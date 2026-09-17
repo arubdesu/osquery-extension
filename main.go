@@ -16,6 +16,7 @@ import (
 	"github.com/macadmins/osquery-extension/tables/localnetworkpermissions"
 	macosprofiles "github.com/macadmins/osquery-extension/tables/macos_profiles"
 	"github.com/macadmins/osquery-extension/tables/macosrsr"
+	mcpservers "github.com/macadmins/osquery-extension/tables/mcp_servers"
 	"github.com/macadmins/osquery-extension/tables/mdm"
 	"github.com/macadmins/osquery-extension/tables/munki"
 	"github.com/macadmins/osquery-extension/tables/networkquality"
@@ -109,6 +110,7 @@ func main() {
 			table.NewPlugin("privileges_events", privileges.PrivilegesEventsColumns(), privileges.PrivilegesEventsGenerate),
 			table.NewPlugin("macadmins_unified_log", unifiedlog.UnifiedLogColumns(), unifiedlog.UnifiedLogGenerate),
 			table.NewPlugin("macos_rsr", macosrsr.MacOSRsrColumns(), macosrsr.MacOSRsrGenerate),
+			table.NewPlugin("mcp_servers", mcpservers.MCPServersColumns(), mcpservers.MCPServersGenerate),
 			table.NewPlugin("sofa_security_release_info", sofa.SofaSecurityReleaseInfoColumns(), func(ctx context.Context, queryContext table.QueryContext) ([]map[string]string, error) {
 				return sofa.SofaSecurityReleaseInfoGenerate(ctx, queryContext, *flSocketPath, sofaOpts...)
 			}),

@@ -1,0 +1,216 @@
+package mcp_servers
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/macadmins/osquery-extension/pkg/fsscan"
+	"github.com/osquery/osquery-go/plugin/table"
+)
+
+// A token shape the redactor is expected to recognise, used wherever a test needs to prove a
+// value passed through redaction rather than reaching the row verbatim.
+const fakeToken = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+// Every key serverToRow emits has to be a declared column and every declared column has to be
+// emitted. osquery drops row keys that name no column and reports a declared column with no
+// key as NULL, and both failures are silent. Asserting in both directions means a column added
+// to the schema without a mapper entry, or a mapper entry left behind after a column is
+// renamed, fails here rather than in a query nobody is watching.
+func TestServerToRowCoversExactlyTheDeclaredColumns(t *testing.T) {
+	declared := make(map[string]struct{})
+	for _, column := range MCPServersColumns() {
+		declared[column.Name] = struct{}{}
+	}
+	row := serverToRow(Server{})
+	for name := range declared {
+		if _, ok := row[name]; !ok {
+			t.Errorf("column %q is declared but serverToRow never sets it", name)
+		}
+	}
+	for name := range row {
+		if _, ok := declared[name]; !ok {
+			t.Errorf("serverToRow sets %q, which is not a declared column", name)
+		}
+	}
+}
+
+// The table's whole credential posture is that no user-writable value reaches a row intact.
+// This checks the three shapes that carry the most risk: the command (reduced to a basename),
+// a token planted in a field that is otherwise passed through, and the argument vector (never
+// emitted, only counted).
+func TestServerToRowStripsCredentialBearingValues(t *testing.T) {
+	row := serverToRow(Server{
+		Command:    "/opt/homebrew/bin/npx --api-key=" + fakeToken,
+		Args:       []string{"--token", fakeToken, "server"},
+		ServerName: "svc-" + fakeToken,
+		Version:    fakeToken,
+	})
+	if row["command_basename"] != "npx" {
+		t.Errorf("command_basename = %q, want the bare executable name", row["command_basename"])
+	}
+	if row["args_count"] != "3" {
+		t.Errorf("args_count = %q, want 3", row["args_count"])
+	}
+	for _, column := range []string{"server_name", "version"} {
+		if strings.Contains(row[column], fakeToken) {
+			t.Errorf("%s = %q, want the token redacted", column, row[column])
+		}
+	}
+	// The arguments themselves must not appear under any column, whatever it is named.
+	for name, value := range row {
+		if strings.Contains(value, fakeToken) {
+			t.Errorf("column %q leaked the token: %q", name, value)
+		}
+	}
+}
+
+// env_keys is JSON so a consumer can unpack it, sorted so a row is stable across runs (Go map
+// iteration is not), and redacted per element so a variable *named* after a token shape does
+// not smuggle one into the array.
+func TestRedactedJSONStringArray(t *testing.T) {
+	if got := redactedJSONStringArray(nil); got != "" {
+		t.Errorf("empty input = %q, want the empty string rather than %q", got, "[]")
+	}
+	got := redactedJSONStringArray([]string{"ZED_TOKEN", "API_KEY", fakeToken})
+	var keys []string
+	if err := json.Unmarshal([]byte(got), &keys); err != nil {
+		t.Fatalf("not valid JSON: %v (%q)", err, got)
+	}
+	if len(keys) != 3 {
+		t.Fatalf("got %d keys, want 3: %v", len(keys), keys)
+	}
+	if keys[0] > keys[1] || keys[1] > keys[2] {
+		t.Errorf("keys are not sorted: %v", keys)
+	}
+	for _, key := range keys {
+		if strings.Contains(key, fakeToken) {
+			t.Errorf("element %q was not redacted", key)
+		}
+	}
+}
+
+// The generator narrows its walk to the users named in the query, so it has to read equality
+// constraints and ignore everything else. A LIKE or a > must leave the filter empty, because
+// a filter built from a constraint the generator cannot honour would drop real rows.
+func TestUserConstraintTakesOnlyEqualityMatches(t *testing.T) {
+	constraints := func(list ...table.Constraint) table.QueryContext {
+		return table.QueryContext{
+			Constraints: map[string]table.ConstraintList{
+				"user": {Constraints: list},
+			},
+		}
+	}
+	if got := userConstraint(table.QueryContext{}); got != nil {
+		t.Errorf("no constraint at all: got %v, want nil", got)
+	}
+	if got := userConstraint(constraints(table.Constraint{
+		Operator: table.OperatorLike, Expression: "a%",
+	})); got != nil {
+		t.Errorf("LIKE only: got %v, want nil so the walk is not wrongly narrowed", got)
+	}
+	got := userConstraint(constraints(
+		table.Constraint{Operator: table.OperatorEquals, Expression: "alice"},
+		table.Constraint{Operator: table.OperatorEquals, Expression: "bob"},
+		table.Constraint{Operator: table.OperatorGreaterThan, Expression: "c"},
+	))
+	if len(got) != 2 {
+		t.Fatalf("got %d users, want alice and bob only: %v", len(got), got)
+	}
+	for _, want := range []string{"alice", "bob"} {
+		if _, ok := got[want]; !ok {
+			t.Errorf("%q missing from the filter", want)
+		}
+	}
+}
+
+func TestBoolToStr(t *testing.T) {
+	if boolToStr(true) != "1" || boolToStr(false) != "0" {
+		t.Error("disabled must render as the 1/0 integers osquery expects, not true/false")
+	}
+}
+
+// MCPServersGenerate is the only function osquery ever calls, and every piece it is built from
+// is tested above or in discover_integration_test.go. What is not otherwise covered is the
+// wiring: that the constraint reaches discovery, that every discovered server becomes exactly
+// one row, and that the rows are shaped the way the schema promises. A fake users root makes
+// that checkable without touching the real /Users.
+func TestMCPServersGenerateWiresConstraintsToDiscovery(t *testing.T) {
+	root := t.TempDir()
+	for _, user := range []string{"alice", "bob"} {
+		dir := filepath.Join(root, user, ".cursor")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		config := `{"mcpServers":{"` + user + `-srv":{"command":"npx","args":["-y","x-mcp@2.1.0"]}}}`
+		if err := os.WriteFile(filepath.Join(dir, "mcp.json"), []byte(config), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	original := fsscan.UsersRoot
+	fsscan.UsersRoot = root
+	t.Cleanup(func() { fsscan.UsersRoot = original })
+
+	declared := make(map[string]struct{})
+	for _, column := range MCPServersColumns() {
+		declared[column.Name] = struct{}{}
+	}
+
+	rows, err := MCPServersGenerate(context.Background(), table.QueryContext{})
+	if err != nil {
+		t.Fatalf("unconstrained: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("unconstrained: got %d rows, want one per user: %v", len(rows), rows)
+	}
+	// Whatever osquery is handed has to match the schema, or it silently drops the extras.
+	for _, row := range rows {
+		for name := range row {
+			if _, ok := declared[name]; !ok {
+				t.Errorf("row carries undeclared column %q", name)
+			}
+		}
+		if row["warning"] != "" {
+			t.Errorf("clean fixture produced a warning: %q", row["warning"])
+		}
+		if row["command_basename"] != "npx" || row["args_count"] != "2" {
+			t.Errorf("identity not populated: %v", row)
+		}
+	}
+
+	// The narrowing path. This is the half that silently does nothing if the column is not
+	// indexed, so asserting the generator honours the constraint is the half worth having.
+	narrowed, err := MCPServersGenerate(context.Background(), table.QueryContext{
+		Constraints: map[string]table.ConstraintList{
+			"user": {Constraints: []table.Constraint{
+				{Operator: table.OperatorEquals, Expression: "alice"},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("constrained: %v", err)
+	}
+	if len(narrowed) != 1 || narrowed[0]["user"] != "alice" {
+		t.Fatalf("user constraint not honoured: %v", narrowed)
+	}
+}
+
+// A users root that does not exist is the ordinary case on a machine with no such directory,
+// and it must not fail the table. DiscoverAll turns it into one warning row instead.
+func TestMCPServersGenerateSurfacesUnreadableRootAsAWarningRow(t *testing.T) {
+	original := fsscan.UsersRoot
+	fsscan.UsersRoot = filepath.Join(t.TempDir(), "absent")
+	t.Cleanup(func() { fsscan.UsersRoot = original })
+
+	rows, err := MCPServersGenerate(context.Background(), table.QueryContext{})
+	if err != nil {
+		t.Fatalf("a missing root must not error the table: %v", err)
+	}
+	if len(rows) != 1 || rows[0]["warning"] == "" {
+		t.Fatalf("want exactly one row carrying a warning, got %v", rows)
+	}
+}

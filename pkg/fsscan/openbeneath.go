@@ -1,0 +1,97 @@
+package fsscan
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// OpenBeneath opens relPath relative to baseDir while refusing to follow
+// symlinks at ANY path component: including intermediates. This is
+// equivalent to Linux's openat2(O_NOFOLLOW + RESOLVE_NO_SYMLINKS), built
+// portably on macOS with iterated openat(O_NOFOLLOW).
+//
+// The threat this defends against: a user owns their home directory, so
+// they can replace ANY intermediate directory with a symlink:
+//
+//	rm -rf ~/Library
+//	ln -s /Users/victim/Library ~/Library
+//
+// Then a direct-path lookup like ~/Library/Application Support/Claude/foo.json
+// resolves through the attacker's symlink to the victim's Library. Plain
+// O_NOFOLLOW only protects the FINAL component. OpenBeneath protects all
+// of them: each intermediate is opened with O_NOFOLLOW so a substituted
+// symlink fails with ELOOP.
+//
+// baseDir is assumed already trusted (e.g., the result of ListUserHomes,
+// which Lstat-checks user home dirs and refuses symlinks at /Users/*).
+// relPath must NOT contain ".." or absolute path components: those are
+// rejected. Components separated by OS path separators are walked one at
+// a time.
+//
+// Returns an *os.File ready for reading, or an error. The caller closes
+// the file as usual. The per-component open lives in platform_unix.go; on
+// Windows it reports unsupported and this returns an error.
+func OpenBeneath(baseDir, relPath string) (*os.File, error) {
+	components, err := splitSafeComponents(relPath)
+	if err != nil {
+		return nil, err
+	}
+	if len(components) == 0 {
+		return nil, errors.New("openbeneath: empty relative path")
+	}
+	return openBeneathComponents(baseDir, relPath, components)
+}
+
+// ReadBoundedUnder opens relPath inside baseDir refusing all symlinks
+// (via OpenBeneath), then enforces the same regular-file check and size
+// cap as ReadBounded.
+func ReadBoundedUnder(baseDir, relPath string, maxSize int64) ([]byte, error) {
+	f, err := OpenBeneath(baseDir, relPath)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("not a regular file")
+	}
+	if info.Size() > maxSize {
+		return nil, fmt.Errorf("file exceeds %d byte cap", maxSize)
+	}
+	buf, err := io.ReadAll(io.LimitReader(f, maxSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(buf)) > maxSize {
+		return nil, errors.New("file grew past cap during read")
+	}
+	return buf, nil
+}
+
+// splitSafeComponents decomposes relPath into path components, rejecting
+// absolute paths and any ".." traversal.
+func splitSafeComponents(relPath string) ([]string, error) {
+	if filepath.IsAbs(relPath) {
+		return nil, errors.New("openbeneath: absolute path not permitted")
+	}
+	cleaned := filepath.Clean(relPath)
+	parts := strings.Split(cleaned, string(os.PathSeparator))
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p == "" || p == "." {
+			continue
+		}
+		if p == ".." {
+			return nil, errors.New("openbeneath: '..' not permitted")
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}

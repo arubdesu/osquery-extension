@@ -1,0 +1,36 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "mcp_servers",
+    srcs = [
+        "classify.go",
+        "discover.go",
+        "identity.go",
+        "jsonc.go",
+        "mcp_servers.go",
+        "parse.go",
+        "redact.go",
+    ],
+    importpath = "github.com/macadmins/osquery-extension/tables/mcp_servers",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/fsscan",
+        "//pkg/redact",
+        "@com_github_osquery_osquery_go//plugin/table",
+    ],
+)
+
+go_test(
+    name = "mcp_servers_test",
+    srcs = [
+        "classify_test.go",
+        "discover_integration_test.go",
+        "mcp_servers_test.go",
+        "mcp_test.go",
+    ],
+    embed = [":mcp_servers"],
+    deps = [
+        "//pkg/fsscan",
+        "@com_github_osquery_osquery_go//plugin/table",
+    ],
+)
