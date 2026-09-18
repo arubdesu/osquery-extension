@@ -363,6 +363,15 @@ func dockerRunIdentity(args []string) string {
 				i++
 				continue
 			}
+			// A grouped short-option cluster. `docker run -it image` is the most common
+			// invocation of the lot, and "-it" is in neither flag table, so the generic rule
+			// below consumed the image and returned nothing at low confidence.
+			if consumesNext, recognised := dockerShortCluster(argument); recognised {
+				if consumesNext && i+1 < len(args) {
+					i++
+				}
+				continue
+			}
 			// Otherwise: assumed to consume the next token, but never when that token is
 			// itself an option. A boolean missing from the list below would otherwise
 			// swallow the following option and hand back *its* value as the image:
@@ -384,6 +393,42 @@ func dockerRunIdentity(args []string) string {
 	}
 	return ""
 }
+
+// dockerShortCluster interprets a single-dash short-option group such as -it or -itv.
+//
+// Docker's flag parser (pflag) walks a cluster left to right: a boolean shorthand yields to
+// the next character, while the first value-taking one takes the rest of the cluster as its
+// value (-p8080:80) or, when it ends the cluster, the next token (-p 8080:80).
+//
+// recognised is false when the group holds a character that is not a known `docker run`
+// shorthand, which leaves the caller's conservative consume-the-next-token default in charge
+// rather than guessing. That keeps an unfamiliar cluster failing toward an empty identity.
+func dockerShortCluster(argument string) (consumesNext, recognised bool) {
+	if len(argument) < 2 || argument[0] != '-' || strings.HasPrefix(argument, "--") {
+		return false, false
+	}
+	group := argument[1:]
+	for index := 0; index < len(group); index++ {
+		switch {
+		case strings.IndexByte(dockerBooleanShorts, group[index]) >= 0:
+			continue
+		case strings.IndexByte(dockerValueShorts, group[index]) >= 0:
+			return index == len(group)-1, true
+		default:
+			return false, false
+		}
+	}
+	return false, true
+}
+
+// dockerBooleanShorts and dockerValueShorts are the single-character `docker run`
+// shorthands, split by whether they take a value. Case matters: -P is --publish-all and
+// takes none, while -p is --publish and takes one. Only shorthands belong here; the long
+// forms stay in the maps below.
+const (
+	dockerBooleanShorts = "ditqP"
+	dockerValueShorts   = "acehlmpuvw"
+)
 
 // dockerBooleanFlags are the `docker run` options that take no value. Everything else is
 // assumed to consume its next argument.

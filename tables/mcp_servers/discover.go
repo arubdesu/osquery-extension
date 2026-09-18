@@ -545,29 +545,60 @@ func extractEnvelopeSimple(data []byte) ([]Server, error) {
 	return append(rows, skippedEntryWarning(skipped)...), nil
 }
 
+// decodeContainer decodes one top-level object of a larger config file. It reports whether
+// the value was usable, so a caller holding several independent containers can lose one
+// without losing the rest. An absent container is not a failure: ok is true with a nil map.
+func decodeContainer(raw json.RawMessage) (map[string]json.RawMessage, bool) {
+	if len(raw) == 0 {
+		return nil, true
+	}
+	var out map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
 // extractClaudeCode reads ~/.claude.json. The file is a big per-user blob with
 // `mcpServers` at the top and a `projects` map keyed by project path whose
 // values each carry their own `mcpServers`.
 func extractClaudeCode(data []byte) ([]Server, error) {
+	// Both containers are held raw and decoded independently below. Binding either one to a
+	// map directly made its *type* part of the whole-document Unmarshal: a global
+	// `"mcpServers": "broken"` returned an error from the outer Unmarshal, and the early
+	// return discarded every healthy project-scoped server with it -- on the file that holds
+	// the most servers on a real machine, and in exactly the way the per-project loop below
+	// already took care to avoid. The two sections fail independently because they are
+	// independent sources of servers.
 	var doc struct {
-		MCPServers map[string]json.RawMessage `json:"mcpServers"`
-		// Each project is left raw and decoded on its own below. Decoding the map into a
-		// typed struct meant one project whose mcpServers was the wrong shape failed the
-		// whole Unmarshal, taking every healthy project *and* the global servers with it --
-		// on the file that holds the most servers on a real machine.
-		Projects map[string]json.RawMessage `json:"projects"`
+		MCPServers json.RawMessage `json:"mcpServers"`
+		Projects   json.RawMessage `json:"projects"`
 	}
 	if err := json.Unmarshal(data, &doc); err != nil {
+		// The document itself is not JSON. There is nothing to recover and the caller turns
+		// this into a parse warning row.
 		return nil, err
 	}
 	var out []Server
 	skipped := 0
-	userScope := make(map[string]rawServerEntry, len(doc.MCPServers))
-	skipped += decodeInto(userScope, doc.MCPServers)
+	// A malformed container counts as one skipped item even though it may have held many
+	// servers. That understates the loss, but it matches the envelope extractor and keeps a
+	// single warning shape; either way the row set is marked incomplete, which is what the
+	// warning column exists to say.
+	globalScope, ok := decodeContainer(doc.MCPServers)
+	if !ok {
+		skipped++
+	}
+	userScope := make(map[string]rawServerEntry, len(globalScope))
+	skipped += decodeInto(userScope, globalScope)
 	if rows, err := materialize(userScope, "mcpServers"); err == nil {
 		out = append(out, rows...)
 	}
-	for projPath, raw := range doc.Projects {
+	projects, ok := decodeContainer(doc.Projects)
+	if !ok {
+		skipped++
+	}
+	for projPath, raw := range projects {
 		var project struct {
 			MCPServers map[string]json.RawMessage `json:"mcpServers"`
 		}

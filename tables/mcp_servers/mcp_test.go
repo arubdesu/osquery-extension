@@ -778,6 +778,28 @@ func TestDockerRunIdentityArity(t *testing.T) {
 		{"pids-limit unlimited", []string{"run", "--pids-limit", "-1", "myorg/s:1"}, "myorg/s:1"},
 		{"memory-swap unlimited", []string{"run", "--memory-swap", "-1", "myorg/s:1"}, "myorg/s:1"},
 		{"negatable then chained option", []string{"run", "--oom-score-adj", "-100", "--publish", "8080:80", "myorg/s:1"}, "myorg/s:1"},
+		// Grouped short options. pflag walks a cluster left to right; -it is the most common
+		// docker invocation in existence and appeared in no flag table, so the generic rule
+		// consumed the image and reported nothing.
+		{"grouped booleans", []string{"run", "-it", "myorg/s:1"}, "myorg/s:1"},
+		{"grouped booleans three", []string{"run", "-itd", "myorg/s:1"}, "myorg/s:1"},
+		{"grouped after a value option", []string{"run", "-v", "/tmp:/tmp", "-it", "myorg/s:1"}, "myorg/s:1"},
+		// A value-taking shorthand ending a cluster consumes the next token; one in the
+		// middle takes the cluster remainder as its value and consumes nothing. Getting
+		// these backwards loses the image in one direction and misreads a value as it in
+		// the other.
+		{"cluster ending in a value short", []string{"run", "-itp", "8080:80", "myorg/s:1"}, "myorg/s:1"},
+		{"value short carrying its own value", []string{"run", "-p8080:80", "myorg/s:1"}, "myorg/s:1"},
+		{"value short mid-cluster", []string{"run", "-ip8080:80", "myorg/s:1"}, "myorg/s:1"},
+		// -P is --publish-all and takes nothing; -p is --publish and takes one. Folding case
+		// here would make -P consume the image.
+		{"capital P is publish-all", []string{"run", "-P", "myorg/s:1"}, "myorg/s:1"},
+		{"grouped with capital P", []string{"run", "-itP", "myorg/s:1"}, "myorg/s:1"},
+		// An unknown character in a cluster falls back to the conservative default rather
+		// than assuming the rest are booleans.
+		{"cluster with an unknown short", []string{"run", "-itZ", "myorg/s:1"}, ""},
+		// A negative number must not be mistaken for a cluster.
+		{"negative number is not a cluster", []string{"run", "--pids-limit", "-1", "myorg/s:1"}, "myorg/s:1"},
 		// Credential-bearing forms the grammar must reject outright.
 		{"userinfo", []string{"run", "user:secret@reg/img"}, ""},
 		{"no run subcommand", []string{"pull", "myorg/s:1"}, ""},
@@ -1014,5 +1036,104 @@ func TestOneMalformedClaudeProjectKeepsTheRest(t *testing.T) {
 	}
 	if diagnostics != 1 {
 		t.Errorf("the malformed project should be reported, got %d diagnostics", diagnostics)
+	}
+}
+
+// TestClaudeCodeSectionsFailIndependently pins that a malformed top-level container in
+// ~/.claude.json costs only that container. The file is the one place where two independent
+// sources of servers share a document -- the user-scope `mcpServers` and the per-project
+// `projects` map -- and binding either to a typed map made its shape a precondition of
+// decoding the other: a global `"mcpServers": "broken"` failed the outer Unmarshal and the
+// early return dropped every healthy project server on the machine.
+func TestClaudeCodeSectionsFailIndependently(t *testing.T) {
+	// Fragments are the inside of the object; the test body adds the outer braces. Balancing
+	// them by hand here made three cases unparseable rather than merely malformed, which the
+	// test then reported as an implementation failure.
+	const healthyProject = `"projects": {"/Users/alice/repo": {"mcpServers": ` +
+		`{"proj-server": {"command": "npx", "args": ["-y", "pkg"]}}}}`
+	const healthyGlobal = `"mcpServers": {"global-server": {"command": "node"}}`
+
+	for _, tc := range []struct {
+		name         string
+		doc          string
+		wantServers  []string
+		wantWarnings int
+	}{
+		{
+			name:         "malformed global keeps project servers",
+			doc:          `"mcpServers": "broken", ` + healthyProject,
+			wantServers:  []string{"proj-server"},
+			wantWarnings: 1,
+		},
+		{
+			name:         "malformed projects keeps global servers",
+			doc:          healthyGlobal + `, "projects": "broken"`,
+			wantServers:  []string{"global-server"},
+			wantWarnings: 1,
+		},
+		{
+			// An array is a different type error than a string, and the array form is what a
+			// config-writing tool is most likely to emit by mistake.
+			name:         "array in place of the global object keeps project servers",
+			doc:          `"mcpServers": [], ` + healthyProject,
+			wantServers:  []string{"proj-server"},
+			wantWarnings: 1,
+		},
+		{
+			name:         "both sections healthy warns about neither",
+			doc:          healthyGlobal + `, ` + healthyProject,
+			wantServers:  []string{"global-server", "proj-server"},
+			wantWarnings: 0,
+		},
+		{
+			name:         "both sections malformed reports loss without erroring",
+			doc:          `"mcpServers": 7, "projects": false`,
+			wantServers:  nil,
+			wantWarnings: 1, // one row, reporting two skipped items
+		},
+		{
+			name:         "absent sections are not a failure",
+			doc:          `"numStartups": 42, "theme": "dark"`,
+			wantServers:  nil,
+			wantWarnings: 0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			document := "{" + tc.doc + "}"
+			if !json.Valid([]byte(document)) {
+				t.Fatalf("test fixture is not valid JSON, so it would not exercise "+
+					"container recovery: %s", document)
+			}
+			rows, err := extractClaudeCode([]byte(document))
+			if err != nil {
+				t.Fatalf("extractClaudeCode returned an error for recoverable input: %v", err)
+			}
+			var gotServers []string
+			gotWarnings := 0
+			for _, row := range rows {
+				if row.Warning != "" {
+					gotWarnings++
+					continue
+				}
+				gotServers = append(gotServers, row.ServerName)
+			}
+			sort.Strings(gotServers)
+			want := append([]string(nil), tc.wantServers...)
+			sort.Strings(want)
+			if !reflect.DeepEqual(gotServers, want) {
+				t.Errorf("servers = %v, want %v", gotServers, want)
+			}
+			if gotWarnings != tc.wantWarnings {
+				t.Errorf("warning rows = %d, want %d (rows: %+v)", gotWarnings, tc.wantWarnings, rows)
+			}
+		})
+	}
+}
+
+// TestClaudeCodeInvalidJSONStillErrors guards the other side of the change above: making the
+// containers independently recoverable must not make an unparseable document look healthy.
+func TestClaudeCodeInvalidJSONStillErrors(t *testing.T) {
+	if _, err := extractClaudeCode([]byte(`{"mcpServers": {`)); err == nil {
+		t.Fatal("truncated JSON should return an error so the caller emits a parse warning")
 	}
 }
