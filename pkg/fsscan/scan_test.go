@@ -71,7 +71,9 @@ func TestScan_PrunesNodeModulesAndGit(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("expected 1 result (prunes worked), got %d: %v", len(got), got)
 	}
-	if !strings.HasSuffix(got[0], "myrepo/.mcp.json") {
+	// filepath.Join rather than a literal: this file has no build constraint, so it also
+	// compiles for the !unix path, where the separator is a backslash.
+	if !strings.HasSuffix(got[0], filepath.Join("myrepo", ".mcp.json")) {
 		t.Errorf("wrong file: %q", got[0])
 	}
 }
@@ -90,60 +92,6 @@ func TestScan_RespectsMaxDepth(t *testing.T) {
 	})
 	if len(got) != 1 {
 		t.Fatalf("expected 1 result at depth limit 2, got %d: %v", len(got), got)
-	}
-}
-
-func TestScan_SkipsSymlinkedDirectories(t *testing.T) {
-	root := t.TempDir()
-	writeFile(t, filepath.Join(root, "real", "config", ".mcp.json"), `{}`)
-	// Create a symlink at root/link pointing to root/real. We must NOT descend through it.
-	if err := os.Symlink(filepath.Join(root, "real"), filepath.Join(root, "link")); err != nil {
-		t.Fatal(err)
-	}
-
-	got := Scan(ScanConfig{
-		Roots:    []string{root},
-		MaxDepth: 8,
-		Accept:   acceptByBasename(".mcp.json"),
-	})
-	if len(got) != 1 {
-		t.Fatalf("expected 1 result (symlink should not be followed), got %d: %v", len(got), got)
-	}
-	if strings.Contains(got[0], "/link/") {
-		t.Errorf("symlink was followed: %q", got[0])
-	}
-}
-
-func TestScan_SkipsSymlinkRoot(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.Mkdir(filepath.Join(dir, "real"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	writeFile(t, filepath.Join(dir, "real", ".mcp.json"), `{}`)
-	if err := os.Symlink(filepath.Join(dir, "real"), filepath.Join(dir, "link")); err != nil {
-		t.Fatal(err)
-	}
-
-	// Scanner is given the symlink as a root. It must refuse.
-	got := Scan(ScanConfig{
-		Roots:  []string{filepath.Join(dir, "link")},
-		Accept: acceptByBasename(".mcp.json"),
-	})
-	if len(got) != 0 {
-		t.Errorf("symlinked root should be refused: got %v", got)
-	}
-}
-
-func TestScan_DedupesAcrossRoots(t *testing.T) {
-	root := t.TempDir()
-	writeFile(t, filepath.Join(root, "A", ".mcp.json"), `{}`)
-	// Two roots that overlap: should not double-count.
-	got := Scan(ScanConfig{
-		Roots:  []string{root, filepath.Join(root, "A")},
-		Accept: acceptByBasename(".mcp.json"),
-	})
-	if len(got) != 1 {
-		t.Errorf("expected 1 (dedup), got %d: %v", len(got), got)
 	}
 }
 
@@ -360,7 +308,7 @@ func TestScanResultWarningCoversBothConditions(t *testing.T) {
 		{
 			name:          "symlinked root refused",
 			result:        ScanResult{SymlinkedRoots: 2},
-			wantSubstring: "symlinks and were not followed",
+			wantSubstring: "2 walk root(s) were symlinks and were not followed",
 			wantNoRemedy:  true,
 		},
 		{

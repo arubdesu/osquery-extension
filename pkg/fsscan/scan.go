@@ -6,7 +6,10 @@
 //   - Heavy / noisy directories (node_modules, .git, vendor, build outputs) are
 //     pruned by default
 //   - Walks are depth-bounded so a deeply nested repo cannot inflate runtime
-//   - Symlinked directories are never descended (no symlink-traversal escapes)
+//   - Symlinked directories are never descended. Static ones cannot redirect a walk; a
+//     directory *replaced* with a symlink mid-walk can, because traversal reopens by
+//     pathname. Containment of the traversal is therefore best-effort under concurrent
+//     mutation, while containment of the reads is not -- see ScanResult.ReadCandidate
 //   - Files are opened with O_NOFOLLOW + O_NONBLOCK and a regular-file check,
 //     so a planted FIFO, socket, or symlink cannot hang or redirect a read
 //   - Per-file size cap so a planted 1 GB file cannot exhaust memory
@@ -24,7 +27,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -47,10 +49,14 @@ type rootKey struct {
 // Callers also pass overlapping roots, so /home and /home/user would both be walked in full.
 //
 
-// descendBlocked reports whether a directory must not be descended, for the two reasons that
-// do not depend on where a walk counts it: a pruned directory name, or a depth already at the
-// limit. The symlink refusal is deliberately kept at the call site, because it has to happen
-// before the directory is counted against MaxDirs.
+// descendBlocked reports whether a directory must not be descended: a pruned directory name,
+// or a depth already at the limit.
+//
+// Symlinks are not among the reasons, because WalkDir has already excluded them by the time
+// this is reached. A stable symlink reports IsDir() false, so it never enters the directory
+// branch at all; a check for os.ModeSymlink there was unreachable and has been removed. It
+// could not have helped with a replacement race either -- during one, the DirEntry still
+// describes the directory that was there when the parent was listed.
 func descendBlocked(prunes map[string]struct{}, name string, depth, maxDepth int) bool {
 	if _, pruned := prunes[name]; pruned {
 		return true
@@ -74,9 +80,13 @@ const (
 	// rootNotDirectory: the path exists and is not a directory. Nothing is behind it, so
 	// like rootAbsent this is silent.
 	rootNotDirectory
-	// rootSymlink: a symlink we refuse to follow. Unlike every other non-usable case there
-	// *is* content behind it, so this one is reported.
+	// rootSymlink: a symlink we refuse to follow, either the root itself or a component
+	// between Beneath and the root. Unlike every other non-usable case there *is* content
+	// behind it, so this one is reported.
 	rootSymlink
+	// rootOutsideBeneath: the root does not lie under cfg.Beneath at all. A caller bug or a
+	// tree that moved mid-scan; either way it is not walked.
+	rootOutsideBeneath
 	// rootUnreadable: stat failed for a reason that is not expected absence.
 	rootUnreadable
 	// rootDenied: rootUnreadable, specifically a permission denial, so the remedy can be
@@ -95,7 +105,7 @@ const (
 // defaults to case-insensitive APFS, so /Users/x/code and /Users/x/Code are one directory that
 // a string comparison reports as two, and the walker would visit everything under it twice.
 // Callers also pass overlapping roots, so /home and /home/user would both be walked in full.
-func resolveRoot(root string, seen map[rootKey]struct{}) (string, rootDisposition) {
+func resolveRoot(root, beneath string, seen map[rootKey]struct{}) (string, rootDisposition) {
 	absRoot := root
 	if !filepath.IsAbs(absRoot) {
 		resolved, err := filepath.Abs(absRoot)
@@ -103,6 +113,12 @@ func resolveRoot(root string, seen map[rootKey]struct{}) (string, rootDispositio
 			return "", rootUnreadable
 		}
 		absRoot = resolved
+	}
+	if beneath != "" {
+		disposition := checkComponentsBeneath(absRoot, beneath)
+		if disposition != rootUsable {
+			return "", disposition
+		}
 	}
 	info, err := os.Lstat(absRoot)
 	if err != nil {
@@ -134,14 +150,71 @@ func resolveRoot(root string, seen map[rootKey]struct{}) (string, rootDispositio
 	return absRoot, rootUsable
 }
 
+// checkComponentsBeneath walks the components between beneath and absRoot, Lstat-ing each one,
+// and reports the first that is a symlink or unreadable.
+//
+// beneath itself is not checked: the caller asserts it is trusted, which for a user home means
+// it came from ListUserHomes, which already refuses a symlinked entry under /Users.
+//
+// Deliberately Lstat per component rather than filepath.EvalSymlinks on the whole path.
+// EvalSymlinks would report every root under /var or /tmp on macOS as symlinked, because /var
+// genuinely is a link to /private/var, so it cannot distinguish a system path from a planted
+// one. Starting below a trusted base avoids the question: the only components examined are the
+// ones a user could have replaced.
+func checkComponentsBeneath(absRoot, beneath string) rootDisposition {
+	relative, err := filepath.Rel(beneath, absRoot)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+		return rootOutsideBeneath
+	}
+	if relative == "." {
+		return rootUsable
+	}
+	current := beneath
+	for _, component := range strings.Split(relative, string(os.PathSeparator)) {
+		if component == "" || component == "." {
+			continue
+		}
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		if err != nil {
+			switch {
+			case IsExpectedAbsent(err):
+				return rootAbsent
+			case errors.Is(err, fs.ErrPermission):
+				return rootDenied
+			default:
+				return rootUnreadable
+			}
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return rootSymlink
+		}
+	}
+	return rootUsable
+}
+
 // ScanConfig parameterizes a single Scan invocation.
 type ScanConfig struct {
-	// Roots are absolute directory paths to walk. Non-existent or symlinked
-	// roots are silently skipped.
+	// Roots are absolute directory paths to walk.
+	//
+	// A non-existent root is skipped silently: a dev subdirectory a user does not have is
+	// the normal case and hides nothing. A symlinked root is skipped and *counted*, in
+	// SymlinkedRoots, because content exists behind it that the walk deliberately will not
+	// follow. See ScanResult.Warning.
 	Roots []string
 
 	// MaxDepth bounds traversal depth, counted from each root. A root itself
 	// is depth 0; its immediate children are depth 1. If zero, defaults to 8.
+	//
+	// Reaching the limit prunes silently and does not set Truncated. That is deliberate and
+	// is the one exception to "an incomplete answer says so", because the depth bound is not
+	// a budget that ran out -- it is the definition of what this scan covers. A tree deeper
+	// than MaxDepth is outside scope rather than cut short, and flagging it would put a
+	// warning on the majority of real trees, which would make the warning column useless for
+	// the cases that are genuinely partial.
+	//
+	// The consequence has to be documented wherever completeness is claimed: an empty warning
+	// means "complete within MaxDepth", not "complete".
 	MaxDepth int
 
 	// MaxDirs bounds the number of directories visited across all roots. If
@@ -169,6 +242,42 @@ type ScanConfig struct {
 	// sockets are filtered out before this is called). Path is absolute.
 	// If nil, no files are returned.
 	Accept func(path string, d fs.DirEntry) bool
+
+	// Beneath, when set, is a trusted directory that every root must lie under, and every
+	// path component from Beneath down to each root is checked for being a symlink before
+	// the root is walked.
+	//
+	// This closes a hole that os.Lstat alone cannot. Lstat refuses to follow only the final
+	// component, so a root like <home>/Library/Application Support/Code/User/profiles was
+	// accepted whenever an *intermediate* component was a symlink, and WalkDir then walked
+	// the link's target. The paths it returned still read as though they were inside the
+	// requested tree, which is what made it dangerous: a caller could not tell, and
+	// ReadBounded would later open them through the same parent link.
+	//
+	// Set this to the user home whenever roots are built from one. Leaving it empty keeps
+	// the old behaviour and means the caller is asserting its roots are trusted, which is
+	// only true when nothing between the filesystem root and the root path is user-writable.
+	//
+	// The limit of this, stated plainly because the alternative is a false sense of
+	// containment: it is a preflight, not a lock. Components are Lstat-ed and then released,
+	// and filepath.WalkDir reopens directories by pathname afterwards. A user who replaces a
+	// checked component with a symlink in between will have that link followed. Containment
+	// of the *traversal* is therefore best-effort under concurrent mutation.
+	//
+	// What is not best-effort is containment of the reads. Callers reopen every candidate
+	// component-wise with O_NOFOLLOW relative to the trusted base, so a raced replacement
+	// makes the open fail rather than resolve outside. The residual exposure is enumeration
+	// and I/O against a tree the caller did not intend. MaxDirs, MaxFiles and Timeout
+	// mitigate that rather than bound it: WalkDir reads and sorts a whole directory before
+	// any child callback runs, so MaxDirs cannot interrupt that read, MaxFiles counts
+	// accepted candidates rather than every file seen, and the timeout is checked between
+	// callbacks and cannot interrupt a blocked ReadDir.
+	//
+	// Eliminating it needs descriptor-relative traversal: open the base once, open each child
+	// relative to its parent's descriptor with O_DIRECTORY|O_NOFOLLOW, and enumerate from the
+	// descriptor. openbeneath.go already has the platform primitives for it. That replaces
+	// filepath.WalkDir wholesale and is deliberately not attempted here.
+	Beneath string
 }
 
 // ScanResult is the budget-aware result from ScanContext.
@@ -203,6 +312,10 @@ type ScanResult struct {
 	// cause was an I/O error instead.
 	Denied int
 
+	// Beneath echoes ScanConfig.Beneath, so a path this scan produced can be reopened safely
+	// without the caller having to carry the base separately. See ReadCandidate.
+	Beneath string
+
 	// SymlinkedRoots counts configured roots that were symlinks and so were not followed.
 	//
 	// Kept apart from Inaccessible because the cause is different in a way that changes what
@@ -217,7 +330,11 @@ type ScanResult struct {
 
 // Warning renders anything that makes this result less than a complete answer, as the single
 // string a table's warning column carries. It is "" only when the scan both finished and saw
-// everything it tried to.
+// everything it tried to see.
+//
+// "Tried to see" is doing work in that sentence. Depth pruning is scope rather than
+// incompleteness -- see ScanConfig.MaxDepth -- so an empty warning means complete within the
+// configured depth, not complete without qualification.
 //
 // Two independent conditions reach it, and either alone is enough:
 //
@@ -226,7 +343,9 @@ type ScanResult struct {
 //   - Inaccessible > 0: the scan ran to completion but could not read some roots or subtrees,
 //     so the paths it did return are a floor rather than the total.
 //   - SymlinkedRoots > 0: a configured root was a symlink and was deliberately not followed,
-//     so everything beneath it is missing from the result.
+//     so everything beneath it is missing from the result. Symlinks *below* a root are also
+//     not followed but are not reported; see the walk callback for the measurements behind
+//     that.
 //
 // Both matter for the same reason. A bounded or partially-blind scan returns fewer paths, and
 // without this it is indistinguishable from a host that genuinely has none to any query
@@ -268,6 +387,31 @@ func (r ScanResult) Warning() string {
 	return strings.Join(parts, "; ")
 }
 
+// ReadCandidate opens a path this scan returned, refusing symlinks at every component below
+// the scan's trusted base.
+//
+// This exists so the secure pattern is the easy one. ReadBounded refuses a symlink only at the
+// final component, which is not enough for a path discovered beneath a directory its owner can
+// modify: an intermediate component replaced between the walk and the read is followed, and
+// running as root that reads another user's file. Every caller of this package walks exactly
+// such trees, and the package used to recommend ReadBounded for the job.
+//
+// With Beneath set, the path is re-derived relative to the base and opened component-wise with
+// O_NOFOLLOW, so a raced replacement fails the open instead of redirecting it. Without it the
+// scan made no containment claim and this falls back to ReadBounded, which is all that is
+// available when the caller has not said what the paths are supposed to be under.
+func (r ScanResult) ReadCandidate(path string, maxSize int64) ([]byte, error) {
+	if r.Beneath == "" {
+		return ReadBounded(path, maxSize)
+	}
+	relative, err := filepath.Rel(r.Beneath, path)
+	if err != nil || relative == ".." ||
+		strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+		return nil, fmt.Errorf("fsscan: %q is not beneath the scanned base", path)
+	}
+	return ReadBoundedUnder(r.Beneath, relative, maxSize)
+}
+
 // WalkTimeoutEnv overrides DefaultWalkTimeout with a Go duration string.
 const WalkTimeoutEnv = "MACADMINS_EXTENSION_WALK_TIMEOUT"
 
@@ -295,8 +439,12 @@ func WalkTimeout() time.Duration {
 
 // Scan walks the configured roots and returns absolute paths of accepted files.
 // Per-entry errors (permission denied, etc.) are swallowed: the subtree is
-// skipped and the walk continues. Caller is responsible for safely opening
-// returned paths: use ReadBounded.
+// skipped and the walk continues.
+//
+// Prefer ScanContext, whose ScanResult carries the trusted base and offers ReadCandidate.
+// Scan discards both, so a caller has to open the paths itself and gets no help doing it
+// safely -- which is how the original version of this package told callers to use ReadBounded
+// on walker output and reintroduced an escaped read.
 //
 // Allocation budget: one map for dedup + one slice for output. Per-entry work
 // is O(1) (map lookups, basename comparisons). Designed to be safe to call on
@@ -312,6 +460,7 @@ func Scan(cfg ScanConfig) []string {
 // ScanResult.Warning, which renders both.
 func ScanContext(ctx context.Context, cfg ScanConfig) (ScanResult, error) {
 	var result ScanResult
+	result.Beneath = cfg.Beneath
 	if cfg.Accept == nil {
 		return result, nil
 	}
@@ -333,7 +482,11 @@ func ScanContext(ctx context.Context, cfg ScanConfig) (ScanResult, error) {
 	// are already closed elsewhere, since candidates open with O_NONBLOCK and anything that is
 	// not a regular file is rejected. Covering the rest needs interruptible traversal or a
 	// process boundary to enforce the deadline, which is a larger change than this function.
-	// Recorded as a known limit rather than an oversight;
+	// Recorded as a known limit rather than an oversight. It is also why the budgets
+	// mitigate rather than strictly bound: WalkDir reads a whole directory before invoking
+	// callbacks for its children, and MaxFiles counts accepted candidates rather than every
+	// regular file seen, so a single enormous or stalled directory can overrun both before
+	// either is consulted.
 	budgetExpired := func() bool {
 		return cfg.Timeout > 0 && callerCtx.Err() == nil && ctx.Err() != nil
 	}
@@ -368,7 +521,7 @@ func ScanContext(ctx context.Context, cfg ScanConfig) (ScanResult, error) {
 		if result.Truncated {
 			break
 		}
-		absRoot, disposition := resolveRoot(root, rootSeen)
+		absRoot, disposition := resolveRoot(root, cfg.Beneath, rootSeen)
 		if disposition != rootUsable {
 			switch disposition {
 			case rootDenied:
@@ -428,16 +581,31 @@ func ScanContext(ctx context.Context, cfg ScanConfig) (ScanResult, error) {
 				if path == absRoot {
 					return nil
 				}
-				// Refuse to descend symlinked directories.
-				if d.Type()&os.ModeSymlink != 0 {
-					return filepath.SkipDir
-				}
 				curDepth := strings.Count(path, string(os.PathSeparator)) - rootSeps
 				if descendBlocked(prunes, d.Name(), curDepth, cfg.MaxDepth) {
 					return filepath.SkipDir
 				}
 				return nil
 			}
+
+			// A symlink below a root is never descended and never accepted, and is not
+			// counted either. That asymmetry with SymlinkedRoots is deliberate; three ways
+			// of reporting it were measured on one workstation and each failed:
+			//
+			//   - Stat the target to see whether it is a directory: follows an
+			//     attacker-controlled path purely to word a warning, and on a dead network
+			//     mount is precisely where the walk would hang inside its own budget.
+			//   - Count every non-pruned symlink: 51 of them under the dev roots, all
+			//     benign, which makes the warning column useless for the cases that are
+			//     genuinely partial.
+			//   - Count only shallow ones: zero at depth 1-2 but 33 at depth 3, which is
+			//     where both a build artifact inside a repository and a symlinked
+			//     repository under ~/Documents/GitHub sit. No threshold separates them.
+			//
+			// A symlinked *root* stays reported because it is unambiguous and quiet: the
+			// user pointed ~/code elsewhere and their whole project-local inventory is
+			// missing. One symlinked project inside a tree is a far smaller gap, and no
+			// available signal for it survives contact with a real machine.
 
 			// Non-regular file: skip without consulting Accept. We never
 			// want to surface FIFOs, sockets, or device nodes.
@@ -474,6 +642,12 @@ func ScanContext(ctx context.Context, cfg ScanConfig) (ScanResult, error) {
 // at the kernel level and opening a FIFO/socket cannot hang. It verifies the
 // file is regular and reads at most maxSize bytes. Returns the standard Go
 // error sentinels for missing/permission cases so callers can use errors.Is.
+//
+// Only suitable when the entire parent chain is trusted. O_NOFOLLOW covers the final component
+// and nothing above it, so for a path found beneath a user-writable directory this is not
+// enough: an intermediate component can be replaced with a symlink between the walk and the
+// read. Use ScanResult.ReadCandidate, or ReadBoundedUnder directly, for anything a walk
+// produced.
 //
 // All MCP-style configs are < 1 MiB in practice; lockfiles can be larger but
 // callers should still set a reasonable cap.
@@ -524,20 +698,9 @@ func IsExpectedAbsent(err error) bool {
 	if errors.Is(err, fs.ErrNotExist) {
 		return true
 	}
-	// errors.Is walks the %w-wrapped chain. Direct errno comparison catches
-	// unix.Openat errors (which return bare syscall.Errno values, not
-	// os.PathError) once unwrapped through the fmt.Errorf wrap in
-	// OpenBeneath.
-	if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.ENOTDIR) {
-		return true
-	}
-	var pathErr *os.PathError
-	if errors.As(err, &pathErr) {
-		if errors.Is(pathErr.Err, syscall.ELOOP) || errors.Is(pathErr.Err, syscall.ENOTDIR) {
-			return true
-		}
-	}
-	return false
+	// The ELOOP and ENOTDIR classification is per-platform: those errno values do not exist
+	// on every GOOS Go can target, and referencing them here broke the plan9 cross-build.
+	return isRefusedOrNotDirectory(err)
 }
 
 // DefaultPrunes returns the set of directory basenames typically excluded from
@@ -555,6 +718,9 @@ func DefaultPrunes() map[string]struct{} {
 		// Generic cache / build outputs
 		".cache": {}, ".nx": {}, ".turbo": {}, ".parcel-cache": {},
 		"dist": {}, "build": {}, "out": {}, ".next": {}, ".nuxt": {},
+		// Swift package manager build output. Its debug and release entries are
+		// symlinks into it, so pruning the parent keeps them out of the walk entirely.
+		".build": {},
 		// Compiled targets / vendored deps
 		"target": {}, "vendor": {}, "Pods": {}, "DerivedData": {},
 		// Python toolchain detritus

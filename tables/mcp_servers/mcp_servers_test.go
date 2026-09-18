@@ -74,8 +74,10 @@ func TestServerToRowStripsCredentialBearingValues(t *testing.T) {
 // iteration is not), and redacted per element so a variable *named* after a token shape does
 // not smuggle one into the array.
 func TestRedactedJSONStringArray(t *testing.T) {
-	if got := redactedJSONStringArray(nil); got != "" {
-		t.Errorf("empty input = %q, want the empty string rather than %q", got, "[]")
+	// Empty is "[]" rather than "": the column is documented as JSON, so every row should
+	// unpack the same way instead of the empty case needing its own branch in every consumer.
+	if got := redactedJSONStringArray(nil); got != "[]" {
+		t.Errorf("empty input = %q, want an empty JSON array", got)
 	}
 	got := redactedJSONStringArray([]string{"ZED_TOKEN", "API_KEY", fakeToken})
 	var keys []string
@@ -114,13 +116,25 @@ func TestUserConstraintTakesOnlyEqualityMatches(t *testing.T) {
 	})); got != nil {
 		t.Errorf("LIKE only: got %v, want nil so the walk is not wrongly narrowed", got)
 	}
+	// An unsupported operator alongside equality abandons narrowing entirely. Keeping the
+	// equality values and ignoring the rest can under-scan: QueryContext does not carry
+	// enough boolean structure to prove the subset is sufficient, so `user = 'alice' OR user
+	// LIKE 'b%'` would be answered with alice alone. An earlier version of this test asserted
+	// that unsafe behaviour as correct.
+	if got := userConstraint(constraints(
+		table.Constraint{Operator: table.OperatorEquals, Expression: "alice"},
+		table.Constraint{Operator: table.OperatorGreaterThan, Expression: "c"},
+	)); got != nil {
+		t.Errorf("mixed operators must not narrow: %v", got)
+	}
+
+	// All-equality still narrows, which is the case worth having.
 	got := userConstraint(constraints(
 		table.Constraint{Operator: table.OperatorEquals, Expression: "alice"},
 		table.Constraint{Operator: table.OperatorEquals, Expression: "bob"},
-		table.Constraint{Operator: table.OperatorGreaterThan, Expression: "c"},
 	))
 	if len(got) != 2 {
-		t.Fatalf("got %d users, want alice and bob only: %v", len(got), got)
+		t.Fatalf("got %d users, want alice and bob: %v", len(got), got)
 	}
 	for _, want := range []string{"alice", "bob"} {
 		if _, ok := got[want]; !ok {

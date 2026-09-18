@@ -17,7 +17,7 @@ go_library(
     deps = [
         "//pkg/fsscan",
         "//pkg/redact",
-        "@com_github_burntsushi_toml//:go_default_library",
+        "@com_github_burntsushi_toml//:toml",
         "@com_github_osquery_osquery_go//plugin/table",
     ],
 )
@@ -27,6 +27,7 @@ go_test(
     srcs = [
         "classify_test.go",
         "discover_integration_test.go",
+        "discover_symlink_unix_test.go",
         "mcp_servers_test.go",
         "mcp_test.go",
         "toml_test.go",

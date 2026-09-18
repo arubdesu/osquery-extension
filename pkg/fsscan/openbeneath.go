@@ -81,6 +81,15 @@ func splitSafeComponents(relPath string) ([]string, error) {
 	if filepath.IsAbs(relPath) {
 		return nil, errors.New("openbeneath: absolute path not permitted")
 	}
+	// Inspected before Clean, not after. Clean collapses a/../secret.json to secret.json, so
+	// checking afterwards accepted an interior ".." that the documented contract rejects.
+	// Nothing escaped -- Clean normalises within the base -- but a caller relying on the
+	// contract to reason about which path was opened was being told the wrong thing.
+	for _, part := range strings.Split(relPath, string(os.PathSeparator)) {
+		if part == ".." {
+			return nil, errors.New("openbeneath: '..' not permitted")
+		}
+	}
 	cleaned := filepath.Clean(relPath)
 	parts := strings.Split(cleaned, string(os.PathSeparator))
 	out := make([]string, 0, len(parts))

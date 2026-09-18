@@ -35,33 +35,78 @@ type rawServerEntry struct {
 type envelopeEntries struct {
 	MCPServers map[string]rawServerEntry
 	Servers    map[string]rawServerEntry
+	// Present records that a recognised envelope key existed, independently of whether it
+	// yielded anything. An envelope that is present and legitimately empty must not fall
+	// through to the flat parser, or an unrelated sibling gets emitted as a server; but it
+	// must not be an error either, because a configuration with no servers in it is a
+	// perfectly ordinary thing for a user to have.
+	Present bool
 }
 
+// errNoDecodableEntries means the document does have an mcpServers or servers envelope and
+// every entry in it failed to decode.
+//
+// It is distinguished from a document that is not JSON at all because the two need opposite
+// handling. Invalid JSON can fall through to the flat shape, which will fail the same way. A
+// malformed *envelope* must not: falling back let an unrelated top-level object such as
+// {"other": {"command": "node"}} satisfy the flat parser, so the broken envelope was silently
+// reinterpreted, its entries dropped, and no diagnostic emitted.
+var errNoDecodableEntries = errors.New("envelope present but no decodable server entries")
+
 func extractEnvelope(raw []byte) (envelopeEntries, int, error) {
-	var env struct {
-		MCPServers map[string]json.RawMessage `json:"mcpServers"`
-		Servers    map[string]json.RawMessage `json:"servers"`
-	}
 	var out envelopeEntries
-	if err := json.Unmarshal(raw, &env); err != nil {
+
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &top); err != nil {
 		return out, 0, err
 	}
-	if len(env.MCPServers) == 0 && len(env.Servers) == 0 {
+	out.MCPServers = map[string]rawServerEntry{}
+	out.Servers = map[string]rawServerEntry{}
+
+	// Four states are tracked separately because they mean different things to a consumer:
+	// whether a recognised key was present at all, how many entries were unreadable, how many
+	// whole envelopes were the wrong type, and how many servers came out usable. An earlier
+	// version collapsed all of them into one error, which reported {"mcpServers": {}} -- a
+	// valid zero-server configuration -- as a malformed file.
+	skipped, malformedEnvelopes := 0, 0
+	for key, target := range map[string]map[string]rawServerEntry{
+		"servers": out.Servers, "mcpServers": out.MCPServers,
+	} {
+		value, present := top[key]
+		if !present {
+			continue
+		}
+		out.Present = true
+		var entries map[string]json.RawMessage
+		if err := json.Unmarshal(value, &entries); err != nil {
+			// Present but the wrong shape: an array, a string, a number. This envelope is
+			// malformed. The other one, if there is one, is unaffected -- returning here
+			// discarded a healthy `servers` alongside a malformed `mcpServers`.
+			malformedEnvelopes++
+			continue
+		}
+		// A nil map covers both {} and null. Neither is a failure: the key is present and
+		// declares no servers.
+		skipped += decodeInto(target, entries)
+	}
+	if !out.Present {
+		// No recognised envelope key. The only case where reading the document as flat is a
+		// legitimate interpretation.
 		return out, 0, nil
 	}
-	out.MCPServers = make(map[string]rawServerEntry, len(env.MCPServers))
-	out.Servers = make(map[string]rawServerEntry, len(env.Servers))
-	skipped := decodeInto(out.Servers, env.Servers)
-	skipped += decodeInto(out.MCPServers, env.MCPServers)
 	// mcpServers wins on collision, so drop the duplicate from the servers side rather than
 	// emitting the same server twice under two contexts.
 	for name := range out.MCPServers {
 		delete(out.Servers, name)
 	}
-	if len(out.MCPServers)+len(out.Servers) == 0 {
-		// Every entry failed. The envelope exists but nothing in it is usable, which is a
-		// malformed file rather than a file without MCP configuration.
-		return out, skipped, errors.New("no decodable server entries")
+	if len(out.MCPServers)+len(out.Servers) == 0 && (malformedEnvelopes > 0 || skipped > 0) {
+		// Recognised content existed and none of it could be recovered.
+		return out, skipped, errNoDecodableEntries
+	}
+	if malformedEnvelopes > 0 {
+		// Healthy rows survive; the failure is reported alongside them rather than instead
+		// of them.
+		skipped += malformedEnvelopes
 	}
 	return out, skipped, nil
 }
@@ -79,6 +124,14 @@ func decodeInto(out map[string]rawServerEntry, in map[string]json.RawMessage) in
 	for name, value := range in {
 		var entry rawServerEntry
 		if err := json.Unmarshal(value, &entry); err != nil {
+			skipped++
+			continue
+		}
+		// A shape check, not just a decode check. `null` and `{}` unmarshal without error
+		// into a zero entry, which became a row with a server name, transport=unknown and no
+		// warning: a phantom server that was never configured. The flat extractor already
+		// applied this test; the envelope path did not.
+		if !looksLikeServerEntry(entry) {
 			skipped++
 			continue
 		}

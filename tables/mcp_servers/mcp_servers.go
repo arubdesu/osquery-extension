@@ -92,16 +92,24 @@ func MCPServersGenerate(ctx context.Context, queryContext table.QueryContext) (r
 	return rows, nil
 }
 
+// userConstraint builds the set of usernames a query narrowed to, or nil to scan every home.
+//
+// Equality only, and *all* of it or none. An earlier version kept the equality values and
+// ignored any other operator in the same list, which can under-scan: QueryContext does not
+// carry enough of the original boolean structure to prove the equality subset is sufficient,
+// so `user = 'alice' OR user LIKE 'b%'` could be answered with alice's rows alone. Scanning
+// more than asked costs time; returning fewer rows than the query matches is a wrong answer.
 func userConstraint(qc table.QueryContext) map[string]struct{} {
-	cl, ok := qc.Constraints["user"]
+	constraintList, ok := qc.Constraints["user"]
 	if !ok {
 		return nil
 	}
 	users := make(map[string]struct{})
-	for _, c := range cl.Constraints {
-		if c.Operator == table.OperatorEquals {
-			users[c.Expression] = struct{}{}
+	for _, constraint := range constraintList.Constraints {
+		if constraint.Operator != table.OperatorEquals {
+			return nil
 		}
+		users[constraint.Expression] = struct{}{}
 	}
 	if len(users) == 0 {
 		return nil
@@ -154,7 +162,10 @@ func serverToRow(s Server) map[string]string {
 // column whose value is a JSON array of user-controlled strings.
 func redactedJSONStringArray(ss []string) string {
 	if len(ss) == 0 {
-		return ""
+		// "[]" rather than "": the column is documented and tested as a JSON array, so a
+		// consumer should be able to unpack every row the same way instead of special-casing
+		// the empty one.
+		return "[]"
 	}
 	cleaned := make([]string, len(ss))
 	for i, s := range ss {

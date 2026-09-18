@@ -69,7 +69,7 @@ func TestExtractEnvelope(t *testing.T) {
 	}
 }
 
-func TestExtractEnvelopeServersWins(t *testing.T) {
+func TestExtractEnvelopeMCPServersWinsOverServers(t *testing.T) {
 	// `servers` and `mcpServers` both present: mcpServers wins on key collision.
 	data := []byte(`{
 		"servers": {"a": {"command": "OLD"}},
@@ -352,9 +352,12 @@ func TestSplitNPMSpec(t *testing.T) {
 func TestEnvKeysNeverContainValues(t *testing.T) {
 	// Belt-and-suspenders: confirm secret env values never round-trip into a Server.
 	data := []byte(`{"mcpServers":{"x":{"command":"x","env":{"GITHUB_TOKEN":"ghp_supersecretvalue1234567890"}}}}`)
-	rows, _ := extractEnvelopeSimple(data)
+	rows, err := extractEnvelopeSimple(data)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
 	if len(rows) != 1 {
-		t.Fatal()
+		t.Fatalf("got %d rows, want 1: %+v", len(rows), rows)
 	}
 	sort.Strings(rows[0].EnvKeys)
 	if !reflect.DeepEqual(rows[0].EnvKeys, []string{"GITHUB_TOKEN"}) {
@@ -371,9 +374,12 @@ func TestServerNameRedacted(t *testing.T) {
 	// HIGH finding: JSON map keys are attacker-controlled. A token-shaped
 	// server name must be redacted before it reaches the table.
 	data := []byte(`{"mcpServers":{"ghp_abcdefghijklmnopqrstuvwx12345":{"command":"npx","args":["x"]}}}`)
-	rows, _ := extractEnvelopeSimple(data)
+	rows, err := extractEnvelopeSimple(data)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
 	if len(rows) != 1 {
-		t.Fatalf("got %d rows", len(rows))
+		t.Fatalf("got %d rows, want 1: %+v", len(rows), rows)
 	}
 	if strings.Contains(rows[0].ServerName, "ghp_") {
 		t.Errorf("token-shaped server name leaked into ServerName: %q", rows[0].ServerName)
@@ -391,9 +397,12 @@ func TestSourceContextRedacted(t *testing.T) {
 			}
 		}
 	}`)
-	rows, _ := extractClaudeCode(data)
+	rows, err := extractClaudeCode(data)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
 	if len(rows) != 1 {
-		t.Fatalf("got %d rows", len(rows))
+		t.Fatalf("got %d rows, want 1: %+v", len(rows), rows)
 	}
 	if strings.Contains(rows[0].SourceContext, "ghp_realtoken") {
 		t.Errorf("token-shaped project path leaked into SourceContext: %q", rows[0].SourceContext)
@@ -589,13 +598,6 @@ func TestEnvelopeKeepsHealthyEntriesAndReportsSkippedOnes(t *testing.T) {
 	}
 }
 
-// A file whose every entry is undecodable is malformed, not empty, and must still error.
-func TestEnvelopeWithNoDecodableEntriesStillErrors(t *testing.T) {
-	if _, err := extractEnvelopeSimple([]byte(`{"mcpServers":{"a":{"command":1},"b":{"args":2}}}`)); err == nil {
-		t.Error("an envelope with nothing decodable in it should report a parse failure")
-	}
-}
-
 // An unterminated block comment makes a file malformed. The prefix before the opener can be
 // valid JSON on its own, so returning it silently would report a truncated file as clean.
 func TestStripJSONCReportsUnterminatedBlockComment(t *testing.T) {
@@ -647,9 +649,20 @@ func TestUntypedSSEEndpointIsNotReportedAsHTTP(t *testing.T) {
 		}
 	}
 	// An explicit type still wins over the path heuristic.
-	rows, _ := extractEnvelopeSimple([]byte(`{"mcpServers":{"s":{"type":"http","url":"https://e.test/sse"}}}`))
-	if len(rows) == 1 && rows[0].Transport != "http" {
-		t.Errorf("an explicit type should win, got %q", rows[0].Transport)
+	//
+	// Asserted unconditionally. Guarding this on len(rows) == 1 meant an extraction that
+	// returned nothing satisfied the test without ever comparing a transport -- the precedence
+	// rule would have stopped being checked and nothing would have said so.
+	rows, err := extractEnvelopeSimple([]byte(
+		`{"mcpServers":{"s":{"type":"http","url":"https://e.test/sse"}}}`))
+	if err != nil {
+		t.Fatalf("explicit type: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("explicit type: got %d rows, want 1: %+v", len(rows), rows)
+	}
+	if rows[0].Transport != "http" {
+		t.Errorf("an explicit type should win over the /sse path, got %q", rows[0].Transport)
 	}
 }
 
@@ -664,6 +677,11 @@ func TestValueTakingOptionsDoNotBecomeThePackage(t *testing.T) {
 	}{
 		{"uvx", []string{"--python", "3.12", "actual-server"}, "actual-server"},
 		{"uvx", []string{"--with", "extra-dep", "actual-server"}, "actual-server"},
+		// pipx skipped flags but not the values they consume, so this returned 3.12.
+		{"pipx", []string{"run", "--python", "3.12", "actual-server"}, "actual-server"},
+		// uv indexed blindly to run+2 regardless of what sat there, returning --python.
+		{"uv", []string{"tool", "run", "--python", "3.12", "actual-server"}, "actual-server"},
+		{"uv", []string{"run", "--from", "real-pkg", "cmd"}, "real-pkg"},
 		{"docker", []string{"run", "--pull", "always", "myorg/real:1.0"}, "myorg/real"},
 		{"docker", []string{"run", "--rm", "-v", "/tmp:/tmp", "myorg/img:2"}, "myorg/img"},
 		{"npx", []string{"-y", "@scope/pkg@1.0.0"}, "@scope/pkg"},
@@ -711,5 +729,290 @@ func TestCollidingEnvelopeNamesYieldOneRow(t *testing.T) {
 	}
 	if rows[0].Command != "npx" || rows[0].SourceContext != "mcpServers" {
 		t.Errorf("mcpServers should win: %+v", rows[0])
+	}
+}
+
+// dockerRunIdentity has been through several arity strategies and regressed on each, so the
+// cases that broke it are pinned here rather than left to ad-hoc checks.
+//
+// The strategy is to enumerate the boolean options and assume everything else consumes a
+// value. That is the inversion of listing value-bearing options, which grew three times during
+// review -- --pull, then --cap-add, then --publish -- each addition prompted by a wrong package
+// name rather than by reading the docs.
+func TestDockerRunIdentityArity(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		// Values that satisfy the image grammar, which is why a grammar alone cannot decide.
+		{"publish long", []string{"run", "--publish", "8080:80", "myorg/s:1"}, "myorg/s:1"},
+		{"publish short", []string{"run", "-p", "8080:80", "myorg/s:1"}, "myorg/s:1"},
+		{"memory", []string{"run", "--memory", "512m", "myorg/s:1"}, "myorg/s:1"},
+		{"dns", []string{"run", "--dns", "1.1.1.1", "myorg/s:1"}, "myorg/s:1"},
+		{"env bare word", []string{"run", "-e", "debug", "myorg/s:1"}, "myorg/s:1"},
+		{"pull policy", []string{"run", "--pull", "always", "myorg/s:1"}, "myorg/s:1"},
+		{"restart policy", []string{"run", "--restart", "no", "myorg/s:1"}, "myorg/s:1"},
+		// Values the grammar rejects on case or structure.
+		{"cap-add", []string{"run", "--cap-add", "NET_ADMIN", "myorg/s:1"}, "myorg/s:1"},
+		// Booleans, listed and unlisted.
+		{"known booleans", []string{"run", "--rm", "-i", "-t", "myorg/s"}, "myorg/s"},
+		{"boolean then option", []string{"run", "--sig-proxy", "--publish", "8080:80", "myorg/s:1"}, "myorg/s:1"},
+		{"unlisted boolean then option", []string{"run", "--made-up-bool", "--publish", "8080:80", "myorg/s:1"}, "myorg/s:1"},
+		// An unlisted boolean directly before the image swallows it. No image beats a wrong
+		// one, which is the intended direction of error.
+		{"unlisted boolean then image", []string{"run", "--made-up-bool", "myorg/s:1"}, ""},
+		// Structural forms.
+		{"inline value", []string{"run", "--env=FOO=bar", "myorg/s:1"}, "myorg/s:1"},
+		{"double dash", []string{"run", "--", "myorg/s:1"}, "myorg/s:1"},
+		{"registry with port", []string{"run", "--privileged", "localhost:5000/t/i:tag"}, "localhost:5000/t/i:tag"},
+		{"digest reference", []string{"run", "myorg/s@sha256:" + strings.Repeat("a", 64)}, "myorg/s@sha256:" + strings.Repeat("a", 64)},
+		// Options whose value can begin with a dash. These fail in both directions and need
+		// their own category: classifying --oom-score-adj as boolean made the positive case
+		// report 100 as the image, and merely removing it from the boolean set made the
+		// negative case return nothing, because -100 was then read as an option that
+		// consumed the image. Docker documents --oom-score-adj as -1000..1000, and
+		// --pids-limit and --memory-swap use -1 for unlimited.
+		{"oom-score-adj positive", []string{"run", "--oom-score-adj", "100", "myorg/s:1"}, "myorg/s:1"},
+		{"oom-score-adj negative", []string{"run", "--oom-score-adj", "-100", "myorg/s:1"}, "myorg/s:1"},
+		{"pids-limit unlimited", []string{"run", "--pids-limit", "-1", "myorg/s:1"}, "myorg/s:1"},
+		{"memory-swap unlimited", []string{"run", "--memory-swap", "-1", "myorg/s:1"}, "myorg/s:1"},
+		{"negatable then chained option", []string{"run", "--oom-score-adj", "-100", "--publish", "8080:80", "myorg/s:1"}, "myorg/s:1"},
+		// Credential-bearing forms the grammar must reject outright.
+		{"userinfo", []string{"run", "user:secret@reg/img"}, ""},
+		{"no run subcommand", []string{"pull", "myorg/s:1"}, ""},
+	} {
+		if got := dockerRunIdentity(testCase.args); got != testCase.want {
+			t.Errorf("%s: %v -> %q, want %q", testCase.name, testCase.args, got, testCase.want)
+		}
+	}
+}
+
+// Every state the envelope parser distinguishes, in one table.
+//
+// This path has changed on four separate review rounds, and each change broke a state the
+// previous one had working: presence conflated with decodability, then a valid empty envelope
+// reported as malformed, then a malformed envelope discarding a healthy sibling envelope. The
+// states were described in comments and verified by throwaway checks that were then deleted,
+// which is why they kept regressing. Pinned here instead.
+//
+// The distinctions that matter, and why:
+//
+//   - No recognised key: the only case where reading the document as flat is legitimate.
+//   - Present but empty, `{}` or `null`: a valid configuration with no servers. Must not
+//     error, and must not fall through to flat either, or an unrelated sibling object gets
+//     attributed as a server.
+//   - Present but the wrong type: that envelope is malformed. The *other* envelope, if there
+//     is one, is unaffected.
+//   - Present with entries that all fail: nothing usable, so a file-level error.
+//   - Malformed alongside healthy: keep the healthy rows and report the failure beside them.
+func TestEnvelopeStates(t *testing.T) {
+	for _, testCase := range []struct {
+		name         string
+		doc          string
+		wantErr      bool
+		wantServers  []string
+		wantWarnings int
+	}{
+		{
+			name:        "no recognised key reads as flat",
+			doc:         `{"flat-server":{"command":"npx","args":["x"]}}`,
+			wantServers: []string{"flat-server"},
+		},
+		{
+			name: "empty object is a valid zero-server configuration",
+			doc:  `{"mcpServers":{}}`,
+		},
+		{
+			name: "null is a valid zero-server configuration",
+			doc:  `{"mcpServers":null}`,
+		},
+		{
+			name: "empty envelope does not fall through to flat",
+			doc:  `{"mcpServers":{},"other":{"command":"node"}}`,
+			// Specifically NOT ["other"]: the envelope was present and said there are none.
+		},
+		{
+			name: "null envelope does not fall through to flat",
+			doc:  `{"mcpServers":null,"other":{"command":"node"}}`,
+		},
+		{
+			name:    "wrong-shaped envelope with nothing else is an error",
+			doc:     `{"mcpServers":[]}`,
+			wantErr: true,
+		},
+		{
+			name:         "wrong-shaped envelope must not erase a healthy sibling envelope",
+			doc:          `{"mcpServers":[],"servers":{"healthy":{"command":"node"}}}`,
+			wantServers:  []string{"healthy"},
+			wantWarnings: 1,
+		},
+		{
+			name:    "wrong-shaped envelope with no usable alternate is an error",
+			doc:     `{"mcpServers":"nope","other":{"command":"node"}}`,
+			wantErr: true,
+		},
+		{
+			name:    "every entry failing is an error",
+			doc:     `{"mcpServers":{"a":{"command":1},"b":{"args":2}}}`,
+			wantErr: true,
+		},
+		{
+			name:         "one entry failing keeps its siblings and reports itself",
+			doc:          `{"mcpServers":{"good":{"command":"npx"},"bad":{"command":1}}}`,
+			wantServers:  []string{"good"},
+			wantWarnings: 1,
+		},
+		{
+			name:        "healthy envelope",
+			doc:         `{"mcpServers":{"ok":{"command":"npx"}}}`,
+			wantServers: []string{"ok"},
+		},
+		{
+			name:        "servers spelling is equally recognised",
+			doc:         `{"servers":{"ok":{"command":"npx"}}}`,
+			wantServers: []string{"ok"},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			rows, err := extractEnvelopeSimple([]byte(testCase.doc))
+			if (err != nil) != testCase.wantErr {
+				t.Fatalf("err = %v, wantErr = %v (rows=%+v)", err, testCase.wantErr, rows)
+			}
+			var names []string
+			warnings := 0
+			for _, row := range rows {
+				if row.Warning != "" {
+					warnings++
+					continue
+				}
+				names = append(names, row.ServerName)
+			}
+			sort.Strings(names)
+			want := append([]string(nil), testCase.wantServers...)
+			sort.Strings(want)
+			if !reflect.DeepEqual(names, want) {
+				t.Errorf("servers = %v, want %v", names, want)
+			}
+			if warnings != testCase.wantWarnings {
+				t.Errorf("warnings = %d, want %d (rows=%+v)", warnings, testCase.wantWarnings, rows)
+			}
+		})
+	}
+	// Invalid JSON is a parse failure regardless of envelope reasoning.
+	if _, err := extractEnvelopeSimple([]byte(`{not json`)); err == nil {
+		t.Error("invalid JSON should error")
+	}
+}
+
+// The identity columns are derived from user-controlled arguments, and a blacklist of rejected
+// prefixes accepted everything it had not anticipated -- which included credentials.
+// user:opaque-password@registry/image was emitted as package_name=user:opaque-password: an
+// actual password in a row, not the documented opaque-value caveat, because the final redactor
+// only recognises issuer-prefixed token shapes and a password is not one.
+//
+// A positive grammar is what fixes it: a colon cannot appear in a package name, and a Docker
+// port must be numeric, so every userinfo form is rejected without enumerating them.
+func TestCredentialBearingFormsNeverReachIdentityColumns(t *testing.T) {
+	for _, candidate := range []string{
+		"user:opaque-password@registry/image",
+		"https:user:secret@host",
+		"a:b@c",
+		"user:pw@host:1234/img",
+		"//user:pw@host/img",
+	} {
+		if looksLikePackageSpec(candidate) {
+			t.Errorf("looksLikePackageSpec(%q) = true: a colon cannot appear in a package name",
+				candidate)
+		}
+		for _, command := range []string{"uvx", "npx", "bunx", "docker"} {
+			args := []string{candidate}
+			if command == "docker" {
+				args = []string{"run", candidate}
+			}
+			server := Server{Command: command, Args: args, Transport: "stdio"}
+			inferIdentity(&server)
+			for column, value := range map[string]string{
+				"package_name":   server.PackageName,
+				"requested_spec": server.RequestedSpec,
+				"version":        server.Version,
+			} {
+				if strings.Contains(value, "password") || strings.Contains(value, "secret") ||
+					strings.Contains(value, "pw@") || strings.Contains(value, ":b@") {
+					t.Errorf("%s %q: %s = %q", command, candidate, column, value)
+				}
+			}
+		}
+	}
+	// The forms that must still be accepted, so the grammar is not merely strict.
+	for _, valid := range []string{
+		"@scope/pkg@1.0.0", "real-server@1.2.3", "mcp-server-time", "pkg==1.2",
+		"awslabs.aws-documentation-mcp-server",
+	} {
+		if !looksLikePackageSpec(valid) {
+			t.Errorf("looksLikePackageSpec(%q) = false, want true", valid)
+		}
+	}
+}
+
+// null and {} decode without error into a zero entry, and the envelope path had no shape check
+// where the flat path did. They became rows with a server name, transport unknown, and no
+// warning: servers that were never configured.
+//
+// Distinct from an envelope that is itself null or empty, which TestEnvelopeStates covers.
+// This is a null *entry inside* a healthy envelope.
+func TestZeroValuedEntriesAreNotEmittedAsServers(t *testing.T) {
+	rows, err := extractEnvelopeSimple([]byte(
+		`{"mcpServers":{"nullish":null,"empty":{},"real":{"command":"npx"}}}`))
+	if err != nil {
+		t.Fatalf("two unusable entries must not fail the file: %v", err)
+	}
+	var names []string
+	diagnostics := 0
+	for _, row := range rows {
+		if row.Warning != "" {
+			diagnostics++
+			continue
+		}
+		names = append(names, row.ServerName)
+	}
+	if len(names) != 1 || names[0] != "real" {
+		t.Errorf("servers = %v, want only \"real\"", names)
+	}
+	if diagnostics != 1 {
+		t.Errorf("the two skipped entries should be reported, got %d diagnostics", diagnostics)
+	}
+}
+
+// One project whose value is the wrong shape must not take the file with it. The projects map
+// was decoded into a typed struct, so a single bad project failed the whole Unmarshal --
+// including the global mcpServers -- on the file that holds the most servers on a real machine.
+func TestOneMalformedClaudeProjectKeepsTheRest(t *testing.T) {
+	rows, err := extractClaudeCode([]byte(`{
+		"mcpServers": {"global": {"command": "npx"}},
+		"projects": {
+			"/a": {"mcpServers": {"healthy": {"command": "node"}}},
+			"/b": {"mcpServers": "not-an-object"}
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("one malformed project must not fail the file: %v", err)
+	}
+	found := map[string]bool{}
+	diagnostics := 0
+	for _, row := range rows {
+		if row.Warning != "" {
+			diagnostics++
+			continue
+		}
+		found[row.ServerName] = true
+	}
+	for _, want := range []string{"global", "healthy"} {
+		if !found[want] {
+			t.Errorf("%q was lost with the malformed project; found %v", want, found)
+		}
+	}
+	if diagnostics != 1 {
+		t.Errorf("the malformed project should be reported, got %d diagnostics", diagnostics)
 	}
 }

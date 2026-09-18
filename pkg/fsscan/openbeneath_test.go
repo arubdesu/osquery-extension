@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build unix
 
 package fsscan
 
@@ -130,5 +130,32 @@ func TestReadBoundedUnder_SizeCapEnforced(t *testing.T) {
 	}
 	if _, err := ReadBoundedUnder(base, "f.json", 5); err == nil {
 		t.Fatal("expected size cap error")
+	}
+}
+
+// The contract says ".." is rejected. filepath.Clean ran first, so a/../secret.json collapsed
+// to secret.json and was accepted -- nothing escaped, because Clean normalises within the base,
+// but a caller reasoning about which path was opened was being told the wrong thing.
+func TestSplitSafeComponentsRejectsInteriorDotDot(t *testing.T) {
+	for _, rejected := range []string{
+		"..",
+		"../secret.json",
+		"a/../secret.json",
+		"a/b/../../secret.json",
+		"a/../../outside.json",
+	} {
+		if _, err := splitSafeComponents(rejected); err == nil {
+			t.Errorf("splitSafeComponents(%q) accepted a path containing ..", rejected)
+		}
+	}
+	for _, accepted := range []string{
+		".cursor/mcp.json",
+		"Library/Application Support/Claude/claude_desktop_config.json",
+		"./a/b.json",
+		"a/./b.json",
+	} {
+		if _, err := splitSafeComponents(accepted); err != nil {
+			t.Errorf("splitSafeComponents(%q) = %v, want accepted", accepted, err)
+		}
 	}
 }

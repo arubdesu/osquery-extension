@@ -1,6 +1,8 @@
 package mcp_servers
 
 import (
+	"fmt"
+
 	"github.com/BurntSushi/toml"
 )
 
@@ -49,10 +51,18 @@ type tomlServerEntry struct {
 
 // extractCodexTOML parses a Codex config.toml and returns one Server per [mcp_servers.<name>].
 func extractCodexTOML(data []byte) ([]Server, error) {
+	// Each server is held as a primitive and decoded on its own, the same way the JSON
+	// extractors decode each entry from a json.RawMessage.
+	//
+	// Decoding the whole mcp_servers map in one Unmarshal meant one entry with a wrong field
+	// type failed the file and replaced every healthy sibling with a single parse warning --
+	// the same failure already fixed for JSON envelopes and Claude projects, still present
+	// here because the TOML path was written later and copied the wrong shape.
 	var doc struct {
-		MCPServers map[string]tomlServerEntry `toml:"mcp_servers"`
+		MCPServers map[string]toml.Primitive `toml:"mcp_servers"`
 	}
-	if err := toml.Unmarshal(data, &doc); err != nil {
+	metadata, err := toml.Decode(string(data), &doc)
+	if err != nil {
 		return nil, err
 	}
 	if len(doc.MCPServers) == 0 {
@@ -60,7 +70,28 @@ func extractCodexTOML(data []byte) ([]Server, error) {
 		// carries plenty of unrelated settings.
 		return nil, nil
 	}
-	return materializeTOML(doc.MCPServers), nil
+	entries := make(map[string]tomlServerEntry, len(doc.MCPServers))
+	skipped := 0
+	for name, primitive := range doc.MCPServers {
+		var entry tomlServerEntry
+		if err := metadata.PrimitiveDecode(primitive, &entry); err != nil {
+			skipped++
+			continue
+		}
+		// A shape check after decoding, matching what the JSON extractors do. An empty
+		// [mcp_servers.placeholder] table decodes without error into a zero entry and became
+		// a clean row: a server name, transport unknown, no command, no warning. A server
+		// that declares nothing is not a server.
+		if !looksLikeTOMLServerEntry(entry) {
+			skipped++
+			continue
+		}
+		entries[name] = entry
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("mcp_servers present but no decodable entries (%d skipped)", skipped)
+	}
+	return append(materializeTOML(entries), skippedEntryWarning(skipped)...), nil
 }
 
 // materializeTOML applies the same sanitization materialize() applies to the JSON shapes, so
@@ -157,4 +188,14 @@ func tomlEnvKeys(entry tomlServerEntry) []string {
 	}
 	add(entry.BearerTokenEnvVar)
 	return out
+}
+
+// looksLikeTOMLServerEntry reports whether a decoded entry declares anything that identifies a
+// server. The TOML counterpart of looksLikeServerEntry, kept separate because the two formats'
+// field sets differ: env_vars, bearer_token_env_var and env_http_headers exist only here.
+func looksLikeTOMLServerEntry(entry tomlServerEntry) bool {
+	return entry.Command != "" || entry.URL != "" || entry.Type != "" || entry.Transport != "" ||
+		len(entry.Args) > 0 || len(entry.Env) > 0 || len(entry.EnvVars) > 0 ||
+		entry.BearerTokenEnvVar != "" || len(entry.EnvHTTPHeaders) > 0 ||
+		entry.Enabled != nil || entry.Disabled != nil
 }

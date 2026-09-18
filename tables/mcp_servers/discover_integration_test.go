@@ -141,7 +141,8 @@ func TestDiscoverForHome_SkipsClaudePluginMarketplace(t *testing.T) {
 	})
 	rows := discoverForTest("alice", home)
 	for _, r := range rows {
-		if strings.Contains(r.SourcePath, "plugins/marketplaces") || strings.Contains(r.SourcePath, "plugins/cache") {
+		if strings.Contains(r.SourcePath, filepath.Join("plugins", "marketplaces")) ||
+			strings.Contains(r.SourcePath, filepath.Join("plugins", "cache")) {
 			t.Errorf("catalog entry leaked into table: %s", r.SourcePath)
 		}
 	}
@@ -199,7 +200,7 @@ func TestDiscoverForHome_AllRowsHaveUserAndPath(t *testing.T) {
 	if rows[0].User != "bob" {
 		t.Errorf("user: %q", rows[0].User)
 	}
-	if !strings.HasSuffix(rows[0].SourcePath, ".cursor/mcp.json") {
+	if !strings.HasSuffix(rows[0].SourcePath, filepath.Join(".cursor", "mcp.json")) {
 		t.Errorf("source path: %q", rows[0].SourcePath)
 	}
 }
@@ -247,25 +248,6 @@ func TestDiscoverForHome_JSONCWithComments(t *testing.T) {
 	}
 	if rows[0].ServerName != "x" {
 		t.Errorf("server name: %q", rows[0].ServerName)
-	}
-}
-
-func TestDiscoverForHome_SymlinkAttack_RefusedSilently(t *testing.T) {
-	// Attacker scenario: home contains a symlink at .cursor/mcp.json pointing to /etc/passwd.
-	// fsscan.ReadBounded refuses the symlink at the kernel level (O_NOFOLLOW). No leak.
-	home := t.TempDir()
-	cursorDir := filepath.Join(home, ".cursor")
-	if err := os.MkdirAll(cursorDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("/etc/passwd", filepath.Join(cursorDir, "mcp.json")); err != nil {
-		t.Fatal(err)
-	}
-	rows := discoverForTest("alice", home)
-	for _, r := range rows {
-		if strings.HasSuffix(r.SourcePath, "/.cursor/mcp.json") {
-			t.Errorf("symlink was followed: %#v", r)
-		}
 	}
 }
 
@@ -415,47 +397,6 @@ func TestDiscoverAllHonoursCallerCancellation(t *testing.T) {
 	}
 }
 
-// A path the walker produced must be opened relative to the user home with O_NOFOLLOW on
-// every component, not just the last.
-//
-// This exercises the read step directly rather than going through discoverForHome, because the
-// real defect is a TOCTOU: filepath.WalkDir never descends a symlink, so the walk is safe, but
-// the user owns the directory and can swap it for a symlink after discovery and before the
-// open. A single-threaded test cannot sit inside that window, and planting the symlink up
-// front instead just means the walk never yields the path at all -- which is why the first
-// version of this test passed with the bug present. Calling processOne with an already-swapped
-// parent reproduces exactly the state the race would create.
-func TestProcessOneRefusesASymlinkedParentDirectory(t *testing.T) {
-	root := t.TempDir()
-	home := filepath.Join(root, "alice")
-	victimDir := filepath.Join(root, "victim", "repo")
-	if err := os.MkdirAll(victimDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(victimDir, ".mcp.json"),
-		[]byte(`{"mcpServers":{"victim-secret":{"command":"npx","args":["x"]}}}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(home, "code"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// code/repo is a symlink out of the home, as it would be mid-race.
-	if err := os.Symlink(victimDir, filepath.Join(home, "code", "repo")); err != nil {
-		t.Fatal(err)
-	}
-
-	rows := processOne(home, filepath.Join(home, "code", "repo", ".mcp.json"),
-		"alice", "claude_code", true, extractEnvelopeSimple)
-	for _, row := range rows {
-		if row.ServerName == "victim-secret" {
-			t.Errorf("read through a symlinked parent into another user's config: %+v", row)
-		}
-	}
-	if len(rows) != 0 {
-		t.Errorf("a refused read should be silent, got %+v", rows)
-	}
-}
-
 // Codex ships an installable-plugin catalog in the same file shape as real configuration, and
 // it had no exclusion while Claude's equivalent did. Measured on one workstation after a Codex
 // update, 39 of 51 rows came from these directories -- airtable, canva, figma, slack, stripe
@@ -561,29 +502,45 @@ func TestDiscoverForHome_CodexProjectAndProfileTOML(t *testing.T) {
 	}
 }
 
-// Pass 1 stopping early has to be reported. Breaking out of the direct-source loop quietly
-// also skips Pass 2, so the home returns only what had been read and looks like a user with
-// fewer configs -- the confusion the per-user rows in DiscoverAll exist to prevent.
+// The budget running out mid-home has to be reported, by either route.
 //
-// Forced with an already-exhausted budget so Pass 1 breaks on its first iteration.
-func TestDiscoverForHomeReportsWhenPassOneStopsEarly(t *testing.T) {
+// Two paths reach it and only one was covered. Pass 1 breaking early was handled. Pass 1
+// *completing* while the deadline passed during its final read was not: the range just ended,
+// no break fired, and the Pass 2 guard then skipped the walk silently. A home whose last
+// direct read was slow -- the network-backed case the budget exists for -- returned partial
+// rows that looked complete. One diagnostic after Pass 1 now covers both.
+func TestDiscoverForHomeReportsAnExhaustedBudget(t *testing.T) {
 	home := buildFakeHome(t, map[string]string{
-		".cursor/mcp.json": `{"mcpServers":{"never-read":{"command":"npx","args":["x"]}}}`,
+		".cursor/mcp.json": `{"mcpServers":{"maybe-read":{"command":"npx","args":["x"]}}}`,
 	})
-	rows := discoverForHome(context.Background(), "alice", home, -1*time.Second)
-	if len(rows) == 0 {
-		t.Fatal("an exhausted budget must not return silently")
-	}
-	var reported bool
-	for _, row := range rows {
-		if strings.Contains(row.Warning, "partway through this user") {
-			reported = true
+	for _, testCase := range []struct {
+		name   string
+		budget time.Duration
+	}{
+		// Breaks on the first iteration of Pass 1.
+		{"already exhausted", -1 * time.Second},
+		// Positive on entry, gone by the time Pass 2 is considered. Whether this breaks
+		// mid-loop or completes and fails the guard depends on how fast the opens are, which
+		// is the point: both routes must report.
+		{"expires during pass 1", 1 * time.Nanosecond},
+	} {
+		rows := discoverForHome(context.Background(), "alice", home, testCase.budget)
+		var diagnostics int
+		for _, row := range rows {
+			if row.Warning == "" {
+				continue
+			}
+			diagnostics++
+			if !strings.Contains(row.Warning, "scan truncated") {
+				t.Errorf("%s: warning does not name the cause: %q", testCase.name, row.Warning)
+			}
+			if row.Transport != "unknown" || row.Confidence != "low" {
+				t.Errorf("%s: diagnostic breaks the identity contract: %+v", testCase.name, row)
+			}
 		}
-		if row.Warning != "" && (row.Transport != "unknown" || row.Confidence != "low") {
-			t.Errorf("diagnostic row breaks the identity contract: %+v", row)
+		if diagnostics != 1 {
+			t.Errorf("%s: want exactly one diagnostic, got %d: %+v",
+				testCase.name, diagnostics, rows)
 		}
-	}
-	if !reported {
-		t.Errorf("no row says Pass 1 stopped early: %+v", rows)
 	}
 }

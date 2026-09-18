@@ -1,8 +1,9 @@
-//go:build !windows
+//go:build unix
 
 package fsscan
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -56,4 +57,22 @@ func openBeneathComponents(baseDir, relPath string, components []string) (*os.Fi
 		currentFD = nextFD
 	}
 	return os.NewFile(uintptr(currentFD), filepath.Join(baseDir, relPath)), nil
+}
+
+// isRefusedOrNotDirectory reports whether err is a symlink refusal or a traversal through a
+// non-directory, the two errno cases IsExpectedAbsent treats as benign absence alongside
+// ENOENT. Split out per-platform because ELOOP and ENOTDIR are not defined on every GOOS.
+//
+// Both the wrapped and unwrapped forms are checked: errors.Is walks a %w chain, while
+// unix.Openat returns a bare syscall.Errno that only surfaces after OpenBeneath's fmt.Errorf
+// wrap is unwound.
+func isRefusedOrNotDirectory(err error) bool {
+	if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.ENOTDIR) {
+		return true
+	}
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		return errors.Is(pathErr.Err, syscall.ELOOP) || errors.Is(pathErr.Err, syscall.ENOTDIR)
+	}
+	return false
 }

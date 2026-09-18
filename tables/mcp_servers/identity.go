@@ -1,6 +1,7 @@
 package mcp_servers
 
 import (
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -87,8 +88,10 @@ func inferIdentity(s *Server) {
 		// Docker refs aren't package specs in the npm/pypi sense; splitDockerRef
 		// returns (name, version) for valid refs and "", "" otherwise. We
 		// accept whatever it produces.
-		ref := dockerRunIdentity(argTok)
-		if ref != "" && !strings.Contains(ref, "://") {
+		// Validated against the reference grammar before anything is assigned. The old
+		// guard only excluded "://", so user:secret@reg/img was emitted verbatim as both
+		// requested_spec and package_name.
+		if ref := dockerRunIdentity(argTok); dockerRefRe.MatchString(ref) {
 			s.RequestedSpec = ref
 			s.PackageName, s.Version = splitDockerRef(ref)
 		}
@@ -151,10 +154,18 @@ func effectiveCommandArgs(cmd string, args []string) (string, []string) {
 
 // guessRemoteTransport returns "sse" if the args or URL hint at server-sent events,
 // otherwise "http". MCP currently uses Streamable HTTP and SSE.
+//
+// The URL is parsed and only whole path segments are compared. Matching the substring "/sse"
+// anywhere classified /sse-notify, /sse2 and even a query string containing /sse as SSE, and
+// that value is emitted as the server's transport.
 func guessRemoteTransport(u string, args []string) string {
-	lo := strings.ToLower(u)
-	if strings.Contains(lo, "/sse") || strings.HasSuffix(lo, "/events") {
-		return "sse"
+	if parsed, err := url.Parse(u); err == nil {
+		for _, segment := range strings.Split(parsed.Path, "/") {
+			switch strings.ToLower(segment) {
+			case "sse", "events":
+				return "sse"
+			}
+		}
 	}
 	for _, a := range args {
 		if strings.EqualFold(a, "--transport=sse") || strings.EqualFold(a, "sse") {
@@ -253,9 +264,11 @@ func uvRunIdentity(args []string) string {
 			return args[i+1]
 		}
 	}
-	for i := 0; i < len(args); i++ {
-		if args[i] == "tool" && i+2 < len(args) && args[i+1] == "run" {
-			return args[i+2]
+	// `uv tool run --python 3.12 actual-server` returned --python, because this indexed to
+	// run+2 without regard for what sat there.
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "tool" && args[i+1] == "run" {
+			return firstOperandAfter(args[i+1:], "run")
 		}
 	}
 	return ""
@@ -267,53 +280,139 @@ func pipxIdentity(args []string) string {
 			return args[i+1]
 		}
 	}
-	for _, a := range args {
-		if a == "run" {
+	// `pipx run --python 3.12 actual-server` returned 3.12: the scan skipped flags but not
+	// the values they consume, and 3.12 is name-shaped so no grammar rejects it either.
+	return firstOperandAfter(args, "run")
+}
+
+// firstOperandAfter returns the first positional argument following subcommand, skipping any
+// argument consumed as a value by the option before it, and requiring the result to be
+// package-shaped.
+//
+// One scanner for the launchers that take a subcommand. Each of pipx, uv and docker previously
+// had its own partial version: pipx skipped flags but not their values, uv indexed blindly to
+// run+2, and docker maintained a hand-written list of value-taking options that kept needing
+// additions. Arity comes from runnerValueFlags, which they now share.
+func firstOperandAfter(args []string, subcommand string) string {
+	started := subcommand == ""
+	for i, argument := range args {
+		if !started {
+			if argument == subcommand {
+				started = true
+			}
 			continue
 		}
-		if !strings.HasPrefix(a, "-") {
-			return a
+		if strings.HasPrefix(argument, "-") {
+			continue
+		}
+		if i > 0 {
+			if _, consumed := runnerValueFlags[args[i-1]]; consumed {
+				continue
+			}
+		}
+		if looksLikePackageSpec(argument) {
+			return argument
 		}
 	}
 	return ""
 }
 
+// dockerRunIdentity returns the image reference from a `docker run` invocation.
+//
+// Option arity is decided by listing the *boolean* options and assuming everything else takes
+// a value. That is the inversion of the obvious approach and the reason it works: docker run
+// has dozens of value-bearing options and the list of them kept needing additions, each found
+// only when it produced a wrong package name -- --pull, then --cap-add, then --publish. The
+// boolean set is small, stable, and its members are the ones a reader can actually recall.
+//
+// Values that satisfy the image grammar are what made the previous approach fail silently
+// rather than loudly: `--publish 8080:80` reads as a tagged reference, `--memory 512m` and
+// `--dns 1.1.1.1` as one-component ones. No grammar distinguishes those from an image, because
+// they are valid images.
+//
+// An unrecognised option is therefore assumed to consume its next token. That can swallow the
+// real image and yield nothing, which is the intended direction of error: an empty identity at
+// low confidence is honest, a confident wrong one is not.
 func dockerRunIdentity(args []string) string {
-	// Find the image: first non-flag after the `run` subcommand. Flags that take
-	// a value (-v, -p, -e, --network, --mount, --name, --user, --env, --rm... etc.)
-	// must consume the next arg. We keep a small allowlist of value-taking flags;
-	// anything else with `--foo=bar` is treated as no-value.
-	valueFlags := map[string]struct{}{
-		"-v": {}, "--volume": {},
-		"-p": {}, "--publish": {},
-		"-e": {}, "--env": {},
-		"--mount": {}, "--name": {}, "--user": {}, "-u": {},
-		"--network": {}, "--workdir": {}, "-w": {},
-		"--entrypoint": {}, "--label": {}, "-l": {},
-		"--env-file": {}, "--add-host": {}, "--platform": {},
-		// --pull takes a policy (always|missing|never). Without it, `docker run --pull
-		// always myorg/img` reported the image as "always".
-		"--pull": {}, "--restart": {}, "--log-driver": {}, "--memory": {}, "-m": {},
-		"--cpus": {}, "--device": {}, "--dns": {}, "--hostname": {}, "-h": {},
-	}
 	sawRun := false
 	for i := 0; i < len(args); i++ {
-		a := args[i]
+		argument := args[i]
 		if !sawRun {
-			if a == "run" {
+			if argument == "run" {
 				sawRun = true
 			}
 			continue
 		}
-		if strings.HasPrefix(a, "-") {
-			if _, takesValue := valueFlags[a]; takesValue && i+1 < len(args) {
+		if argument == "--" {
+			// Everything after this is the image and the container's command.
+			if i+1 < len(args) && dockerRefRe.MatchString(args[i+1]) {
+				return args[i+1]
+			}
+			return ""
+		}
+		if strings.HasPrefix(argument, "-") {
+			if strings.Contains(argument, "=") {
+				continue // the inline form carries its own value
+			}
+			if _, isBoolean := dockerBooleanFlags[argument]; isBoolean {
+				continue
+			}
+			// A handful of options take a value that can legitimately begin with a dash,
+			// so for those the next token is consumed unconditionally.
+			if _, negatable := dockerNegatableValueFlags[argument]; negatable {
+				i++
+				continue
+			}
+			// Otherwise: assumed to consume the next token, but never when that token is
+			// itself an option. A boolean missing from the list below would otherwise
+			// swallow the following option and hand back *its* value as the image:
+			// `docker run --sig-proxy --publish 8080:80 img` skipped --publish and returned
+			// 8080:80. An option is not a value, so declining to consume one costs nothing
+			// and repairs the whole chain.
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
 				i++
 			}
 			continue
 		}
-		return a
+		if dockerRefRe.MatchString(argument) {
+			return argument
+		}
+		// A positional that is not reference-shaped means the arity assumptions and reality
+		// have diverged. Stop, rather than keep looking and risk returning the container's
+		// command as the image.
+		return ""
 	}
 	return ""
+}
+
+// dockerBooleanFlags are the `docker run` options that take no value. Everything else is
+// assumed to consume its next argument.
+//
+// Enumerating these rather than their complement is what makes the scan stable: this set
+// changes rarely, while the value-bearing set is large and grew three times during review.
+var dockerBooleanFlags = map[string]struct{}{
+	"-d": {}, "--detach": {},
+	"-i": {}, "--interactive": {},
+	"-t": {}, "--tty": {},
+	"--rm": {}, "--privileged": {}, "--init": {}, "--read-only": {},
+	"-q": {}, "--quiet": {}, "--no-healthcheck": {}, "--oom-kill-disable": {},
+	"--publish-all": {}, "-P": {}, "--help": {}, "--disable-content-trust": {},
+	// --sig-proxy is documented with a default of true and takes no value in the common
+	// form. Omitting it is what produced the chained-option failure above.
+	"--sig-proxy": {}, "--no-trunc": {},
+}
+
+// dockerNegatableValueFlags take a value that can begin with a dash, so the general rule of
+// never consuming an option-looking token would leave their value unconsumed.
+//
+// --oom-score-adj accepts -1000 to 1000, and --pids-limit and --memory-swap use -1 for
+// unlimited. Getting this wrong fails in both directions: classifying --oom-score-adj as
+// boolean made `--oom-score-adj 100 myorg/s:1` report 100 as the image, and merely removing it
+// from the boolean set left `--oom-score-adj -100 myorg/s:1` returning nothing, because -100
+// was then read as an option that consumed the image.
+var dockerNegatableValueFlags = map[string]struct{}{
+	"--oom-score-adj": {}, "--pids-limit": {}, "--memory-swap": {}, "--kernel-memory": {},
+	"--blkio-weight": {}, "--cpu-period": {}, "--cpu-quota": {},
 }
 
 func pythonModule(args []string) string {
@@ -389,22 +488,43 @@ func splitDockerRef(ref string) (name, ver string) {
 	return ref, ""
 }
 
-// looksLikePackageSpec rejects URLs, git refs, file paths, and tarballs so we don't
-// emit them as fake package names.
+// packageSpecRe is the union of the npm and PyPI spec shapes: an optional @scope, a name, and
+// an optional version introduced by @ or a PEP 440 comparison operator.
+//
+// A positive grammar, replacing a list of rejected prefixes. The blacklist accepted anything it
+// had not thought of, and what it had not thought of included credentials:
+// user:opaque-password@registry/image passed it and was emitted as
+// package_name=user:opaque-password. A colon cannot appear in a package name, so a grammar
+// rejects every userinfo form without having to enumerate them -- which matters because the
+// final redactor only recognises known token shapes and an arbitrary password is not one.
+var packageSpecRe = regexp.MustCompile(
+	`^(@[A-Za-z0-9][A-Za-z0-9._-]*/)?[A-Za-z0-9][A-Za-z0-9._-]*` +
+		`((==|>=|<=|~=|!=|[@><])[A-Za-z0-9][A-Za-z0-9.+_~*-]*)?$`)
+
+// dockerRefRe is the distribution reference grammar: an optional host with optional numeric
+// port, one or more lowercase path components, an optional tag, and an optional digest.
+//
+// The port being digits-only is what rejects user:password@host, and requiring lowercase in
+// path components is what rejects an option value such as NET_ADMIN being read as an image.
+var dockerRefRe = regexp.MustCompile(
+	`^([a-z0-9][a-z0-9.-]*(:[0-9]+)?/)?` +
+		`[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*` +
+		`(:[A-Za-z0-9][A-Za-z0-9._-]*)?(@sha256:[a-f0-9]{64})?$`)
+
+// looksLikePackageSpec reports whether a candidate is shaped like an npm or PyPI spec.
+//
+// Tarball and archive suffixes are still rejected explicitly: they satisfy the name grammar
+// (a filename is name-shaped) but are a local artifact rather than a registry package.
 func looksLikePackageSpec(s string) bool {
-	if s == "" {
+	if s == "" || len(s) > 214 { // npm's documented maximum name length
 		return false
 	}
 	lo := strings.ToLower(s)
 	switch {
-	case strings.Contains(lo, "://"):
-		return false
-	case strings.HasPrefix(lo, "git+"), strings.HasPrefix(lo, "git@"):
-		return false
-	case strings.HasPrefix(lo, "./"), strings.HasPrefix(lo, "../"), strings.HasPrefix(lo, "/"):
-		return false
-	case strings.HasSuffix(lo, ".tar"), strings.HasSuffix(lo, ".tar.gz"), strings.HasSuffix(lo, ".tgz"), strings.HasSuffix(lo, ".zip"):
+	case strings.HasSuffix(lo, ".tar"), strings.HasSuffix(lo, ".tar.gz"),
+		strings.HasSuffix(lo, ".tgz"), strings.HasSuffix(lo, ".zip"),
+		strings.HasSuffix(lo, ".whl"):
 		return false
 	}
-	return true
+	return packageSpecRe.MatchString(s)
 }

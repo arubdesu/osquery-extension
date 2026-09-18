@@ -541,3 +541,65 @@ env_vars = [42, "REAL_ONE"]
 		t.Errorf("the usable reference should survive: %v", servers[0].EnvKeys)
 	}
 }
+
+// An empty [mcp_servers.name] table decodes without error into a zero entry. Emitting it
+// produced a clean row with a server name and nothing else -- a server that was never
+// configured. The JSON extractors already rejected the equivalent {}.
+func TestCodexTOMLRejectsEmptyServerTables(t *testing.T) {
+	servers, err := extractCodexTOML([]byte(`
+[mcp_servers.placeholder]
+
+[mcp_servers.real]
+command = "node"
+`))
+	if err != nil {
+		t.Fatalf("one empty table must not fail the file: %v", err)
+	}
+	var healthy, diagnostics int
+	for _, server := range servers {
+		switch {
+		case server.Warning != "":
+			diagnostics++
+		case server.ServerName == "real":
+			healthy++
+		default:
+			t.Errorf("phantom server emitted: %+v", server)
+		}
+	}
+	if healthy != 1 {
+		t.Errorf("the real server should survive, got %d: %+v", healthy, servers)
+	}
+	if diagnostics != 1 {
+		t.Errorf("the skipped placeholder should be reported, got %d", diagnostics)
+	}
+}
+
+// A file whose every server table is empty is a file with nothing usable in it.
+func TestCodexTOMLAllEmptyTablesErrors(t *testing.T) {
+	if _, err := extractCodexTOML([]byte("[mcp_servers.a]\n\n[mcp_servers.b]\n")); err == nil {
+		t.Error("a file with no usable entries should report a parse failure")
+	}
+}
+
+// And one malformed entry beside a healthy one keeps the healthy one.
+func TestCodexTOMLMalformedEntryKeepsSiblings(t *testing.T) {
+	servers, err := extractCodexTOML([]byte(`
+[mcp_servers.good]
+command = "node"
+
+[mcp_servers.broken]
+command = 123
+`))
+	if err != nil {
+		t.Fatalf("one malformed entry must not fail the file: %v", err)
+	}
+	var names []string
+	for _, server := range servers {
+		if server.Warning == "" {
+			names = append(names, server.ServerName)
+		}
+	}
+	if len(names) != 1 || names[0] != "good" {
+		t.Errorf("want only the healthy server, got %v", names)
+	}
+}

@@ -3,6 +3,7 @@ package mcp_servers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"path/filepath"
 	"strings"
@@ -169,13 +170,28 @@ func DiscoverAll(ctx context.Context, userFilter map[string]struct{}) []Server {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	homes, err := fsscan.ListUserHomes(fsscan.UsersRoot)
+	enumerated, err := fsscan.ListUserHomes(fsscan.UsersRoot)
 	if err != nil {
 		return []Server{diagnosticRow("", fsscan.UsersRoot, "", "list users: "+err.Error())}
 	}
 	deadline := time.Now().Add(fsscan.WalkTimeout())
 	var out []Server
-	for _, h := range homes {
+	// One row per skipped account, carrying that account's name.
+	//
+	// An aggregate row with an empty user was filtered out by `WHERE user = '<name>'`, so if
+	// the account asked about was the skipped one the caller saw a clean empty result. The
+	// userFilter is applied here too, so a narrowed query still gets the diagnostic that
+	// concerns it and not the others.
+	for _, name := range enumerated.Skipped {
+		if userFilter != nil {
+			if _, ok := userFilter[name]; !ok {
+				continue
+			}
+		}
+		out = append(out, diagnosticRow(name, filepath.Join(fsscan.UsersRoot, name), "",
+			enumerated.Warning(name)))
+	}
+	for _, h := range enumerated.Homes {
 		if userFilter != nil {
 			if _, ok := userFilter[h.Name]; !ok {
 				continue
@@ -218,6 +234,7 @@ func discoverForHome(ctx context.Context, user, home string, budget time.Duratio
 	// had run.
 	deadline := time.Now().Add(budget)
 	var out []Server
+	stoppedEarly := false
 	seen := make(map[string]struct{})
 
 	// Pass 1: known direct paths.
@@ -232,12 +249,7 @@ func discoverForHome(ctx context.Context, user, home string, budget time.Duratio
 		// this loop, so time spent here is taken out of the query-wide budget rather than
 		// added on top of it.
 		if ctx.Err() != nil || time.Now().After(deadline) {
-			// Say so before leaving. Breaking quietly ends Pass 1 early and the guard on
-			// Pass 2 then skips the walk entirely, so the home returns only what had been
-			// read so far and looks identical to a user with fewer configs -- the exact
-			// confusion the per-user rows in DiscoverAll exist to prevent.
-			out = append(out, diagnosticRow(user, home, "",
-				"scan truncated: budget exhausted or query cancelled partway through this user"))
+			stoppedEarly = true
 			break
 		}
 		path := filepath.Join(home, src.relPath)
@@ -252,15 +264,44 @@ func discoverForHome(ctx context.Context, user, home string, budget time.Duratio
 		out = append(out, rows...)
 	}
 
+	// One diagnostic covering both ways the budget can run out during a home, emitted here
+	// rather than at the break so it cannot be missed on one path.
+	//
+	// Breaking out of Pass 1 was handled; the loop *completing* while the deadline passed
+	// during its last read was not. The range simply ended, no break fired, and the guard
+	// below then skipped Pass 2 silently -- so a home whose final direct read was slow, which
+	// is exactly the network-backed case this budget exists for, returned partial rows that
+	// looked complete.
+	if stoppedEarly || time.Until(deadline) <= 0 {
+		return append(out, diagnosticRow(user, home, "",
+			"scan truncated: budget exhausted or query cancelled before the project-local "+
+				"walk could run for this user"))
+	}
+
 	// Pass 2: walker over high-signal dev dirs
 	walkRoots := buildWalkRoots(home)
-	if len(walkRoots) > 0 && time.Until(deadline) > 0 {
+	if len(walkRoots) > 0 {
 		// ScanContext rather than Scan, because Scan discards the truncation flag along with
 		// the error, and a walk that quietly returns fewer rows is indistinguishable from a
 		// home with no MCP configs in it. budget is what remains of the query-wide walk
 		// allowance, so the last home scanned gets whatever the earlier ones left.
 		result, scanErr := fsscan.ScanContext(ctx, fsscan.ScanConfig{
-			Roots:    walkRoots,
+			Roots: walkRoots,
+			// Sized from measurement on one workstation: 9,386 directories visited and
+			// 26,730 regular files seen across 23 roots, of which 63 matched. These caps sit
+			// roughly an order of magnitude above that, so they are unreachable by ordinary
+			// use and mitigate the case that matters -- a traversal redirected by a raced
+			// symlink into a tree far larger than any home. Mitigate rather than bound:
+			// WalkDir reads an entire directory before any child callback, so neither cap
+			// can interrupt one enormous or stalled directory. Exceeding either is reported
+			// as a truncation rather than silently returning less.
+			MaxDirs:  100000,
+			MaxFiles: 2000,
+			// Every root is built from home, so each component between the two is checked
+			// for being a symlink before the walk starts. Without this a symlinked
+			// Library, or app directory, or User, lets the walk out of the home entirely
+			// while the paths it returns still read as though they were inside it.
+			Beneath:  home,
 			MaxDepth: 6, // up to monorepo/packages/foo/.cursor/mcp.json
 			Timeout:  time.Until(deadline),
 			Accept: func(path string, d fs.DirEntry) bool {
@@ -299,7 +340,7 @@ func discoverForHome(ctx context.Context, user, home string, budget time.Duratio
 			if !c.supported {
 				continue
 			}
-			rows := processOne(home, path, user, c.client, c.jsonc, c.extract)
+			rows := processOne(result, path, user, c.client, c.jsonc, c.extract)
 			if rows == nil {
 				continue
 			}
@@ -329,8 +370,12 @@ var pluginCatalogPathSubstrs = []string{
 }
 
 func isPluginCatalogPath(p string) bool {
+	// Normalised once: the substrings are slash-separated, and an exclusion that silently
+	// stops matching because the separator differs is the worst kind of platform bug -- the
+	// table would fill with catalog noise and nothing would say why.
+	slashed := filepath.ToSlash(p)
 	for _, s := range pluginCatalogPathSubstrs {
-		if strings.Contains(p, s) {
+		if strings.Contains(slashed, s) {
 			return true
 		}
 	}
@@ -386,17 +431,24 @@ func buildWalkRoots(home string) []string {
 // ReadBounded refuses a symlink only at the final component, which leaves a window: the
 // walker inspects a directory, and the user who owns it can replace that directory with a
 // symlink before the file is opened. Running as root, the open would then resolve through it
-// and read another user's config. filepath.WalkDir never descends a symlink, so the walk
-// itself is safe, but the read afterwards was not.
+// and read another user's config.
+//
+// This closes the *read*. It does not make the traversal race-safe, and an earlier version of
+// this comment claimed otherwise. filepath.WalkDir does not follow a symlink present in the
+// directory snapshot it took, but it reopens directories by pathname afterwards, so a
+// component replaced between the snapshot and the read is followed. What that costs is
+// enumeration and I/O outside the home, not disclosure, because every candidate is reopened
+// here component-wise and a replaced parent makes the open fail. See fsscan.ScanConfig.Beneath
+// for the containment that is available and the limit of it.
 //
 // A path that does not resolve under home means the tree moved during the walk. Refuse it
 // rather than read it.
-func processOne(home, path, user, client string, jsonc bool, extract func([]byte) ([]Server, error)) []Server {
-	relPath, err := filepath.Rel(home, path)
-	if err != nil || relPath == ".." || strings.HasPrefix(relPath, ".."+string(filepath.Separator)) {
-		return nil
-	}
-	return processOneBeneath(home, relPath, path, user, client, jsonc, extract)
+func processOne(scan fsscan.ScanResult, path, user, client string, jsonc bool, extract func([]byte) ([]Server, error)) []Server {
+	// ScanResult.ReadCandidate rather than a hand-rolled relative-path dance: the scan knows
+	// what base it was contained to, so the safe open is the one-liner and the containment
+	// cannot drift out of sync with the scan that produced the path.
+	data, err := scan.ReadCandidate(path, MaxFileSize)
+	return finishProcessing(data, err, path, user, client, jsonc, extract)
 }
 
 // processOneBeneath is the symlink-safe variant used by direct-path lookups
@@ -441,6 +493,12 @@ func finishProcessing(data []byte, readErr error, path, user, client string, jso
 // back to the flat shape.
 func extractEnvelopeSimple(data []byte) ([]Server, error) {
 	envelopes, skipped, err := extractEnvelope(data)
+	if errors.Is(err, errNoDecodableEntries) {
+		// The file has an envelope and it is broken. Reporting that is the whole answer;
+		// re-reading it as a flat document would attribute an unrelated sibling object as a
+		// server and lose the failure.
+		return nil, err
+	}
 	if err != nil {
 		// The envelope failed, which for a file that has an mcpServers or servers key means
 		// one of its entries is malformed. Falling back to the flat shape finds nothing in
@@ -458,7 +516,7 @@ func extractEnvelopeSimple(data []byte) ([]Server, error) {
 		}
 		return append(rows, skippedEntryWarning(flatSkipped)...), nil
 	}
-	if len(envelopes.MCPServers) == 0 && len(envelopes.Servers) == 0 {
+	if !envelopes.Present {
 		flat, flatSkipped, fErr := extractFlat(data)
 		if fErr != nil {
 			// Neither the envelope nor the flat shape matched, and the envelope parse itself
@@ -493,9 +551,11 @@ func extractEnvelopeSimple(data []byte) ([]Server, error) {
 func extractClaudeCode(data []byte) ([]Server, error) {
 	var doc struct {
 		MCPServers map[string]json.RawMessage `json:"mcpServers"`
-		Projects   map[string]struct {
-			MCPServers map[string]json.RawMessage `json:"mcpServers"`
-		} `json:"projects"`
+		// Each project is left raw and decoded on its own below. Decoding the map into a
+		// typed struct meant one project whose mcpServers was the wrong shape failed the
+		// whole Unmarshal, taking every healthy project *and* the global servers with it --
+		// on the file that holds the most servers on a real machine.
+		Projects map[string]json.RawMessage `json:"projects"`
 	}
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return nil, err
@@ -507,7 +567,15 @@ func extractClaudeCode(data []byte) ([]Server, error) {
 	if rows, err := materialize(userScope, "mcpServers"); err == nil {
 		out = append(out, rows...)
 	}
-	for projPath, project := range doc.Projects {
+	for projPath, raw := range doc.Projects {
+		var project struct {
+			MCPServers map[string]json.RawMessage `json:"mcpServers"`
+		}
+		if err := json.Unmarshal(raw, &project); err != nil {
+			// This one project is unreadable; its siblings are not.
+			skipped++
+			continue
+		}
 		if len(project.MCPServers) == 0 {
 			continue
 		}

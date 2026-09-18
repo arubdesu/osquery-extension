@@ -24,13 +24,18 @@ type classification struct {
 //     with VS Code's user settings)
 //   - `.mcp.json` under .claude/ is per-user; at a repo root it's project-local
 func classifyPath(absPath string) classification {
+	// Comparisons below are against slash-separated literals, so the path is normalised once
+	// rather than each site guessing. The literals describe macOS locations and the table is
+	// registered on macOS only, but the package compiles and its tests run elsewhere, and a
+	// match that silently never fires is worse than one that cannot fire.
+	slashed := filepath.ToSlash(absPath)
 	base := filepath.Base(absPath)
 	parent := filepath.Base(filepath.Dir(absPath))
 	grandparent := filepath.Base(filepath.Dir(filepath.Dir(absPath)))
 
 	// Most specific cases first.
 	switch {
-	case strings.Contains(absPath, string(filepath.Separator)+"Library"+string(filepath.Separator)+"Application Support"+string(filepath.Separator)+"Claude"+string(filepath.Separator)) &&
+	case strings.Contains(slashed, "/Library/Application Support/Claude/") &&
 		base == "claude_desktop_config.json":
 		return classification{"claude_desktop", true, extractEnvelopeSimple, true}
 
@@ -42,7 +47,7 @@ func classifyPath(absPath string) classification {
 		// Copilot's portable config. Hyphenated, unlike every other name here.
 		return classification{"copilot", true, extractEnvelopeSimple, true}
 
-	case base == "mcp.json" && strings.Contains(absPath, "/Library/Application Support/"):
+	case base == "mcp.json" && strings.Contains(slashed, "/Library/Application Support/"):
 		// VS Code family, user scope or a per-profile directory under .../User/profiles/<id>/.
 		return classification{vscodeForkFromPath(absPath), true, extractEnvelopeSimple, true}
 
@@ -73,16 +78,16 @@ func classifyPath(absPath string) classification {
 	case base == ".mcp.json" && parent == ".codex":
 		return classification{"codex", true, extractEnvelopeSimple, true}
 
-	case strings.Contains(absPath, string(filepath.Separator)+".codex"+string(filepath.Separator)) &&
+	case strings.Contains(slashed, "/.codex/") &&
 		(base == "mcp.json" || base == ".mcp.json"):
 		// Nested under .codex/ at deeper than immediate child.
 		return classification{"codex", true, extractEnvelopeSimple, true}
 
-	case strings.Contains(absPath, string(filepath.Separator)+".continue"+string(filepath.Separator)) &&
+	case strings.Contains(slashed, "/.continue/") &&
 		(base == "mcp.json" || base == ".mcp.json"):
 		return classification{"continue", true, extractEnvelopeSimple, true}
 
-	case strings.Contains(absPath, string(filepath.Separator)+".claude"+string(filepath.Separator)) &&
+	case strings.Contains(slashed, "/.claude/") &&
 		(base == "mcp.json" || base == ".mcp.json"):
 		// Project-scoped or extra MCP configs under ~/.claude/ subdirs.
 		return classification{"claude_code", true, extractEnvelopeSimple, true}
@@ -125,10 +130,11 @@ func isCodexTOMLPath(absPath string) bool {
 // vscodeForkFromPath names the fork owning a path under Library/Application Support, so a
 // profile-scoped mcp.json is attributed to the editor that wrote it rather than to "unknown".
 func vscodeForkFromPath(absPath string) string {
+	slashed := filepath.ToSlash(absPath)
 	switch {
-	case strings.Contains(absPath, "/Application Support/Cursor/"):
+	case strings.Contains(slashed, "/Application Support/Cursor/"):
 		return "cursor"
-	case strings.Contains(absPath, "/Application Support/Windsurf/"):
+	case strings.Contains(slashed, "/Application Support/Windsurf/"):
 		return "windsurf"
 	default:
 		return "vscode"

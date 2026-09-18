@@ -1,14 +1,14 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 # srcs stays a flat list: rules_go applies the Go build constraints on platform_unix.go and
-# platform_windows.go itself when compiling. deps is the part that has to be conditional, so
+# platform_unsupported.go itself when compiling. deps is the part that has to be conditional, so
 # that a Windows build does not require golang.org/x/sys. Both forms are gazelle's own output.
 go_library(
     name = "fsscan",
     srcs = [
         "openbeneath.go",
         "platform_unix.go",
-        "platform_windows.go",
+        "platform_unsupported.go",
         "scan.go",
         "users.go",
     ],
@@ -36,9 +36,6 @@ go_library(
         "@io_bazel_rules_go//go/platform:ios": [
             "@org_golang_x_sys//unix",
         ],
-        "@io_bazel_rules_go//go/platform:js": [
-            "@org_golang_x_sys//unix",
-        ],
         "@io_bazel_rules_go//go/platform:linux": [
             "@org_golang_x_sys//unix",
         ],
@@ -46,9 +43,6 @@ go_library(
             "@org_golang_x_sys//unix",
         ],
         "@io_bazel_rules_go//go/platform:openbsd": [
-            "@org_golang_x_sys//unix",
-        ],
-        "@io_bazel_rules_go//go/platform:plan9": [
             "@org_golang_x_sys//unix",
         ],
         "@io_bazel_rules_go//go/platform:solaris": [
@@ -63,6 +57,7 @@ go_test(
     srcs = [
         "dedup_test.go",
         "openbeneath_test.go",
+        "readcandidate_test.go",
         "scan_test.go",
         "scan_unix_test.go",
         "timeout_test.go",
