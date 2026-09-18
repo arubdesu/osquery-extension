@@ -1,0 +1,160 @@
+package mcp_servers
+
+import (
+	"github.com/BurntSushi/toml"
+)
+
+// Codex stores its MCP configuration in ~/.codex/config.toml under [mcp_servers.<name>]
+// sections rather than in JSON, which is what this file reads.
+//
+// The dependency is carried rather than hand-rolled because upcoming Python dependency tables
+// need TOML anyway for pyproject.toml and uv.lock, and because a real parser is correct on the
+// whole grammar rather than on the subset someone anticipated. A no-dependency comparison
+// implementation lives in toml_test.go and is diffed against this one over a corpus, so the
+// option of dropping the dependency stays open and is decided on evidence.
+
+// tomlServerEntry is the TOML projection of a server entry. Separate from rawServerEntry so
+// the two formats' key names stay independent: TOML uses snake_case where the JSON configs use
+// camelCase, and conflating them would make one format's rename silently break the other.
+type tomlServerEntry struct {
+	Command   string            `toml:"command"`
+	Args      []string          `toml:"args"`
+	Env       map[string]string `toml:"env"`
+	URL       string            `toml:"url"`
+	Type      string            `toml:"type"`
+	Transport string            `toml:"transport"`
+
+	// Codex spells this `enabled`, not `disabled`, and the two mean opposite things. A
+	// config carrying `enabled = false` previously read as an enabled server, because the
+	// key matched nothing. Measured against a real config.toml: 11 `enabled` keys, zero
+	// `disabled`. Both are accepted, with `enabled` taking precedence when present, so a
+	// file written by either convention is read correctly.
+	Enabled  *bool `toml:"enabled"`
+	Disabled *bool `toml:"disabled"`
+
+	// Other places Codex names an environment variable rather than holding a value. These
+	// are the useful half of a credential inventory: they identify what a server depends on
+	// without exposing it. A remote server authenticated through bearer_token_env_var
+	// previously reported an empty env_keys.
+	EnvVars           []tomlEnvVar      `toml:"env_vars"`
+	BearerTokenEnvVar string            `toml:"bearer_token_env_var"`
+	EnvHTTPHeaders    map[string]string `toml:"env_http_headers"`
+
+	// Deliberately no timeout fields. Codex's schema allows a float for tool_timeout_sec,
+	// and declaring it as an int made one valid `tool_timeout_sec = 0.5` fail the whole
+	// document: every server in the file collapsed into a single parse-warning row. The
+	// table does not use timeouts, and BurntSushi ignores keys it has no field for, so the
+	// correct number of fields here is none. Do not re-add them without a use.
+}
+
+// extractCodexTOML parses a Codex config.toml and returns one Server per [mcp_servers.<name>].
+func extractCodexTOML(data []byte) ([]Server, error) {
+	var doc struct {
+		MCPServers map[string]tomlServerEntry `toml:"mcp_servers"`
+	}
+	if err := toml.Unmarshal(data, &doc); err != nil {
+		return nil, err
+	}
+	if len(doc.MCPServers) == 0 {
+		// Valid TOML with no MCP section. Not an error, and not a warning either: config.toml
+		// carries plenty of unrelated settings.
+		return nil, nil
+	}
+	return materializeTOML(doc.MCPServers), nil
+}
+
+// materializeTOML applies the same sanitization materialize() applies to the JSON shapes, so
+// a TOML-sourced row is redacted identically to a JSON-sourced one.
+func materializeTOML(in map[string]tomlServerEntry) []Server {
+	out := make([]Server, 0, len(in))
+	for name, entry := range in {
+		rawURL := entry.URL
+		server := Server{
+			// The TOML section these came from, so source_context describes a real location
+			// here the same way mcpServers and servers do for the JSON shapes.
+			SourceContext: "mcp_servers",
+			ServerName:    redactSecret(name),
+			Command:       redactSecret(entry.Command),
+			Args:          redactArgs(entry.Args),
+			URL:           sanitizeRemoteURL(rawURL),
+			Transport: firstNonEmpty(normalizeTransport(entry.Type, entry.Transport),
+				transportFromRawURL(rawURL, entry.Args)),
+		}
+		switch {
+		case entry.Enabled != nil:
+			server.Disabled = !*entry.Enabled
+		case entry.Disabled != nil:
+			server.Disabled = *entry.Disabled
+		}
+		server.EnvKeys = tomlEnvKeys(entry)
+		out = append(out, server)
+	}
+	return out
+}
+
+// tomlEnvVar is one entry of Codex's env_vars, which its schema allows to be either a bare
+// string naming a variable or an object of the form { name, source }.
+//
+// Decoding it as []string made a valid object-form entry fail the whole document: because the
+// entire mcp_servers map decodes in one operation, one such entry hid every other server in
+// the file behind a single parse-warning row. That is the second time a too-narrow type here
+// cost an entire file, after tool_timeout_sec, so the rule this encodes is that a field the
+// table *does* read has to accept every shape the schema permits.
+type tomlEnvVar struct {
+	Name string
+}
+
+// UnmarshalTOML accepts both permitted shapes. An unrecognised shape yields an empty name and
+// no error, deliberately: skipping one unreadable reference is a far smaller loss than failing
+// the file, which is the mistake being corrected here.
+func (v *tomlEnvVar) UnmarshalTOML(data any) error {
+	switch value := data.(type) {
+	case string:
+		v.Name = value
+	case map[string]any:
+		// `source` names where the value comes from (keychain, env, ...). It is metadata
+		// about the reference, not a value, and the table does not use it.
+		if name, ok := value["name"].(string); ok {
+			v.Name = name
+		}
+	}
+	return nil
+}
+
+// tomlEnvKeys collects every environment variable name an entry references, from all four
+// places Codex can name one. Values are never read: env holds them inline and is deliberately
+// consulted for its keys only, while the other three name variables by design.
+func tomlEnvKeys(entry tomlServerEntry) []string {
+	total := len(entry.Env) + len(entry.EnvVars) + len(entry.EnvHTTPHeaders)
+	if entry.BearerTokenEnvVar != "" {
+		total++
+	}
+	if total == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, total)
+	out := make([]string, 0, total)
+	add := func(name string) {
+		if name == "" {
+			return
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	for key := range entry.Env {
+		add(key)
+	}
+	for _, reference := range entry.EnvVars {
+		add(reference.Name)
+	}
+	// env_http_headers maps a header name to the *name* of the variable holding its value,
+	// so the variable names are the values here rather than the keys.
+	for _, variable := range entry.EnvHTTPHeaders {
+		add(variable)
+	}
+	add(entry.BearerTokenEnvVar)
+	return out
+}

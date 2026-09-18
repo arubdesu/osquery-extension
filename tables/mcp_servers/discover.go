@@ -36,6 +36,25 @@ type Server struct {
 	Warning        string // populated on parse/IO errors so the row still surfaces a finding
 }
 
+// diagnosticRow builds a row that reports a problem rather than a server.
+//
+// Every diagnostic goes through here so none can be built by hand and miss the identity
+// columns' contract. transport is documented as stdio|http|sse|unknown and confidence as
+// low|medium|high, and these rows are created outside inferIdentity, so they were leaving both
+// empty. An empty value is in neither documented set: `WHERE transport = 'unknown'` did not
+// match them, and neither did `WHERE confidence IN ('high','medium','low')`, so the rows whose
+// whole purpose is to be noticed were invisible to any query that constrained those columns.
+func diagnosticRow(user, sourcePath, client, warning string) Server {
+	return Server{
+		User:       user,
+		SourcePath: sourcePath,
+		Client:     client,
+		Transport:  "unknown",
+		Confidence: "low",
+		Warning:    warning,
+	}
+}
+
 // directSource describes a config file at a known path relative to a user's home.
 // These are the "fast path" lookups; the walker covers project-local files at
 // arbitrary paths.
@@ -86,10 +105,6 @@ var knownDirectSources = []directSource{
 		jsonc:   true,
 		extract: extractGeminiSettings,
 	},
-	// Note: Codex's MCP config is matched by the walker against any mcp.json /
-	// .mcp.json under ~/.codex/ (bumblebee parity). No direct-path entry,
-	// the file location under .codex/ is not deterministic.
-	//
 	// Cline extension storage across major VS Code forks. Library is pruned by
 	// the walker, so these need explicit entries.
 	{
@@ -116,6 +131,25 @@ var knownDirectSources = []directSource{
 		jsonc:   true,
 		extract: extractEnvelopeSimple,
 	},
+	// VS Code's own user-scope MCP config, one per fork. Documented by Microsoft as the
+	// user-profile counterpart to a workspace's .vscode/mcp.json, reached in the UI through
+	// "MCP: Open User Configuration". It uses `servers` rather than `mcpServers`, which
+	// extractEnvelope already accepts. Library is pruned by the walker, so these need to be
+	// named explicitly the same way Cline's storage is.
+	{relPath: "Library/Application Support/Code/User/mcp.json", client: "vscode", jsonc: true, extract: extractEnvelopeSimple},
+	{relPath: "Library/Application Support/Code - Insiders/User/mcp.json", client: "vscode", jsonc: true, extract: extractEnvelopeSimple},
+	{relPath: "Library/Application Support/Cursor/User/mcp.json", client: "cursor", jsonc: true, extract: extractEnvelopeSimple},
+	{relPath: "Library/Application Support/Windsurf/User/mcp.json", client: "windsurf", jsonc: true, extract: extractEnvelopeSimple},
+	{relPath: "Library/Application Support/VSCodium/User/mcp.json", client: "vscode", jsonc: true, extract: extractEnvelopeSimple},
+	// Copilot's portable config, which Microsoft documents as shared across the Agent Host
+	// and other Copilot tools. Note the hyphen: mcp-config.json was not in walkableBasenames
+	// either, so before this the file could not be found by any pathway.
+	{relPath: ".copilot/mcp-config.json", client: "copilot", jsonc: true, extract: extractEnvelopeSimple},
+	// Codex's actual configuration. TOML, not JSON, so jsonc is false and the extractor is a
+	// TOML one: the directSource abstraction only ever promised bytes in and Servers out, so
+	// a second format needed no change to it. The JSON cases in classifyPath stay for older
+	// Codex builds and third-party tooling, but this is the file a current install writes.
+	{relPath: ".codex/config.toml", client: "codex", jsonc: false, extract: extractCodexTOML},
 }
 
 // DiscoverAll iterates each user home under fsscan.UsersRoot and returns every normalized
@@ -137,7 +171,7 @@ func DiscoverAll(ctx context.Context, userFilter map[string]struct{}) []Server {
 	}
 	homes, err := fsscan.ListUserHomes(fsscan.UsersRoot)
 	if err != nil {
-		return []Server{{Warning: "list users: " + err.Error()}}
+		return []Server{diagnosticRow("", fsscan.UsersRoot, "", "list users: "+err.Error())}
 	}
 	deadline := time.Now().Add(fsscan.WalkTimeout())
 	var out []Server
@@ -147,16 +181,20 @@ func DiscoverAll(ctx context.Context, userFilter map[string]struct{}) []Server {
 				continue
 			}
 		}
+		// Checked per home, before Pass 1 runs. Direct-path reads take no context, so without
+		// this a cancelled query still performed ten opens per home for every home on the box.
+		if ctx.Err() != nil {
+			out = append(out, diagnosticRow(h.Name, h.Path, "",
+				"scan truncated: query cancelled before this user was scanned"))
+			continue
+		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			// Say so per user rather than stopping quietly. A user who was never scanned
 			// and a user with no MCP configuration are otherwise the same empty answer,
 			// which is the confusion the truncation contract exists to prevent.
-			out = append(out, Server{
-				User:       h.Name,
-				SourcePath: h.Path,
-				Warning:    "scan truncated: walk budget exhausted before this user was scanned",
-			})
+			out = append(out, diagnosticRow(h.Name, h.Path, "",
+				"scan truncated: walk budget exhausted before this user was scanned"))
 			continue
 		}
 		out = append(out, discoverForHome(ctx, h.Name, h.Path, remaining)...)
@@ -168,14 +206,17 @@ func DiscoverAll(ctx context.Context, userFilter map[string]struct{}) []Server {
 // the merged + deduped set of MCP server records.
 //
 // Pass 1, direct paths: fast, deterministic, catches global configs.
-// Pass 2, walker: scans high-signal project subdirs for arbitrary-path configs
+// Pass 2, walker: scans high-signal project subdirs for configs at paths nobody can predict
 //
-//	(.mcp.json at repo roots, .cursor/mcp.json in workspaces, etc.). Bumblebee
-//	parity for project-local discovery.
+//	(.mcp.json at repo roots, .cursor/mcp.json in workspaces, <repo>/.codex/config.toml).
 //
 // Dedup is by absolute source path, so a file findable by both passes is
 // emitted once.
 func discoverForHome(ctx context.Context, user, home string, budget time.Duration) []Server {
+	// The absolute form of the remaining allowance, so the direct pass and the walk draw on
+	// one deadline instead of the walk receiving a duration computed before the direct reads
+	// had run.
+	deadline := time.Now().Add(budget)
 	var out []Server
 	seen := make(map[string]struct{})
 
@@ -185,6 +226,20 @@ func discoverForHome(ctx context.Context, user, home string, budget time.Duratio
 	// user replaces an intermediate directory (e.g., ~/Library) with a symlink
 	// to harvest another user's files when osqueryd runs as root.
 	for _, src := range knownDirectSources {
+		// Checked between sources, not just once per home. Each direct lookup is an open on
+		// a path that may be network-backed, and a cancelled query used to keep working
+		// through all of them. The walker's allowance is recomputed from the deadline after
+		// this loop, so time spent here is taken out of the query-wide budget rather than
+		// added on top of it.
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			// Say so before leaving. Breaking quietly ends Pass 1 early and the guard on
+			// Pass 2 then skips the walk entirely, so the home returns only what had been
+			// read so far and looks identical to a user with fewer configs -- the exact
+			// confusion the per-user rows in DiscoverAll exist to prevent.
+			out = append(out, diagnosticRow(user, home, "",
+				"scan truncated: budget exhausted or query cancelled partway through this user"))
+			break
+		}
 		path := filepath.Join(home, src.relPath)
 		if _, dup := seen[path]; dup {
 			continue
@@ -199,23 +254,35 @@ func discoverForHome(ctx context.Context, user, home string, budget time.Duratio
 
 	// Pass 2: walker over high-signal dev dirs
 	walkRoots := buildWalkRoots(home)
-	if len(walkRoots) > 0 {
+	if len(walkRoots) > 0 && time.Until(deadline) > 0 {
 		// ScanContext rather than Scan, because Scan discards the truncation flag along with
 		// the error, and a walk that quietly returns fewer rows is indistinguishable from a
 		// home with no MCP configs in it. budget is what remains of the query-wide walk
 		// allowance, so the last home scanned gets whatever the earlier ones left.
-		result, _ := fsscan.ScanContext(ctx, fsscan.ScanConfig{
+		result, scanErr := fsscan.ScanContext(ctx, fsscan.ScanConfig{
 			Roots:    walkRoots,
 			MaxDepth: 6, // up to monorepo/packages/foo/.cursor/mcp.json
-			Timeout:  budget,
+			Timeout:  time.Until(deadline),
 			Accept: func(path string, d fs.DirEntry) bool {
-				_, ok := walkableBasenames[d.Name()]
-				return ok
+				if _, ok := walkableBasenames[d.Name()]; ok {
+					return true
+				}
+				// Codex TOML is matched on the full path rather than the basename.
+				// config.toml is far too common to accept on name alone, and Accept is
+				// given the path precisely so this kind of narrowing can happen before a
+				// candidate is collected rather than after.
+				return isCodexTOMLPath(path)
 			},
 		})
 		paths := result.Paths
+		// A cancelled caller comes back as an error rather than a truncation, and discarding it
+		// made cancellation look like a home with nothing in it.
+		if scanErr != nil {
+			return append(out, diagnosticRow(user, home, "",
+				"scan cancelled: "+scanErr.Error()))
+		}
 		if warning := result.Warning(); warning != "" {
-			out = append(out, Server{User: user, SourcePath: home, Warning: warning})
+			out = append(out, diagnosticRow(user, home, "", warning))
 		}
 		for _, path := range paths {
 			if _, dup := seen[path]; dup {
@@ -232,7 +299,7 @@ func discoverForHome(ctx context.Context, user, home string, budget time.Duratio
 			if !c.supported {
 				continue
 			}
-			rows := processOne(path, user, c.client, c.jsonc, c.extract)
+			rows := processOne(home, path, user, c.client, c.jsonc, c.extract)
 			if rows == nil {
 				continue
 			}
@@ -252,6 +319,13 @@ func discoverForHome(ctx context.Context, user, home string, budget time.Duratio
 var pluginCatalogPathSubstrs = []string{
 	"/.claude/plugins/marketplaces/",
 	"/.claude/plugins/cache/",
+	// Codex ships the same shape and had no exclusion. Measured on one workstation after a
+	// Codex update: 39 of 51 rows came from these three prefixes, every one an installable
+	// catalog entry rather than a configured server, covering airtable, canva, figma, slack,
+	// stripe and thirty more the user had never enabled.
+	"/.codex/plugins/cache/",
+	"/.codex/.tmp/plugins/",
+	"/.codex/.tmp/bundled-marketplaces/",
 }
 
 func isPluginCatalogPath(p string) bool {
@@ -263,15 +337,30 @@ func isPluginCatalogPath(p string) bool {
 	return false
 }
 
-// clientConfigSubdirs are dotdirs under each user home where MCP-aware clients
-// store config at non-deterministic subpaths. Walking these (in addition to dev
-// project dirs) gives us bumblebee-parity coverage for clients whose config
-// layout isn't fixed:
+// clientConfigSubdirs are dotdirs under each user home where MCP-aware clients store config at
+// subpaths that are not deterministic, so a direct path cannot reach them. Walked in addition
+// to the dev project dirs:
 //   - .claude/ may contain mcp.json under various subdirs (Claude Code project-
 //     scoped local files outside the .claude.json blob)
-//   - .codex/ contains the OpenAI Codex CLI's mcp.json/.mcp.json
+//   - .codex/ holds named-profile configs (<profile>.config.toml) alongside the
+//     config.toml a direct path already covers, plus mcp.json from older builds
 //   - .continue/ for the Continue editor extension
-var clientConfigSubdirs = []string{".claude", ".codex", ".continue"}
+//   - .copilot/ for configs beside the mcp-config.json a direct path covers
+var clientConfigSubdirs = []string{".claude", ".codex", ".continue", ".copilot"}
+
+// vscodeProfileRoots are the per-fork directories holding one subdirectory per VS Code
+// profile, each of which may carry its own mcp.json. The profile directory name is generated,
+// so these cannot be direct paths.
+//
+// Walking them is safe despite the Library prune: pruning applies to directories descended
+// *below* a root, and a root is never tested against it. Non-existent roots are skipped.
+var vscodeProfileRoots = []string{
+	"Library/Application Support/Code/User/profiles",
+	"Library/Application Support/Code - Insiders/User/profiles",
+	"Library/Application Support/Cursor/User/profiles",
+	"Library/Application Support/Windsurf/User/profiles",
+	"Library/Application Support/VSCodium/User/profiles",
+}
 
 // buildWalkRoots returns the absolute paths under home that the walker should
 // scan. Two categories:
@@ -279,20 +368,35 @@ var clientConfigSubdirs = []string{".claude", ".codex", ".continue"}
 //   - MCP client config dotdirs (~/.claude, ~/.codex, ~/.continue)
 func buildWalkRoots(home string) []string {
 	dev := fsscan.DevSubdirRoots(home)
-	out := make([]string, 0, len(dev)+len(clientConfigSubdirs))
+	out := make([]string, 0, len(dev)+len(clientConfigSubdirs)+len(vscodeProfileRoots))
 	out = append(out, dev...)
 	for _, s := range clientConfigSubdirs {
+		out = append(out, filepath.Join(home, s))
+	}
+	for _, s := range vscodeProfileRoots {
 		out = append(out, filepath.Join(home, s))
 	}
 	return out
 }
 
-// processOne reads, parses, and normalizes a single config file. Used by the
-// walker (Pass 2), which discovers files at arbitrary absolute paths it has
-// already verified are not under symlinked directories.
-func processOne(path, user, client string, jsonc bool, extract func([]byte) ([]Server, error)) []Server {
-	data, err := fsscan.ReadBounded(path, MaxFileSize)
-	return finishProcessing(data, err, path, user, client, jsonc, extract)
+// processOne reads, parses, and normalizes a file the walker found (Pass 2).
+//
+// It re-derives the path relative to the user home and reads it through the same
+// component-by-component O_NOFOLLOW open that Pass 1 uses, rather than fsscan.ReadBounded.
+// ReadBounded refuses a symlink only at the final component, which leaves a window: the
+// walker inspects a directory, and the user who owns it can replace that directory with a
+// symlink before the file is opened. Running as root, the open would then resolve through it
+// and read another user's config. filepath.WalkDir never descends a symlink, so the walk
+// itself is safe, but the read afterwards was not.
+//
+// A path that does not resolve under home means the tree moved during the walk. Refuse it
+// rather than read it.
+func processOne(home, path, user, client string, jsonc bool, extract func([]byte) ([]Server, error)) []Server {
+	relPath, err := filepath.Rel(home, path)
+	if err != nil || relPath == ".." || strings.HasPrefix(relPath, ".."+string(filepath.Separator)) {
+		return nil
+	}
+	return processOneBeneath(home, relPath, path, user, client, jsonc, extract)
 }
 
 // processOneBeneath is the symlink-safe variant used by direct-path lookups
@@ -309,14 +413,19 @@ func finishProcessing(data []byte, readErr error, path, user, client string, jso
 		if fsscan.IsExpectedAbsent(readErr) {
 			return nil
 		}
-		return []Server{{User: user, SourcePath: path, Client: client, Warning: "read: " + readErr.Error()}}
+		return []Server{diagnosticRow(user, path, client, "read: "+readErr.Error())}
 	}
 	if jsonc {
-		data = stripJSONC(data)
+		stripped, terminated := stripJSONC(data)
+		if !terminated {
+			return []Server{diagnosticRow(user, path, client,
+				"parse: unterminated block comment")}
+		}
+		data = stripped
 	}
 	rows, err := extract(data)
 	if err != nil {
-		return []Server{{User: user, SourcePath: path, Client: client, Warning: "parse: " + err.Error()}}
+		return []Server{diagnosticRow(user, path, client, "parse: "+err.Error())}
 	}
 	for i := range rows {
 		rows[i].User = user
@@ -331,16 +440,26 @@ func finishProcessing(data []byte, readErr error, path, user, client string, jso
 // It tries the {mcpServers,servers} envelope; if that yields nothing it falls
 // back to the flat shape.
 func extractEnvelopeSimple(data []byte) ([]Server, error) {
-	servers, err := extractEnvelope(data)
+	envelopes, skipped, err := extractEnvelope(data)
 	if err != nil {
-		flat, fErr := extractFlat(data)
-		if fErr != nil {
+		// The envelope failed, which for a file that has an mcpServers or servers key means
+		// one of its entries is malformed. Falling back to the flat shape finds nothing in
+		// that case, because the only top-level value is the envelope object itself and it
+		// does not look like a server entry. Returning that empty result would drop every
+		// healthy server in the file and emit no warning either, so an empty fallback has to
+		// surface the original error instead.
+		flat, flatSkipped, fErr := extractFlat(data)
+		if fErr != nil || len(flat) == 0 {
 			return nil, err
 		}
-		return materialize(flat, "")
+		rows, mErr := materialize(flat, "")
+		if mErr != nil {
+			return nil, mErr
+		}
+		return append(rows, skippedEntryWarning(flatSkipped)...), nil
 	}
-	if servers == nil {
-		flat, fErr := extractFlat(data)
+	if len(envelopes.MCPServers) == 0 && len(envelopes.Servers) == 0 {
+		flat, flatSkipped, fErr := extractFlat(data)
 		if fErr != nil {
 			// Neither the envelope nor the flat shape matched, and the envelope parse itself
 			// did not error: so this is valid JSON that simply is not MCP configuration.
@@ -349,9 +468,23 @@ func extractEnvelopeSimple(data []byte) ([]Server, error) {
 			//nolint:nilerr // deliberate: a non-match is not an error
 			return nil, nil
 		}
-		return materialize(flat, "")
+		rows, mErr := materialize(flat, "")
+		if mErr != nil {
+			return nil, mErr
+		}
+		return append(rows, skippedEntryWarning(flatSkipped)...), nil
 	}
-	return materialize(servers, "mcpServers")
+	// Each envelope keeps its own name, so source_context describes the real location.
+	rows, err := materialize(envelopes.MCPServers, "mcpServers")
+	if err != nil {
+		return nil, err
+	}
+	serverRows, err := materialize(envelopes.Servers, "servers")
+	if err != nil {
+		return nil, err
+	}
+	rows = append(rows, serverRows...)
+	return append(rows, skippedEntryWarning(skipped)...), nil
 }
 
 // extractClaudeCode reads ~/.claude.json. The file is a big per-user blob with
@@ -359,38 +492,49 @@ func extractEnvelopeSimple(data []byte) ([]Server, error) {
 // values each carry their own `mcpServers`.
 func extractClaudeCode(data []byte) ([]Server, error) {
 	var doc struct {
-		MCPServers map[string]rawServerEntry `json:"mcpServers"`
+		MCPServers map[string]json.RawMessage `json:"mcpServers"`
 		Projects   map[string]struct {
-			MCPServers map[string]rawServerEntry `json:"mcpServers"`
+			MCPServers map[string]json.RawMessage `json:"mcpServers"`
 		} `json:"projects"`
 	}
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return nil, err
 	}
 	var out []Server
-	if rows, err := materialize(doc.MCPServers, "mcpServers"); err == nil {
+	skipped := 0
+	userScope := make(map[string]rawServerEntry, len(doc.MCPServers))
+	skipped += decodeInto(userScope, doc.MCPServers)
+	if rows, err := materialize(userScope, "mcpServers"); err == nil {
 		out = append(out, rows...)
 	}
-	for projPath, p := range doc.Projects {
-		if len(p.MCPServers) == 0 {
+	for projPath, project := range doc.Projects {
+		if len(project.MCPServers) == 0 {
 			continue
 		}
-		rows, _ := materialize(p.MCPServers, "projects["+projPath+"].mcpServers")
+		scoped := make(map[string]rawServerEntry, len(project.MCPServers))
+		skipped += decodeInto(scoped, project.MCPServers)
+		rows, _ := materialize(scoped, "projects["+projPath+"].mcpServers")
 		out = append(out, rows...)
 	}
-	return out, nil
+	return append(out, skippedEntryWarning(skipped)...), nil
 }
 
 // extractGeminiSettings reads ~/.gemini/settings.json which carries many keys
 // alongside `mcpServers`.
 func extractGeminiSettings(data []byte) ([]Server, error) {
 	var doc struct {
-		MCPServers map[string]rawServerEntry `json:"mcpServers"`
+		MCPServers map[string]json.RawMessage `json:"mcpServers"`
 	}
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return nil, err
 	}
-	return materialize(doc.MCPServers, "mcpServers")
+	entries := make(map[string]rawServerEntry, len(doc.MCPServers))
+	skipped := decodeInto(entries, doc.MCPServers)
+	rows, err := materialize(entries, "mcpServers")
+	if err != nil {
+		return nil, err
+	}
+	return append(rows, skippedEntryWarning(skipped)...), nil
 }
 
 // materialize converts the parsed raw entries into normalized Server records.
@@ -407,6 +551,7 @@ func extractGeminiSettings(data []byte) ([]Server, error) {
 func materialize(in map[string]rawServerEntry, ctx string) ([]Server, error) {
 	out := make([]Server, 0, len(in))
 	for name, e := range in {
+		rawURL := firstNonEmpty(e.URL, e.ServerURL, e.HTTPURL)
 		s := Server{
 			// SourceContext can include a project path the user controls
 			// (e.g., projects[/abs/path].mcpServers from ~/.claude.json).
@@ -419,8 +564,12 @@ func materialize(in map[string]rawServerEntry, ctx string) ([]Server, error) {
 			ServerName: redactSecret(name),
 			Command:    redactSecret(e.Command),
 			Args:       redactArgs(e.Args),
-			URL:        sanitizeRemoteURL(firstNonEmpty(e.URL, e.ServerURL, e.HTTPURL)),
-			Transport:  normalizeTransport(e.Type, e.Transport),
+			URL:        sanitizeRemoteURL(rawURL),
+			// Inferred here, from the unsanitized URL, because sanitizeRemoteURL drops the
+			// path and the /sse convention lives in it. Doing this later in inferIdentity
+			// meant https://example.test/sse was always reported as http.
+			Transport: firstNonEmpty(normalizeTransport(e.Type, e.Transport),
+				transportFromRawURL(rawURL, e.Args)),
 		}
 		if e.Disabled != nil {
 			s.Disabled = *e.Disabled
@@ -443,6 +592,16 @@ func firstNonEmpty(ss ...string) string {
 		}
 	}
 	return ""
+}
+
+// transportFromRawURL distinguishes sse from http using the endpoint path, which only exists
+// before sanitizeRemoteURL runs. Returns "" when there is no URL at all, so a stdio server is
+// not given a remote transport by accident.
+func transportFromRawURL(rawURL string, args []string) string {
+	if rawURL == "" {
+		return ""
+	}
+	return guessRemoteTransport(rawURL, args)
 }
 
 func normalizeTransport(t1, t2 string) string {

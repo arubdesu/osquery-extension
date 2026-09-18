@@ -67,7 +67,13 @@ func redactArgs(args []string) []string {
 	}
 	out := make([]string, len(args))
 	for i, a := range args {
-		if i > 0 && isSecretFlagName(args[i-1]) && !strings.HasPrefix(a, "-") {
+		// No exemption for a dash prefix. `--token -opaque` is a secret whose value happens
+		// to start with a dash, and skipping it left the raw value in place. Distinguishing
+		// that from `--token --verbose`, where the flag has no value, needs a real option
+		// parser with per-flag arity; absent one, this over-redacts. That is the documented
+		// preference for this file, and args are counted rather than emitted, so the cost of
+		// redacting one argument too many is nil.
+		if i > 0 && isSecretFlagName(args[i-1]) {
 			out[i] = redact.RedactedMark
 			continue
 		}
@@ -83,9 +89,7 @@ func redactArgs(args []string) []string {
 // opaque tokens in path segments; the conservative strategy is "keep only what we
 // know is safe to record."
 //
-// Mirrors bumblebee's policy (internal/ecosystem/mcp/mcp.go:109-142) for the same
-// safety reasons. Returns "" if no host can be recovered: better to emit nothing
-// than risk leaking a raw URL.
+// Returns "" if no host can be recovered: better to emit nothing than risk leaking a raw URL.
 func sanitizeRemoteURL(raw string) string {
 	if raw == "" {
 		return ""

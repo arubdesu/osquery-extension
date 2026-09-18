@@ -164,14 +164,34 @@ func guessRemoteTransport(u string, args []string) string {
 	return "http"
 }
 
-// firstPositional returns the first non-flag argument that passes
-// looksLikePackageSpec. Walks past any rejected candidates so a credential
-// URL appearing before the real package (e.g., `--registry https://u:p@h pkg`)
-// doesn't permanently mask identity inference.
+// runnerValueFlags are options whose *next* argument is a value rather than the package. A
+// scan that does not know this attributes the value instead: `uvx --python 3.12 real-server`
+// reported package_name=3.12 at medium confidence, which in an inventory is worse than an
+// empty answer, because nothing marks it as wrong.
+//
+// Only options that take a separate value need listing; the `--flag=value` form carries its
+// own value and is skipped by the dash prefix.
+var runnerValueFlags = map[string]struct{}{
+	"--python": {}, "-p": {}, "--with": {}, "--index": {}, "--index-url": {},
+	"--extra-index-url": {}, "--find-links": {}, "--constraint": {}, "-c": {},
+	"--registry": {}, "--cache-dir": {}, "--refresh-package": {}, "--prerelease": {},
+	"--resolution": {}, "--exclude-newer": {}, "--config-file": {}, "--directory": {},
+	"--project": {}, "--package": {},
+}
+
+// firstPositional returns the first non-flag argument that passes looksLikePackageSpec,
+// skipping any argument consumed as a value by the option before it. Rejected candidates are
+// walked past so a credential URL appearing before the real package (e.g.
+// `--registry https://u:p@h pkg`) does not permanently mask identity inference.
 func firstPositional(args []string) string {
-	for _, a := range args {
+	for i, a := range args {
 		if strings.HasPrefix(a, "-") {
 			continue
+		}
+		if i > 0 {
+			if _, consumed := runnerValueFlags[args[i-1]]; consumed {
+				continue
+			}
 		}
 		if looksLikePackageSpec(a) {
 			return a
@@ -210,9 +230,14 @@ func npxIdentity(args []string) (spec, ver string) {
 // file paths) so identity isn't lost when one of those precedes the real
 // package in args. Does not allocate.
 func firstNonFlag(args []string) string {
-	for _, a := range args {
+	for i, a := range args {
 		if strings.HasPrefix(a, "-") {
 			continue
+		}
+		if i > 0 {
+			if _, consumed := runnerValueFlags[args[i-1]]; consumed {
+				continue
+			}
 		}
 		if looksLikePackageSpec(a) {
 			return a
@@ -266,6 +291,10 @@ func dockerRunIdentity(args []string) string {
 		"--network": {}, "--workdir": {}, "-w": {},
 		"--entrypoint": {}, "--label": {}, "-l": {},
 		"--env-file": {}, "--add-host": {}, "--platform": {},
+		// --pull takes a policy (always|missing|never). Without it, `docker run --pull
+		// always myorg/img` reported the image as "always".
+		"--pull": {}, "--restart": {}, "--log-driver": {}, "--memory": {}, "-m": {},
+		"--cpus": {}, "--device": {}, "--dns": {}, "--hostname": {}, "-h": {},
 	}
 	sawRun := false
 	for i := 0; i < len(args); i++ {

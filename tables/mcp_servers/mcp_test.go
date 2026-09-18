@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/osquery/osquery-go/plugin/table"
 )
 
 func TestStripJSONC(t *testing.T) {
@@ -24,7 +26,11 @@ func TestStripJSONC(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := string(stripJSONC([]byte(c.in)))
+			stripped, terminated := stripJSONC([]byte(c.in))
+			if !terminated {
+				t.Fatalf("%s: unexpected unterminated block comment", c.name)
+			}
+			got := string(stripped)
 			if got != c.want {
 				t.Errorf("got %q, want %q", got, c.want)
 			}
@@ -288,8 +294,15 @@ func TestRedactArgs(t *testing.T) {
 			[]string{"--api-key=[REDACTED]"}},
 		{"two-arg secret flag", []string{"--token", "supersecret123"},
 			[]string{"--token", "[REDACTED]"}},
-		{"two-arg flag followed by another flag (don't consume)", []string{"--token", "--verbose"},
-			[]string{"--token", "--verbose"}},
+		// Deliberately over-redacts. The exemption this replaces skipped any dash-prefixed
+		// token, which meant `--token -opaque-secret` left the secret in place. Telling that
+		// apart from a flag with no value needs per-flag arity, which this does not have, and
+		// this file's stated preference is to over-redact rather than risk a leak. Nothing is
+		// lost: no column emits args, only their count.
+		{"two-arg secret flag consumes the next token even if it looks like a flag",
+			[]string{"--token", "--verbose"}, []string{"--token", "[REDACTED]"}},
+		{"a dash-prefixed secret value is still redacted",
+			[]string{"--token", "-opaque-secret-value"}, []string{"--token", "[REDACTED]"}},
 		{"jwt", []string{"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dozjgNryP-D"},
 			[]string{"[REDACTED]"}},
 		{"benign args untouched", []string{"-y", "@modelcontextprotocol/server-fs", "/tmp"},
@@ -423,23 +436,51 @@ func TestExtractFlatKeepsServersAlongsideNonObjectSiblings(t *testing.T) {
 	}
 }
 
-// One malformed entry must not take its healthy siblings with it, which is why a value that
-// is an object but does not decode is skipped rather than returned as an error.
-func TestExtractFlatSkipsOnlyTheMalformedEntry(t *testing.T) {
+// One malformed entry must not take its healthy siblings with it, and its absence has to be
+// stated. Flat files used to skip silently while envelopes reported a count, so a short
+// listing from a flat .mcp.json was indistinguishable from a complete one.
+func TestExtractFlatKeepsHealthyEntriesAndReportsSkippedOnes(t *testing.T) {
 	rows, err := extractEnvelopeSimple([]byte(
 		`{"broken": {"command": 123}, "good": {"command": "uvx", "args": ["good-mcp"]}}`))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(rows) != 1 || rows[0].ServerName != "good" {
-		t.Fatalf("got %d rows, want only \"good\": %+v", len(rows), rows)
+	var healthy, diagnostics int
+	for _, row := range rows {
+		switch {
+		case row.Warning != "":
+			diagnostics++
+		case row.ServerName == "good":
+			healthy++
+		default:
+			t.Errorf("unexpected row: %+v", row)
+		}
+	}
+	if healthy != 1 || diagnostics != 1 {
+		t.Errorf("want one healthy row and one diagnostic, got %d/%d: %+v",
+			healthy, diagnostics, rows)
+	}
+}
+
+// A metadata sibling that is not an object is not a failed entry, so it must not be counted
+// as one. Only an object that fails to decode is a server we could not read.
+func TestExtractFlatDoesNotCountMetadataSiblingsAsSkipped(t *testing.T) {
+	rows, err := extractEnvelopeSimple([]byte(
+		`{"$schema": "https://example.test/s.json", "good": {"command": "npx"}}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, row := range rows {
+		if row.Warning != "" {
+			t.Errorf("a metadata sibling should not produce a diagnostic: %q", row.Warning)
+		}
 	}
 }
 
 // Top-level JSON that is not an object at all is still a parse failure, since that is a file
 // we genuinely cannot read rather than one we can read selectively.
 func TestExtractFlatStillRejectsInvalidTopLevelJSON(t *testing.T) {
-	if _, err := extractFlat([]byte(`{"a": }`)); err == nil {
+	if _, _, err := extractFlat([]byte(`{"a": }`)); err == nil {
 		t.Error("malformed JSON should error")
 	}
 }
@@ -498,7 +539,7 @@ func TestNpxIdentityFindsInlinePackageInFinalPosition(t *testing.T) {
 // with or without a separator, so it passed either way and asserted nothing.
 func TestStripJSONCBlockCommentDoesNotFuseAdjacentTokens(t *testing.T) {
 	for _, malformed := range []string{`{"a":1/*c*/2}`, `{"a":[1/*c*/2]}`} {
-		stripped := stripJSONC([]byte(malformed))
+		stripped, _ := stripJSONC([]byte(malformed))
 		var parsed any
 		if err := json.Unmarshal(stripped, &parsed); err == nil {
 			t.Errorf("%s stripped to %q, which parsed to %v: malformed input must stay "+
@@ -506,12 +547,169 @@ func TestStripJSONCBlockCommentDoesNotFuseAdjacentTokens(t *testing.T) {
 		}
 	}
 	// The well-formed case still has to survive the separator unharmed.
-	stripped := stripJSONC([]byte(`{"a":1/*c*/,"b":2}`))
+	stripped, _ := stripJSONC([]byte(`{"a":1/*c*/,"b":2}`))
 	var parsed map[string]int
 	if err := json.Unmarshal(stripped, &parsed); err != nil {
 		t.Fatalf("valid JSONC broke: %v (%q)", err, stripped)
 	}
 	if parsed["a"] != 1 || parsed["b"] != 2 {
 		t.Errorf("values wrong: %v", parsed)
+	}
+}
+
+// A malformed entry inside an envelope must not take its healthy siblings with it, and its
+// absence must be stated rather than left to inference.
+//
+// An earlier version of this test asserted the opposite -- zero rows plus an error -- which
+// was the wrong target. Surfacing the whole file as unreadable because one of six entries has
+// a bad field type loses five servers that were perfectly legible, and a supply-chain
+// inventory should prefer partial-and-labelled over nothing.
+func TestEnvelopeKeepsHealthyEntriesAndReportsSkippedOnes(t *testing.T) {
+	rows, err := extractEnvelopeSimple([]byte(
+		`{"mcpServers":{"good":{"command":"npx","args":["x"]},"bad":{"command":123}}}`))
+	if err != nil {
+		t.Fatalf("one bad entry must not fail the document: %v", err)
+	}
+	var healthy, diagnostics int
+	for _, row := range rows {
+		switch {
+		case row.Warning != "":
+			diagnostics++
+		case row.ServerName == "good":
+			healthy++
+		default:
+			t.Errorf("unexpected row: %+v", row)
+		}
+	}
+	if healthy != 1 {
+		t.Errorf("the healthy server should survive, got %d: %+v", healthy, rows)
+	}
+	if diagnostics != 1 {
+		t.Errorf("the skipped entry should be reported, got %d diagnostics: %+v", diagnostics, rows)
+	}
+}
+
+// A file whose every entry is undecodable is malformed, not empty, and must still error.
+func TestEnvelopeWithNoDecodableEntriesStillErrors(t *testing.T) {
+	if _, err := extractEnvelopeSimple([]byte(`{"mcpServers":{"a":{"command":1},"b":{"args":2}}}`)); err == nil {
+		t.Error("an envelope with nothing decodable in it should report a parse failure")
+	}
+}
+
+// An unterminated block comment makes a file malformed. The prefix before the opener can be
+// valid JSON on its own, so returning it silently would report a truncated file as clean.
+func TestStripJSONCReportsUnterminatedBlockComment(t *testing.T) {
+	stripped, terminated := stripJSONC([]byte(`{"mcpServers":{"a":{"command":"npx"}}} /* oops`))
+	if terminated {
+		t.Errorf("unterminated comment reported as terminated; stripped=%q", stripped)
+	}
+	// A properly closed comment still reports terminated.
+	if _, ok := stripJSONC([]byte(`{"a":1/*c*/}`)); !ok {
+		t.Error("a closed block comment must report terminated")
+	}
+}
+
+// args_count and disabled hold numbers. Declared TEXT, SQLite compares them as strings, so
+// `args_count > 5` would rank "10" below "5".
+func TestNumericColumnsAreDeclaredIntegers(t *testing.T) {
+	byName := make(map[string]table.ColumnDefinition)
+	for _, column := range MCPServersColumns() {
+		byName[column.Name] = column
+	}
+	for _, name := range []string{"args_count", "disabled"} {
+		if got := byName[name].Type; got != table.ColumnTypeInteger {
+			t.Errorf("%s declared as %q, want INTEGER: it carries a number", name, got)
+		}
+	}
+}
+
+// The /sse convention lives in the endpoint path, and sanitizeRemoteURL drops the path before
+// the row is built. Transport therefore has to be inferred while the raw URL still exists;
+// inferring it later reported every untyped SSE endpoint as http.
+func TestUntypedSSEEndpointIsNotReportedAsHTTP(t *testing.T) {
+	for _, testCase := range []struct{ url, want string }{
+		{"https://example.test/sse", "sse"},
+		{"https://example.test/mcp/events", "sse"},
+		{"https://example.test/mcp", "http"},
+	} {
+		rows, err := extractEnvelopeSimple([]byte(`{"mcpServers":{"s":{"url":"` + testCase.url + `"}}}`))
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("%s: setup rows=%d err=%v", testCase.url, len(rows), err)
+		}
+		server := rows[0]
+		inferIdentity(&server)
+		if server.Transport != testCase.want {
+			t.Errorf("%s: transport = %q, want %q", testCase.url, server.Transport, testCase.want)
+		}
+		// The emitted endpoint must still be scheme and host only.
+		if server.URL != "https://example.test" {
+			t.Errorf("%s: endpoint leaked a path: %q", testCase.url, server.URL)
+		}
+	}
+	// An explicit type still wins over the path heuristic.
+	rows, _ := extractEnvelopeSimple([]byte(`{"mcpServers":{"s":{"type":"http","url":"https://e.test/sse"}}}`))
+	if len(rows) == 1 && rows[0].Transport != "http" {
+		t.Errorf("an explicit type should win, got %q", rows[0].Transport)
+	}
+}
+
+// An option that takes a separate value must not be mistaken for the package. Attributing the
+// value is worse than attributing nothing, because confidence is then medium on a wrong answer
+// and nothing in the row marks it as suspect.
+func TestValueTakingOptionsDoNotBecomeThePackage(t *testing.T) {
+	for _, testCase := range []struct {
+		command string
+		args    []string
+		want    string
+	}{
+		{"uvx", []string{"--python", "3.12", "actual-server"}, "actual-server"},
+		{"uvx", []string{"--with", "extra-dep", "actual-server"}, "actual-server"},
+		{"docker", []string{"run", "--pull", "always", "myorg/real:1.0"}, "myorg/real"},
+		{"docker", []string{"run", "--rm", "-v", "/tmp:/tmp", "myorg/img:2"}, "myorg/img"},
+		{"npx", []string{"-y", "@scope/pkg@1.0.0"}, "@scope/pkg"},
+	} {
+		server := Server{Command: testCase.command, Args: testCase.args, Transport: "stdio"}
+		inferIdentity(&server)
+		if server.PackageName != testCase.want {
+			t.Errorf("%s %v: package_name = %q, want %q",
+				testCase.command, testCase.args, server.PackageName, testCase.want)
+		}
+	}
+}
+
+// VS Code and several other clients write `servers`; most write `mcpServers`. Merging both
+// into one map and labelling every row "mcpServers" made source_context describe a location
+// the entry did not come from, which is the one thing that column is for.
+func TestSourceContextNamesTheEnvelopeTheEntryCameFrom(t *testing.T) {
+	rows, err := extractEnvelopeSimple([]byte(
+		`{"mcpServers":{"from-mcp":{"command":"npx"}},"servers":{"from-servers":{"command":"node"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, row := range rows {
+		got[row.ServerName] = row.SourceContext
+	}
+	if got["from-mcp"] != "mcpServers" {
+		t.Errorf("from-mcp: source_context = %q, want mcpServers", got["from-mcp"])
+	}
+	if got["from-servers"] != "servers" {
+		t.Errorf("from-servers: source_context = %q, want servers", got["from-servers"])
+	}
+}
+
+// mcpServers still wins a name collision, and the losing entry must not also appear under the
+// other context: one configured server, one row.
+func TestCollidingEnvelopeNamesYieldOneRow(t *testing.T) {
+	rows, err := extractEnvelopeSimple([]byte(
+		`{"mcpServers":{"dup":{"command":"npx"}},"servers":{"dup":{"command":"node"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want one: %+v", len(rows), rows)
+	}
+	if rows[0].Command != "npx" || rows[0].SourceContext != "mcpServers" {
+		t.Errorf("mcpServers should win: %+v", rows[0])
 	}
 }

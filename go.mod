@@ -3,6 +3,7 @@ module github.com/macadmins/osquery-extension
 go 1.25
 
 require (
+	github.com/BurntSushi/toml v1.6.0
 	github.com/hashicorp/go-version v1.7.0
 	github.com/micromdm/plist v0.2.3-0.20260123201933-667adaf87d87
 	github.com/osquery/osquery-go v0.0.0-20250131154556-629f995b6947

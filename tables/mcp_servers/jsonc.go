@@ -8,9 +8,14 @@ package mcp_servers
 // trailing commas (rare in MCP configs; if present, json.Unmarshal returns an error and
 // the file is reported as malformed).
 //
+// Returns terminated=false when a block comment was opened and never closed. Such a file is
+// malformed, and the stripped prefix in front of the opener can still be valid JSON on its own,
+// so silently returning it would report a truncated file as a clean one. The caller turns a
+// false here into a parse warning.
+//
 // One pass, one allocation.
-func stripJSONC(in []byte) []byte {
-	out := make([]byte, 0, len(in))
+func stripJSONC(in []byte) (out []byte, terminated bool) {
+	out = make([]byte, 0, len(in))
 	inString := false
 	escape := false
 	for i := 0; i < len(in); i++ {
@@ -51,15 +56,20 @@ func stripJSONC(in []byte) []byte {
 				// asymmetry with the line-comment branch is not worth keeping.
 				out = append(out, ' ')
 				i += 2
+				closed := false
 				// Scan forward to the closing */. Written as a positive break
 				// rather than a negated conjunction: the condition is "have we
 				// reached the terminator", which this states directly rather than as
 				// either form of "not not at it".
 				for i+1 < len(in) {
 					if in[i] == '*' && in[i+1] == '/' {
+						closed = true
 						break
 					}
 					i++
+				}
+				if !closed {
+					return out, false
 				}
 				i++
 				continue
@@ -67,5 +77,5 @@ func stripJSONC(in []byte) []byte {
 		}
 		out = append(out, c)
 	}
-	return out
+	return out, true
 }

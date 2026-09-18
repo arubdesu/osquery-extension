@@ -81,3 +81,39 @@ func TestErrorTextRedactsTokensStraddlingTheTruncationBoundary(t *testing.T) {
 		t.Errorf("result is not bounded: %d bytes", len(got))
 	}
 }
+
+// "sk" is a common letter pair, so an unanchored sk- prefix matched inside ordinary
+// identifiers: task-management-service-client became ta[REDACTED], and a project directory
+// named task-tracker-frontend-app mangled every source_path containing it. Over-redaction is
+// this package's stated preference over leaking, but destroying legitimate values in the two
+// columns an operator navigates by is a different failure.
+func TestStringLeavesOrdinaryNamesContainingSkAlone(t *testing.T) {
+	for _, unchanged := range []string{
+		"@company/task-management-service-client",
+		"/Users/x/Documents/task-tracker-frontend-app/mcp.json",
+		"disk-usage-reporter-for-macos",
+		"risk-assessment-engine-v2-client",
+		"desk-booking-service-integration",
+	} {
+		if got := String(unchanged); got != unchanged {
+			t.Errorf("mangled an ordinary name: %q -> %q", unchanged, got)
+		}
+	}
+}
+
+// The boundary must not cost a real detection, including when the token is preceded by a
+// separator that has to survive into the output.
+func TestStringStillRedactsRealSkTokens(t *testing.T) {
+	for _, testCase := range []struct{ in, want string }{
+		{"sk-abcdefghijklmnopqrstuvwxyz", RedactedMark},
+		{"sk-ant-abcdefghijklmnopqrstuvwxyz", RedactedMark},
+		{"sk-proj-abcdefghijklmnopqrstuvwxyz", RedactedMark},
+		{"--api-key=sk-abcdefghijklmnopqrstuvwxyz", "--api-key=" + RedactedMark},
+		{"Bearer sk-abcdefghijklmnopqrstuvwxyz", "Bearer " + RedactedMark},
+		{"/path/to/sk-abcdefghijklmnopqrstuvwxyz", "/path/to/" + RedactedMark},
+	} {
+		if got := String(testCase.in); got != testCase.want {
+			t.Errorf("String(%q) = %q, want %q", testCase.in, got, testCase.want)
+		}
+	}
+}

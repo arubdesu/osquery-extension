@@ -3,6 +3,7 @@ package mcp_servers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -213,4 +214,97 @@ func TestMCPServersGenerateSurfacesUnreadableRootAsAWarningRow(t *testing.T) {
 	if len(rows) != 1 || rows[0]["warning"] == "" {
 		t.Fatalf("want exactly one row carrying a warning, got %v", rows)
 	}
+}
+
+// Pins the boundary the schema comment documents, so the residual risk stays a known,
+// deliberate property rather than something rediscovered later as a surprise.
+//
+// Two halves. A secret shaped like a known issuer token is removed wherever it appears, and
+// an opaque one is not removed anywhere. The second half is the limit of regex redaction, and
+// it is uniform across every column whose value a user chooses rather than specific to
+// command_basename.
+func TestRedactionRemovesKnownShapesButNotOpaqueOnes(t *testing.T) {
+	opaque := "my-opaque-secret-value"
+	shaped := "ghp_" + strings.Repeat("B", 36)
+
+	shapedRow := serverToRow(Server{
+		Command: "/tmp/" + shaped, ServerName: shaped, SourcePath: "/Users/x/" + shaped + "/.mcp.json",
+		PackageName: shaped, EnvKeys: []string{shaped},
+	})
+	for _, column := range []string{"command_basename", "server_name", "source_path", "package_name", "env_keys"} {
+		if strings.Contains(shapedRow[column], shaped) {
+			t.Errorf("%s kept a known-shape token: %q", column, shapedRow[column])
+		}
+	}
+
+	opaqueRow := serverToRow(Server{Command: "/tmp/" + opaque, SourcePath: "/Users/x/" + opaque + "/.mcp.json"})
+	if opaqueRow["command_basename"] != opaque {
+		t.Errorf("command_basename = %q; the documented behaviour is that an opaque value "+
+			"passes through. If this changed deliberately, update the schema comment too.",
+			opaqueRow["command_basename"])
+	}
+	if !strings.Contains(opaqueRow["source_path"], opaque) {
+		t.Error("source_path no longer passes an opaque value through, so the comment's claim " +
+			"that the limit is uniform across columns is now wrong")
+	}
+}
+
+// Every row the table emits has to satisfy the identity columns' documented sets, including
+// the rows that report a problem instead of a server. Diagnostics are built outside
+// inferIdentity, so they were leaving transport and confidence empty -- a value in neither
+// documented set, which made the rows whose entire purpose is to be noticed invisible to
+// `WHERE transport = 'unknown'` and to `WHERE confidence IN ('high','medium','low')`.
+func TestDiagnosticRowsSatisfyTheIdentityColumnContract(t *testing.T) {
+	transports := map[string]bool{"stdio": true, "http": true, "sse": true, "unknown": true}
+	confidences := map[string]bool{"high": true, "medium": true, "low": true}
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "alice", "code"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := fsscan.UsersRoot
+	fsscan.UsersRoot = root
+	t.Cleanup(func() { fsscan.UsersRoot = original })
+
+	inspect := func(label string, rows []Server) {
+		t.Helper()
+		var diagnostics int
+		for _, row := range rows {
+			if row.Warning == "" {
+				continue
+			}
+			diagnostics++
+			if !transports[row.Transport] {
+				t.Errorf("%s: transport = %q, not one of stdio/http/sse/unknown", label, row.Transport)
+			}
+			if !confidences[row.Confidence] {
+				t.Errorf("%s: confidence = %q, not one of high/medium/low", label, row.Confidence)
+			}
+		}
+		if diagnostics == 0 {
+			t.Errorf("%s: expected at least one diagnostic row to check", label)
+		}
+	}
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	inspect("cancelled query", DiscoverAll(cancelled, nil))
+
+	t.Setenv(fsscan.WalkTimeoutEnv, "1ns")
+	inspect("budget exhausted", DiscoverAll(context.Background(), nil))
+	t.Setenv(fsscan.WalkTimeoutEnv, "")
+
+	fsscan.UsersRoot = filepath.Join(root, "absent")
+	inspect("users root unreadable", DiscoverAll(context.Background(), nil))
+	fsscan.UsersRoot = root
+
+	inspect("parse failure", finishProcessing([]byte(`{not json`), nil,
+		"/p/mcp.json", "alice", "cursor", false, extractEnvelopeSimple))
+	inspect("unterminated comment", finishProcessing([]byte(`{"a":1} /*`), nil,
+		"/p/mcp.json", "alice", "cursor", true, extractEnvelopeSimple))
+	inspect("read failure", finishProcessing(nil, errors.New("boom"),
+		"/p/mcp.json", "alice", "cursor", false, extractEnvelopeSimple))
+	inspect("skipped entries", finishProcessing(
+		[]byte(`{"mcpServers":{"ok":{"command":"npx"},"bad":{"command":1}}}`), nil,
+		"/p/mcp.json", "alice", "cursor", false, extractEnvelopeSimple))
 }

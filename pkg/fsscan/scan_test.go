@@ -182,8 +182,33 @@ func TestScanContext_MaxFilesTruncatesWithWarning(t *testing.T) {
 	if len(result.Paths) != 1 || !result.Truncated || len(result.Warnings) != 1 {
 		t.Fatalf("unexpected result: %+v", result)
 	}
-	if !strings.Contains(result.Warnings[0], "files") {
-		t.Fatalf("warning should mention files: %+v", result.Warnings)
+	if !strings.Contains(result.Warnings[0], "file limit") {
+		t.Fatalf("warning should name the cause: %+v", result.Warnings)
+	}
+}
+
+// The limit bounds what is accepted; it does not mean "a scan of exactly this many files was
+// cut short". A walk that fitted inside its budget must report no truncation, or the warning
+// column tells operators a complete answer was partial.
+func TestScanContext_MaxFilesExactlyMetIsNotTruncation(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a", ".mcp.json"), `{}`)
+	writeFile(t, filepath.Join(root, "b", ".mcp.json"), `{}`)
+
+	result, err := ScanContext(context.Background(), ScanConfig{
+		Roots:    []string{root},
+		MaxFiles: 2, // exactly the number present
+		Accept:   acceptByBasename(".mcp.json"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Paths) != 2 {
+		t.Fatalf("got %d paths, want both: %+v", len(result.Paths), result.Paths)
+	}
+	if result.Truncated || result.Warning() != "" {
+		t.Errorf("nothing was dropped, so this is not a truncation: Truncated=%v warning=%q",
+			result.Truncated, result.Warning())
 	}
 }
 
@@ -241,6 +266,124 @@ func TestDefaultPrunes_DoesNotPruneClientConfigs(t *testing.T) {
 	for _, mustKeep := range []string{".cursor", ".vscode", ".codex", ".codeium", ".gemini", ".claude", ".continue"} {
 		if _, pruned := prunes[mustKeep]; pruned {
 			t.Errorf("DefaultPrunes should NOT prune %s (configs live there)", mustKeep)
+		}
+	}
+}
+
+// Counting only permission denials left every other read failure silent, though the outcome is
+// identical: a subtree was never inspected. A stale mount, an I/O error and descriptor
+// exhaustion all hide a root as completely as a denial does.
+//
+// ENAMETOOLONG is the one such failure a test can produce portably and safely. It is neither
+// absence nor permission, so it is exactly the class that used to go unreported, and it also
+// checks that the Full Disk Access remedy is withheld when the cause was not a denial.
+func TestScanContextCountsNonPermissionFailures(t *testing.T) {
+	tooLong := filepath.Join(t.TempDir(), strings.Repeat("n", 300))
+
+	result, err := ScanContext(context.Background(), ScanConfig{
+		Roots:  []string{tooLong},
+		Accept: acceptByBasename(".mcp.json"),
+	})
+	if err != nil {
+		t.Fatalf("a read failure must not fail the whole scan: %v", err)
+	}
+	if result.Inaccessible != 1 {
+		t.Errorf("Inaccessible = %d, want 1: a non-permission failure hides a root too",
+			result.Inaccessible)
+	}
+	if result.Denied != 0 {
+		t.Errorf("Denied = %d, want 0: this was not a permission problem", result.Denied)
+	}
+	if warning := result.Warning(); !strings.Contains(warning, "may be incomplete") {
+		t.Errorf("warning does not report the gap: %q", warning)
+	}
+	if warning := result.Warning(); strings.Contains(warning, "Full Disk Access") {
+		t.Errorf("remedy named for a non-denial cause: %q", warning)
+	}
+	if result.Truncated {
+		t.Error("a read failure is not a truncation")
+	}
+}
+
+// The other side of the boundary: the cases IsExpectedAbsent covers must stay silent, or every
+// user without a ~/code directory gets told their inventory is incomplete.
+func TestScanContextTreatsExpectedAbsenceAsSilent(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "afile"), "not a directory")
+
+	for _, testCase := range []struct{ name, path string }{
+		{"missing root", filepath.Join(root, "never-existed")},
+		{"traversal through a file", filepath.Join(root, "afile", "under")},
+	} {
+		result, err := ScanContext(context.Background(), ScanConfig{
+			Roots:  []string{testCase.path},
+			Accept: acceptByBasename(".mcp.json"),
+		})
+		if err != nil {
+			t.Fatalf("%s: %v", testCase.name, err)
+		}
+		if result.Inaccessible != 0 || result.Warning() != "" {
+			t.Errorf("%s: should be silent, got n=%d warning=%q",
+				testCase.name, result.Inaccessible, result.Warning())
+		}
+	}
+}
+
+// Warning() must render an incomplete-but-finished scan, not only a truncated one, and must
+// name the remedy only when a denial actually occurred.
+func TestScanResultWarningCoversBothConditions(t *testing.T) {
+	for _, testCase := range []struct {
+		name          string
+		result        ScanResult
+		wantEmpty     bool
+		wantSubstring string
+		wantNoRemedy  bool
+	}{
+		{name: "complete and fully readable", result: ScanResult{}, wantEmpty: true},
+		{
+			name:          "truncated only",
+			result:        ScanResult{Truncated: true, Warnings: []string{"reached the 1 file limit"}},
+			wantSubstring: "scan truncated",
+			wantNoRemedy:  true,
+		},
+		{
+			name:          "finished but blind, from a denial",
+			result:        ScanResult{Inaccessible: 2, Denied: 2},
+			wantSubstring: "Full Disk Access",
+		},
+		{
+			name:          "finished but blind, not a denial",
+			result:        ScanResult{Inaccessible: 1},
+			wantSubstring: "may be incomplete",
+			wantNoRemedy:  true,
+		},
+		{
+			name:          "symlinked root refused",
+			result:        ScanResult{SymlinkedRoots: 2},
+			wantSubstring: "symlinks and were not followed",
+			wantNoRemedy:  true,
+		},
+		{
+			name: "all three at once",
+			result: ScanResult{
+				Truncated: true, Warnings: []string{"walk timeout"},
+				Inaccessible: 1, Denied: 1, SymlinkedRoots: 1,
+			},
+			wantSubstring: "walk timeout",
+		},
+	} {
+		got := testCase.result.Warning()
+		if testCase.wantEmpty {
+			if got != "" {
+				t.Errorf("%s: want empty, got %q", testCase.name, got)
+			}
+			continue
+		}
+		if !strings.Contains(got, testCase.wantSubstring) {
+			t.Errorf("%s: %q does not contain %q", testCase.name, got, testCase.wantSubstring)
+		}
+		if testCase.wantNoRemedy && strings.Contains(got, "Full Disk Access") {
+			t.Errorf("%s: remedy named without a denial: %q", testCase.name, got)
 		}
 	}
 }

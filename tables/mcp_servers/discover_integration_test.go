@@ -158,7 +158,9 @@ func TestDiscoverForHome_SkipsClaudePluginMarketplace(t *testing.T) {
 }
 
 func TestDiscoverForHome_WalkerSkipsNodeModulesAndGit(t *testing.T) {
-	// Bumblebee-bait: planted configs inside dirs that must be pruned.
+	// Planted configs inside directories that must be pruned. A scanner that descends
+	// node_modules or .git finds vendored and hook-local configs that nothing is configured
+	// to run, which is noise indistinguishable from real rows.
 	home := buildFakeHome(t, map[string]string{
 		"code/foo/.mcp.json":                    `{"mcpServers": {"good": {"command": "npx", "args": ["x"]}}}`,
 		"code/foo/node_modules/evil/.mcp.json":  `{"mcpServers": {"bad-nm": {"command": "evil"}}}`,
@@ -403,11 +405,185 @@ func TestDiscoverAllHonoursCallerCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	// Direct-path reads still run (they take no context), so the assertion is that the walk
-	// pass contributes nothing rather than that the result is empty.
+	// Pass 1 now checks ctx before each direct read and Pass 2 is skipped entirely, so the
+	// assertion is about how the stop is reported: a cancelled query must not be described as
+	// a timeout, which is a budget outcome and means something different to an operator.
 	for _, row := range DiscoverAll(ctx, nil) {
 		if strings.Contains(row.Warning, "timeout") {
 			t.Errorf("cancellation was reported as a timeout: %q", row.Warning)
 		}
+	}
+}
+
+// A path the walker produced must be opened relative to the user home with O_NOFOLLOW on
+// every component, not just the last.
+//
+// This exercises the read step directly rather than going through discoverForHome, because the
+// real defect is a TOCTOU: filepath.WalkDir never descends a symlink, so the walk is safe, but
+// the user owns the directory and can swap it for a symlink after discovery and before the
+// open. A single-threaded test cannot sit inside that window, and planting the symlink up
+// front instead just means the walk never yields the path at all -- which is why the first
+// version of this test passed with the bug present. Calling processOne with an already-swapped
+// parent reproduces exactly the state the race would create.
+func TestProcessOneRefusesASymlinkedParentDirectory(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "alice")
+	victimDir := filepath.Join(root, "victim", "repo")
+	if err := os.MkdirAll(victimDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(victimDir, ".mcp.json"),
+		[]byte(`{"mcpServers":{"victim-secret":{"command":"npx","args":["x"]}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, "code"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// code/repo is a symlink out of the home, as it would be mid-race.
+	if err := os.Symlink(victimDir, filepath.Join(home, "code", "repo")); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := processOne(home, filepath.Join(home, "code", "repo", ".mcp.json"),
+		"alice", "claude_code", true, extractEnvelopeSimple)
+	for _, row := range rows {
+		if row.ServerName == "victim-secret" {
+			t.Errorf("read through a symlinked parent into another user's config: %+v", row)
+		}
+	}
+	if len(rows) != 0 {
+		t.Errorf("a refused read should be silent, got %+v", rows)
+	}
+}
+
+// Codex ships an installable-plugin catalog in the same file shape as real configuration, and
+// it had no exclusion while Claude's equivalent did. Measured on one workstation after a Codex
+// update, 39 of 51 rows came from these directories -- airtable, canva, figma, slack, stripe
+// and thirty more the user had never enabled.
+func TestCodexPluginCatalogIsExcluded(t *testing.T) {
+	catalog := `{"mcpServers":{"catalog-entry":{"type":"http","url":"https://example.test/mcp"}}}`
+	home := buildFakeHome(t, map[string]string{
+		".codex/.tmp/plugins/plugins/slack/.mcp.json":                         catalog,
+		".codex/.tmp/bundled-marketplaces/openai-bundled/plugins/x/.mcp.json": catalog,
+		".codex/plugins/cache/openai-bundled/computer-use/1.0.0/.mcp.json":    catalog,
+		// Control: a real config directly under .codex must still be found.
+		".codex/mcp.json": `{"servers":{"real-codex":{"command":"node","args":["s.js"]}}}`,
+	})
+	rows := discoverForTest("alice", home)
+	for _, row := range rows {
+		if row.ServerName == "catalog-entry" {
+			t.Errorf("catalog entry leaked into the table: %s", row.SourcePath)
+		}
+	}
+	var foundReal bool
+	for _, row := range rows {
+		if row.ServerName == "real-codex" {
+			foundReal = true
+		}
+	}
+	if !foundReal {
+		t.Errorf("the real config was filtered out by mistake; rows=%+v", rows)
+	}
+}
+
+// VS Code's user-scope and profile-scoped MCP configs live under Library, which the walker
+// prunes, and Copilot's portable config has a hyphenated basename that was in neither the
+// direct-path list nor walkableBasenames. All three were unreachable by any pathway.
+//
+// The VS Code files use `servers` rather than `mcpServers`, which is the shape Microsoft
+// documents and which extractEnvelope already accepts; asserting it here keeps that coupling
+// visible.
+func TestDiscoverForHome_VSCodeUserScopeProfilesAndCopilot(t *testing.T) {
+	home := buildFakeHome(t, map[string]string{
+		"Library/Application Support/Code/User/mcp.json": `{
+			// JSONC is accepted here too
+			"servers": {"vscode-user": {"command": "npx", "args": ["-y", "vs-mcp@1.0.0"]}}
+		}`,
+		"Library/Application Support/Code/User/profiles/abc123/mcp.json": `{"servers":{"vscode-profile":{"command":"node","args":["p.js"]}}}`,
+		"Library/Application Support/Cursor/User/mcp.json":               `{"servers":{"cursor-user":{"command":"uvx","args":["c-mcp"]}}}`,
+		".copilot/mcp-config.json":                                       `{"mcpServers":{"copilot-srv":{"type":"http","url":"https://example.test/mcp"}}}`,
+	})
+	rows := discoverForTest("alice", home)
+	got := map[string]string{}
+	for _, row := range rows {
+		if row.Warning != "" {
+			t.Errorf("unexpected warning on %s: %s", row.SourcePath, row.Warning)
+			continue
+		}
+		got[row.ServerName] = row.Client
+	}
+	for name, wantClient := range map[string]string{
+		"vscode-user":    "vscode",
+		"vscode-profile": "vscode",
+		"cursor-user":    "cursor",
+		"copilot-srv":    "copilot",
+	} {
+		if got[name] != wantClient {
+			t.Errorf("%s: client = %q, want %q (rows=%v)", name, got[name], wantClient, got)
+		}
+	}
+}
+
+// Codex supports project-scoped configuration in <repo>/.codex/config.toml and named profiles
+// in ~/.codex/<profile>.config.toml. Only the user-scope file had a direct path, so both of
+// these were false negatives for a client the table names as supported.
+//
+// The .codex parent is required rather than matching config.toml anywhere: that basename is
+// among the most common on a developer machine, and the walk roots are whole project trees.
+func TestDiscoverForHome_CodexProjectAndProfileTOML(t *testing.T) {
+	home := buildFakeHome(t, map[string]string{
+		"code/myrepo/.codex/config.toml": "[mcp_servers.project_scoped]\ncommand = \"node\"\n",
+		".codex/work.config.toml":        "[mcp_servers.profile_scoped]\ncommand = \"uvx\"\n",
+		".codex/config.toml":             "[mcp_servers.user_scoped]\ncommand = \"npx\"\n",
+		// Must NOT be picked up: a config.toml that is not Codex's.
+		"code/myrepo/config.toml":          "[build]\ntarget = \"wasm\"\n",
+		"code/rustproj/.cargo/config.toml": "[net]\ngit-fetch-with-cli = true\n",
+	})
+	rows := discoverForTest("alice", home)
+	found := map[string]bool{}
+	for _, row := range rows {
+		if row.Warning != "" {
+			t.Errorf("unexpected warning on %s: %s", row.SourcePath, row.Warning)
+			continue
+		}
+		found[row.ServerName] = true
+		if row.Client != "codex" {
+			t.Errorf("%s: client = %q, want codex", row.ServerName, row.Client)
+		}
+	}
+	for _, want := range []string{"project_scoped", "profile_scoped", "user_scoped"} {
+		if !found[want] {
+			t.Errorf("missing %q; found %v", want, found)
+		}
+	}
+	if len(found) != 3 {
+		t.Errorf("an unrelated config.toml was picked up: %v", found)
+	}
+}
+
+// Pass 1 stopping early has to be reported. Breaking out of the direct-source loop quietly
+// also skips Pass 2, so the home returns only what had been read and looks like a user with
+// fewer configs -- the confusion the per-user rows in DiscoverAll exist to prevent.
+//
+// Forced with an already-exhausted budget so Pass 1 breaks on its first iteration.
+func TestDiscoverForHomeReportsWhenPassOneStopsEarly(t *testing.T) {
+	home := buildFakeHome(t, map[string]string{
+		".cursor/mcp.json": `{"mcpServers":{"never-read":{"command":"npx","args":["x"]}}}`,
+	})
+	rows := discoverForHome(context.Background(), "alice", home, -1*time.Second)
+	if len(rows) == 0 {
+		t.Fatal("an exhausted budget must not return silently")
+	}
+	var reported bool
+	for _, row := range rows {
+		if strings.Contains(row.Warning, "partway through this user") {
+			reported = true
+		}
+		if row.Warning != "" && (row.Transport != "unknown" || row.Confidence != "low") {
+			t.Errorf("diagnostic row breaks the identity contract: %+v", row)
+		}
+	}
+	if !reported {
+		t.Errorf("no row says Pass 1 stopped early: %+v", rows)
 	}
 }

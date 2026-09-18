@@ -10,12 +10,14 @@ go_library(
         "mcp_servers.go",
         "parse.go",
         "redact.go",
+        "toml.go",
     ],
     importpath = "github.com/macadmins/osquery-extension/tables/mcp_servers",
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/fsscan",
         "//pkg/redact",
+        "@com_github_burntsushi_toml//:go_default_library",
         "@com_github_osquery_osquery_go//plugin/table",
     ],
 )
@@ -27,6 +29,7 @@ go_test(
         "discover_integration_test.go",
         "mcp_servers_test.go",
         "mcp_test.go",
+        "toml_test.go",
     ],
     embed = [":mcp_servers"],
     deps = [

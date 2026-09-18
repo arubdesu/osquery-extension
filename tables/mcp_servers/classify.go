@@ -38,6 +38,14 @@ func classifyPath(absPath string) classification {
 		// $HOME/.claude.json: the Claude Code per-user blob.
 		return classification{"claude_code", false, extractClaudeCode, true}
 
+	case base == "mcp-config.json":
+		// Copilot's portable config. Hyphenated, unlike every other name here.
+		return classification{"copilot", true, extractEnvelopeSimple, true}
+
+	case base == "mcp.json" && strings.Contains(absPath, "/Library/Application Support/"):
+		// VS Code family, user scope or a per-profile directory under .../User/profiles/<id>/.
+		return classification{vscodeForkFromPath(absPath), true, extractEnvelopeSimple, true}
+
 	case base == "cline_mcp_settings.json":
 		// Cline VS Code/Cursor/Windsurf extension storage.
 		return classification{"cline", true, extractEnvelopeSimple, true}
@@ -51,6 +59,13 @@ func classifyPath(absPath string) classification {
 
 	case base == "mcp.json" && parent == ".vscode":
 		return classification{"vscode", true, extractEnvelopeSimple, true}
+
+	// Codex's own configuration is TOML: ~/.codex/config.toml for the user scope, which a
+	// direct path covers, plus <repo>/.codex/config.toml for project scope and
+	// ~/.codex/<profile>.config.toml for named profiles, which only the walker can reach.
+	// The JSON cases below stay for older Codex builds and third-party tooling.
+	case isCodexTOMLPath(absPath):
+		return classification{"codex", false, extractCodexTOML, true}
 
 	case base == "mcp.json" && parent == ".codex":
 		return classification{"codex", true, extractEnvelopeSimple, true}
@@ -93,6 +108,33 @@ func classifyPath(absPath string) classification {
 	return classification{supported: false}
 }
 
+// isCodexTOMLPath reports whether a path is a Codex TOML config: config.toml or a
+// <profile>.config.toml, in either case directly inside a .codex directory.
+//
+// The .codex parent is required rather than matching config.toml anywhere, because that
+// basename is one of the most common on a developer machine -- Rust, Hugo and many others
+// use it -- and the walk roots include whole project trees.
+func isCodexTOMLPath(absPath string) bool {
+	if filepath.Base(filepath.Dir(absPath)) != ".codex" {
+		return false
+	}
+	base := filepath.Base(absPath)
+	return base == "config.toml" || strings.HasSuffix(base, ".config.toml")
+}
+
+// vscodeForkFromPath names the fork owning a path under Library/Application Support, so a
+// profile-scoped mcp.json is attributed to the editor that wrote it rather than to "unknown".
+func vscodeForkFromPath(absPath string) string {
+	switch {
+	case strings.Contains(absPath, "/Application Support/Cursor/"):
+		return "cursor"
+	case strings.Contains(absPath, "/Application Support/Windsurf/"):
+		return "windsurf"
+	default:
+		return "vscode"
+	}
+}
+
 // walkableBasenames is the set of basenames the walker should pick up. Must be
 // kept in sync with classifyPath: a basename here without a classification
 // case will be discovered but skipped during processing.
@@ -102,6 +144,7 @@ var walkableBasenames = map[string]struct{}{
 	"mcp_config.json":            {},
 	"mcp_settings.json":          {},
 	"cline_mcp_settings.json":    {},
+	"mcp-config.json":            {},
 	"claude_desktop_config.json": {},
 	// settings.json deliberately excluded: too generic. The .gemini case is
 	// caught via a direct path; we don't want to surface every VS Code

@@ -31,13 +31,23 @@ const RedactedMark = "[REDACTED]"
 
 // knownTokenRe matches issuer-prefixed token shapes. False positives are
 // rare; we'd rather over-redact in error messages and paths than leak.
+//
+// The sk- alternative alone carries a left-boundary group, because "sk" is a common letter
+// pair and the prefix is only two characters plus a dash. Unanchored, it matched inside
+// ordinary identifiers: task-management-service-client became ta[REDACTED], and a project
+// directory named task-tracker-frontend-app mangled every source_path that contained it.
+// disk-, risk- and desk- do the same. The other prefixes are distinctive enough that matching
+// mid-string is a feature rather than a hazard, so they are deliberately left unanchored.
+//
+// Group 1 is the consumed separator, replayed by String so only the credential is replaced.
+// For every other alternative it captures nothing and the group expands to empty.
 var knownTokenRe = regexp.MustCompile(strings.Join([]string{
 	`(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}`,
 	`github_pat_[A-Za-z0-9_]{20,}`,
 	`gitlab-[a-z]+-[A-Za-z0-9_-]{20,}`,
 	`glpat-[A-Za-z0-9_-]{20,}`,
 	`xox[abprs]-[A-Za-z0-9-]{10,}`,
-	`sk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}`,
+	`(^|[^A-Za-z0-9_-])(sk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,})`,
 	`AKIA[0-9A-Z]{16}`,
 	`ASIA[0-9A-Z]{16}`,
 	`AIza[0-9A-Za-z_-]{35}`,
@@ -53,7 +63,9 @@ func String(s string) string {
 	if !mayContainKnownToken(s) {
 		return s
 	}
-	return knownTokenRe.ReplaceAllString(s, RedactedMark)
+	// ${1} replays the separator the sk- alternative had to consume for want of lookbehind,
+	// which RE2 does not have. It is empty for every other alternative.
+	return knownTokenRe.ReplaceAllString(s, "${1}"+RedactedMark)
 }
 
 func mayContainKnownToken(s string) bool {

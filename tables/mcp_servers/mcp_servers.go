@@ -15,22 +15,36 @@ import (
 
 // MCPServersColumns defines the schema for the mcp_servers virtual table.
 //
-// Credential-leak posture: we emit NOTHING whose value could carry a
-// credential from a user-writable file:
+// Credential-leak posture. The aim is to remove every place a credential is *routinely*
+// found, not to claim that no user-controlled string can ever contain one:
 //
-//   - Raw `args` is not exposed (args can carry opaque tokens that no regex
-//     reliably detects).
-//   - Full `command` is not exposed either. We replace it with
-//     `command_basename` (e.g., "npx", "uvx", "atlassian.sh"), the binary
-//     name, with any whitespace-embedded args/flags stripped. A basename
-//     cannot carry a credential.
-//   - `url_endpoint` is scheme+host only; path/query/fragment/userinfo are
-//     dropped before this column is written.
+//   - Raw `args` is not exposed at all. Arguments routinely carry opaque tokens that no
+//     regex reliably detects, so the column is a count rather than the values.
+//   - Full `command` is not exposed either. It becomes `command_basename` (e.g. "npx",
+//     "uvx", "atlassian.sh"), which drops both the directory components and any
+//     whitespace-embedded arguments. A path like /Users/x/api-key-AAAA/bin/tool therefore
+//     reaches the row as "tool".
+//   - `url_endpoint` is scheme+host only; path, query, fragment and userinfo are dropped
+//     before the column is written, because tokens are common in all four.
 //   - `env_keys` is JSON-encoded variable NAMES. Values are never extracted.
-//   - `server_name`, `source_context`, `source_path`, `warning`,
-//     `package_name`, and `requested_spec` pass through redact.String,
-//     which replaces known-token-shape substrings with [REDACTED]. This is
-//     defense in depth, the primary controls are the column choices above.
+//   - `server_name`, `source_context`, `source_path`, `warning`, `package_name` and
+//     `requested_spec` pass through redact.String, which replaces known-token-shape
+//     substrings with [REDACTED].
+//
+// Residual risk, stated plainly because an absolute claim here would be false. redact.String
+// recognises issuer-prefixed shapes; an opaque secret with no recognisable structure passes
+// through it. So any column whose value a user chooses can carry one if the user puts it
+// there: a binary named after a secret arrives as `command_basename`, a directory named after
+// one arrives inside `source_path`, and the same is true of `server_name`, `package_name` and
+// `env_keys`. This is the limit pkg/redact documents, and it is uniform across those columns
+// rather than specific to any of them.
+//
+// Narrowing those columns further -- hashing them, or restricting them to an allowlist -- was
+// considered and rejected. It would not be sound applied to one column while five others keep
+// the same property, and applied to all of them it removes the table's purpose: on the machine
+// this was developed against, the basenames included `terraform-mcp-server` and
+// `computer-use-client-launcher`, non-standard launchers that no allowlist would contain and
+// that are precisely the rows worth looking at.
 func MCPServersColumns() []table.ColumnDefinition {
 	return []table.ColumnDefinition{
 		table.TextColumn("user"),
@@ -43,7 +57,7 @@ func MCPServersColumns() []table.ColumnDefinition {
 		// no args, no flags, no paths. Whitespace-embedded args are stripped
 		// before this is written.
 		table.TextColumn("command_basename"),
-		table.TextColumn("args_count"),
+		table.IntegerColumn("args_count"),
 		table.TextColumn("url_endpoint"),
 		table.TextColumn("env_keys"),
 		table.TextColumn("package_manager"),
@@ -51,7 +65,7 @@ func MCPServersColumns() []table.ColumnDefinition {
 		table.TextColumn("requested_spec"),
 		table.TextColumn("version"),
 		table.TextColumn("confidence"),
-		table.TextColumn("disabled"),
+		table.IntegerColumn("disabled"),
 		table.TextColumn("warning"),
 	}
 }
@@ -106,7 +120,13 @@ func serverToRow(s Server) map[string]string {
 		// Pass command_basename through redact.String as well, defense in
 		// depth in case a hostile binary filename matches a known token shape.
 		"command_basename": redact.String(redact.CommandBasename(s.Command)),
-		"args_count":       strconv.Itoa(len(s.Args)),
+		// The length of the JSON args array as written, not the number of arguments the
+		// launcher effectively receives. A config of {"command": "uvx pkg@1.0"} with no args
+		// array reports 0 here while package_name and version are still inferred from the
+		// token embedded in command, because identity inference re-splits command on
+		// whitespace and this column deliberately does not. Reporting the raw array length
+		// keeps the column a faithful description of the file.
+		"args_count": strconv.Itoa(len(s.Args)),
 		// url_endpoint is already scheme://host (no path/query), but the
 		// host itself could contain a token shape (e.g., DNS-controlled
 		// `aws.AKIA...example.com`). Redact defensively.
