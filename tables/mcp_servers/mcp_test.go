@@ -1137,3 +1137,79 @@ func TestClaudeCodeInvalidJSONStillErrors(t *testing.T) {
 		t.Fatal("truncated JSON should return an error so the caller emits a parse warning")
 	}
 }
+
+// TestEnvelopeCollisionUsesDeclaredNamesNotDecodedOnes pins the precedence contract against
+// the state where it used to invert: `mcpServers` wins on collision, but the suppression list
+// was built from the entries that *decoded*, so a malformed higher-priority entry dropped out
+// of the list and the lower-priority `servers` row survived under it. The file then reported
+// the shadowed configuration as though it were the effective one.
+func TestEnvelopeCollisionUsesDeclaredNamesNotDecodedOnes(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		doc         string
+		wantServers []string
+		wantErr     bool
+	}{
+		{
+			// The shadowed `servers.dup` must not stand in for the broken authoritative
+			// entry. Nothing is recoverable, so this is the no-decodable-entries case.
+			name:    "malformed mcpServers entry does not promote its servers twin",
+			doc:     `{"mcpServers":{"dup":{"command":123}},"servers":{"dup":{"command":"npx"}}}`,
+			wantErr: true,
+		},
+		{
+			// Same collision, but a healthy sibling in the same envelope means the file is
+			// not a total loss: "ok" survives and "dup" stays suppressed.
+			name: "healthy sibling survives while the collision stays suppressed",
+			doc: `{"mcpServers":{"dup":{"command":123},"ok":{"command":"node"}},` +
+				`"servers":{"dup":{"command":"npx"}}}`,
+			wantServers: []string{"ok"},
+		},
+		{
+			// A shape-invalid entry (null decodes without error but is not a server) takes
+			// the same path as a decode failure and must suppress identically.
+			name:    "shape-invalid mcpServers entry also suppresses",
+			doc:     `{"mcpServers":{"dup":null},"servers":{"dup":{"command":"npx"}}}`,
+			wantErr: true,
+		},
+		{
+			// Control: with no higher-priority declaration at all, the servers entry is the
+			// effective configuration and must be reported.
+			name:        "servers entry with no mcpServers twin is reported",
+			doc:         `{"mcpServers":{"other":{"command":"node"}},"servers":{"solo":{"command":"npx"}}}`,
+			wantServers: []string{"other", "solo"},
+		},
+		{
+			// Control: a healthy collision resolves to the mcpServers side, as before.
+			name:        "healthy collision resolves to mcpServers",
+			doc:         `{"mcpServers":{"dup":{"command":"node"}},"servers":{"dup":{"command":"npx"}}}`,
+			wantServers: []string{"dup"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows, err := extractEnvelopeSimple([]byte(tc.doc))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("want an error, got rows %+v", rows)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			var got []string
+			for _, row := range rows {
+				if row.Warning != "" {
+					continue
+				}
+				got = append(got, row.ServerName)
+			}
+			sort.Strings(got)
+			want := append([]string(nil), tc.wantServers...)
+			sort.Strings(want)
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("servers = %v, want %v", got, want)
+			}
+		})
+	}
+}

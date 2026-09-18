@@ -6,6 +6,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -321,4 +323,61 @@ func TestDiagnosticRowsSatisfyTheIdentityColumnContract(t *testing.T) {
 	inspect("skipped entries", finishProcessing(
 		[]byte(`{"mcpServers":{"ok":{"command":"npx"},"bad":{"command":1}}}`), nil,
 		"/p/mcp.json", "alice", "cursor", false, extractEnvelopeSimple))
+}
+
+// TestUserEnumerationFailureNamesEachRequestedUser pins the roster-unreadable path against the
+// same defect the per-account skipped-home rows already fixed: a single aggregate diagnostic
+// with an empty user is discarded by `WHERE user = '<name>'`, so a constrained query was handed
+// a clean empty result for the one failure that can say nothing about any account at all.
+func TestUserEnumerationFailureNamesEachRequestedUser(t *testing.T) {
+	// A regular file where the users root should be makes ReadDir fail with ENOTDIR, which
+	// is the enumeration failure without needing unreadable directories or a fake root.
+	notADirectory := filepath.Join(t.TempDir(), "users")
+	if err := os.WriteFile(notADirectory, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	original := fsscan.UsersRoot
+	fsscan.UsersRoot = notADirectory
+	t.Cleanup(func() { fsscan.UsersRoot = original })
+
+	t.Run("constrained query gets the diagnostic under each name it asked about", func(t *testing.T) {
+		rows := DiscoverAll(context.Background(), map[string]struct{}{
+			"erin": {}, "carol": {}, "alice": {}, "dave": {}, "bob": {},
+		})
+		var users []string
+		for _, row := range rows {
+			if row.Warning == "" {
+				t.Errorf("every row on this path must carry a warning; got %+v", row)
+			}
+			if !strings.Contains(row.Warning, "list users") {
+				t.Errorf("warning should name the enumeration failure, got %q", row.Warning)
+			}
+			users = append(users, row.User)
+		}
+		// Asserted before sorting: these rows go straight to osquery, and map iteration
+		// order is randomised per range, so emitting them unsorted makes the same query
+		// return the same rows in a different order each run.
+		if !sort.StringsAreSorted(users) {
+			t.Errorf("rows are not in a deterministic order: %q", users)
+		}
+		sort.Strings(users)
+		if !reflect.DeepEqual(users, []string{"alice", "bob", "carol", "dave", "erin"}) {
+			t.Errorf("users = %q, want all five requested; an empty user here is invisible to the "+
+				"constraint that asked the question", users)
+		}
+	})
+
+	t.Run("unconstrained query keeps one aggregate row", func(t *testing.T) {
+		rows := DiscoverAll(context.Background(), nil)
+		if len(rows) != 1 {
+			t.Fatalf("want exactly one aggregate row, got %d: %+v", len(rows), rows)
+		}
+		if rows[0].User != "" {
+			t.Errorf("aggregate row user = %q, want empty: no account was confirmed or "+
+				"ruled out, so naming one would be a claim we cannot make", rows[0].User)
+		}
+		if !strings.Contains(rows[0].Warning, "list users") {
+			t.Errorf("warning = %q, should name the enumeration failure", rows[0].Warning)
+		}
+	})
 }

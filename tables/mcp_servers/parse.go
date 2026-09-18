@@ -69,6 +69,10 @@ func extractEnvelope(raw []byte) (envelopeEntries, int, error) {
 	// version collapsed all of them into one error, which reported {"mcpServers": {}} -- a
 	// valid zero-server configuration -- as a malformed file.
 	skipped, malformedEnvelopes := 0, 0
+	// Names the high-priority envelope *declares*, as opposed to the ones it successfully
+	// decodes. Precedence is a property of the declaration: a name spelled in mcpServers is
+	// spoken for whether or not its entry is readable.
+	declaredByMCPServers := map[string]struct{}{}
 	for key, target := range map[string]map[string]rawServerEntry{
 		"servers": out.Servers, "mcpServers": out.MCPServers,
 	} {
@@ -85,6 +89,11 @@ func extractEnvelope(raw []byte) (envelopeEntries, int, error) {
 			malformedEnvelopes++
 			continue
 		}
+		if key == "mcpServers" {
+			for name := range entries {
+				declaredByMCPServers[name] = struct{}{}
+			}
+		}
 		// A nil map covers both {} and null. Neither is a failure: the key is present and
 		// declares no servers.
 		skipped += decodeInto(target, entries)
@@ -96,7 +105,14 @@ func extractEnvelope(raw []byte) (envelopeEntries, int, error) {
 	}
 	// mcpServers wins on collision, so drop the duplicate from the servers side rather than
 	// emitting the same server twice under two contexts.
-	for name := range out.MCPServers {
+	//
+	// Keyed on the declared names, not out.MCPServers. Those differ exactly when a
+	// high-priority entry is unreadable, and that is the case where the distinction decides
+	// what the table says: suppressing only decoded names let the shadowed `servers` entry
+	// take the broken entry's place and be reported as the effective configuration, which
+	// inverts the precedence this comment claims. An entry that is declared but unreadable
+	// is already counted in skipped, so the loss is reported rather than papered over.
+	for name := range declaredByMCPServers {
 		delete(out.Servers, name)
 	}
 	if len(out.MCPServers)+len(out.Servers) == 0 && (malformedEnvelopes > 0 || skipped > 0) {

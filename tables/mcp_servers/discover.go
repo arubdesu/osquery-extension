@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io/fs"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -172,7 +173,33 @@ func DiscoverAll(ctx context.Context, userFilter map[string]struct{}) []Server {
 	}
 	enumerated, err := fsscan.ListUserHomes(fsscan.UsersRoot)
 	if err != nil {
-		return []Server{diagnosticRow("", fsscan.UsersRoot, "", "list users: "+err.Error())}
+		// The roster itself is unreadable, so no account can be confirmed or ruled out.
+		//
+		// A single aggregate row with an empty user was dropped by `WHERE user = '<name>'`,
+		// handing a constrained query a clean empty result for the one failure that can say
+		// nothing about any account whatsoever -- the same confusion the per-account rows
+		// below exist to prevent, on a wider blast radius. A narrowed query therefore gets
+		// the diagnostic repeated under each name it asked about.
+		//
+		// An unconstrained query keeps the single aggregate row: there is no roster to
+		// enumerate names from, so inventing them is not an option, and an empty user is
+		// the honest answer to "which accounts" when that is precisely what failed.
+		warning := "list users: " + err.Error()
+		if userFilter == nil {
+			return []Server{diagnosticRow("", fsscan.UsersRoot, "", warning)}
+		}
+		requested := make([]string, 0, len(userFilter))
+		for name := range userFilter {
+			requested = append(requested, name)
+		}
+		// Map iteration order is random and these rows go straight to osquery.
+		sort.Strings(requested)
+		rows := make([]Server, 0, len(requested))
+		for _, name := range requested {
+			rows = append(rows, diagnosticRow(name, filepath.Join(fsscan.UsersRoot, name), "",
+				warning))
+		}
+		return rows
 	}
 	deadline := time.Now().Add(fsscan.WalkTimeout())
 	var out []Server
