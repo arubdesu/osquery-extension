@@ -6,9 +6,12 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "fsscan",
     srcs = [
+        "appdata_other.go",
+        "appdata_windows.go",
         "openbeneath.go",
         "platform_unix.go",
         "platform_unsupported.go",
+        "platform_windows.go",
         "scan.go",
         "users.go",
     ],
@@ -50,6 +53,10 @@ go_library(
         "@io_bazel_rules_go//go/platform:solaris": [
             "@org_golang_x_sys//unix",
         ],
+        "@io_bazel_rules_go//go/platform:windows": [
+            "@org_golang_x_sys//windows",
+            "@org_golang_x_sys//windows/registry",
+        ],
         "//conditions:default": [],
     }),
 )
@@ -57,6 +64,7 @@ go_library(
 go_test(
     name = "fsscan_test",
     srcs = [
+        "appdata_other_test.go",
         "components_test.go",
         "dedup_test.go",
         "openbeneath_test.go",

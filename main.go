@@ -84,11 +84,12 @@ func main() {
 	// If there were windows only tables, they would go here
 	// }
 
-	// mcp_servers is not darwin-only: pkg/fsscan refuses symlinks on POSIX with iterated
-	// openat and O_NOFOLLOW, and the per-user config locations resolve per OS. Platforms
-	// without that backend report unsupported rather than degrading, so the table is
-	// registered where it can answer safely and left unregistered where it cannot.
-	if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
+	// mcp_servers is not darwin-only: pkg/fsscan has a symlink-refusing backend for POSIX
+	// (iterated openat with O_NOFOLLOW) and for Windows (os.Root plus a reparse-point check
+	// and a post-open identity re-check), and the per-user config locations resolve per OS.
+	// Platforms with neither backend report unsupported rather than degrading, so the table
+	// is registered where it can answer safely and left unregistered where it cannot.
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" || runtime.GOOS == "linux" {
 		plugins = append(plugins, table.NewPlugin(
 			"mcp_servers", mcpservers.MCPServersColumns(),
 			func(ctx context.Context, queryContext table.QueryContext) ([]map[string]string, error) {

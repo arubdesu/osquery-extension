@@ -326,6 +326,64 @@ func stampUserID(rows []Server, id string) []Server {
 	return rows
 }
 
+// roamingRootFor reports the account's roaming application-data directory and, when the
+// answer is not the conventional one, a diagnostic describing why.
+//
+// Three outcomes matter and only two of them are "fine". A confirmed default needs no
+// comment. A confirmed redirection inside the profile is followed silently, because the
+// configuration is still found. A redirection out of the profile, or an answer that could
+// not be read at all, means this account's application-support configuration is not being
+// inspected, and saying nothing there is the failure mode being fixed.
+func roamingRootFor(account fsscan.UserHome) (root, note string) {
+	if runtime.GOOS != "windows" {
+		return "", ""
+	}
+	resolved, redirected, ok := fsscan.RoamingAppDataFor(account.ID, account.Path)
+	if !ok {
+		return "", "roaming application data location could not be determined for this " +
+			"account, so its editor and agent configuration may not be listed; the " +
+			"conventional location was scanned instead"
+	}
+	if !redirected {
+		return "", ""
+	}
+	if !withinHome(resolved, account.Path) {
+		return resolved, "roaming application data for this account is redirected to " +
+			redact.Path(resolved) + ", outside the profile, which is not inspected; " +
+			"its editor and agent configuration is not listed"
+	}
+	return resolved, ""
+}
+
+// withinHome reports whether an absolute path lies beneath home. Redirection inside the
+// profile is still reachable by the ordinary bounded, symlink-refusing traversal; redirection
+// outside it is not, because that traversal is anchored to the home on purpose.
+func withinHome(path, home string) bool {
+	rel, err := filepath.Rel(home, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
+// redirectAppSupport rewrites an application-support-relative path to sit under a redirected
+// roaming root. It reports usable=false when the source cannot be reached at all, which is
+// the out-of-profile case the caller has already warned about.
+func redirectAppSupport(relPath, appDataRoot, home string) (rewritten string, usable bool) {
+	if appDataRoot == "" {
+		return "", true // conventional location; relPath already correct
+	}
+	prefix := appSupportDir() + string(os.PathSeparator)
+	if !strings.HasPrefix(relPath, prefix) {
+		return "", true // a dotfile source, unaffected by where AppData points
+	}
+	if !withinHome(appDataRoot, home) {
+		return "", false
+	}
+	rel, err := filepath.Rel(home, appDataRoot)
+	if err != nil {
+		return "", false
+	}
+	return filepath.Join(rel, strings.TrimPrefix(relPath, prefix)), true
+}
+
 // scanKey names everything discovery depends on, so a cached result is only reused where it
 // would genuinely have been identical.
 //
@@ -410,10 +468,19 @@ func discoverForHome(ctx context.Context, account fsscan.UserHome, budget time.D
 	// work the budget must cover rather than work that happens outside it.
 	deadline := time.Now().Add(budget)
 
+	// Where this account actually keeps roaming application data. On Windows that is a
+	// per-user known folder a policy can redirect; everywhere else it is a fixed subpath of
+	// the home. An undetermined answer is reported rather than quietly assumed, because
+	// assuming the default on a redirected host is how every VS Code, Claude Desktop and
+	// Cline config for that account went missing with no warning.
+	appData, appDataNote := roamingRootFor(account)
 	// The absolute form of the remaining allowance, so the direct pass and the walk draw on
 	// one deadline instead of the walk receiving a duration computed before the direct reads
 	// had run.
 	var out []Server
+	if appDataNote != "" {
+		out = append(out, diagnosticRow(user, home, "", appDataNote))
+	}
 	stoppedEarly := false
 	seen := make(map[string]struct{})
 
@@ -438,6 +505,11 @@ func discoverForHome(ctx context.Context, account fsscan.UserHome, budget time.D
 		relPath, resolvable := resolveSnapPath(home, src.relPath)
 		if !resolvable {
 			continue
+		}
+		if redirected, usable := redirectAppSupport(relPath, appData, home); !usable {
+			continue
+		} else if redirected != "" {
+			relPath = redirected
 		}
 		path := filepath.Join(home, relPath)
 		if _, dup := seen[path]; dup {
@@ -470,7 +542,7 @@ func discoverForHome(ctx context.Context, account fsscan.UserHome, budget time.D
 	}
 
 	// Pass 2: walker over high-signal dev dirs
-	walkRoots, profileClients := buildWalkRoots(home)
+	walkRoots, profileClients := buildWalkRoots(home, appData)
 	if len(walkRoots) > 0 {
 		// ScanContext rather than Scan, because Scan discards the truncation flag along with
 		// the error, and a walk that quietly returns fewer rows is indistinguishable from a
@@ -602,7 +674,7 @@ var vscodeProfileRoots = vscodeProfileRootPaths()
 // scan. Two categories:
 //   - Dev project dirs (~/code, ~/dev, ~/Documents, ...) from fsscan
 //   - MCP client config dotdirs (~/.claude, ~/.codex, ~/.continue)
-func buildWalkRoots(home string) (roots []string, profileClients map[string]string) {
+func buildWalkRoots(home, appDataRoot string) (roots []string, profileClients map[string]string) {
 	dev := fsscan.DevSubdirRoots(home)
 	profileClients = make(map[string]string, len(vscodeProfileRoots))
 	out := make([]string, 0, len(dev)+len(clientConfigSubdirs)+len(vscodeProfileRoots))
@@ -618,6 +690,18 @@ func buildWalkRoots(home string) (roots []string, profileClients map[string]stri
 		relPath, resolvable := resolveSnapPath(home, s)
 		if !resolvable {
 			continue
+		}
+		// And the same AppData redirection. Applying it to Pass 1 but not here meant a
+		// profile-scoped mcp.json was missed whenever Roaming had moved, with no warning
+		// because an in-profile redirect counts as handled -- and worse, when Roaming had
+		// moved out of the profile the conventional directory was still walked, so stale
+		// files there could be reported as live configuration.
+		rewritten, usable := redirectAppSupport(relPath, appDataRoot, home)
+		if !usable {
+			continue
+		}
+		if rewritten != "" {
+			relPath = rewritten
 		}
 		absolute := filepath.Join(home, relPath)
 		out = append(out, absolute)
