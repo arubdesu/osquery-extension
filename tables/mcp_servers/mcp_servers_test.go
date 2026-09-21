@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/macadmins/osquery-extension/pkg/fsscan"
+	"github.com/macadmins/osquery-extension/pkg/utils"
 	"github.com/osquery/osquery-go/plugin/table"
 )
 
@@ -168,16 +169,13 @@ func TestMCPServersGenerateWiresConstraintsToDiscovery(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	original := fsscan.UsersRoot
-	fsscan.UsersRoot = root
-	t.Cleanup(func() { fsscan.UsersRoot = original })
 
 	declared := make(map[string]struct{})
 	for _, column := range MCPServersColumns() {
 		declared[column.Name] = struct{}{}
 	}
 
-	rows, err := MCPServersGenerate(context.Background(), table.QueryContext{})
+	rows, err := generate(context.Background(), table.QueryContext{}, rosterOf(t, root))
 	if err != nil {
 		t.Fatalf("unconstrained: %v", err)
 	}
@@ -201,13 +199,13 @@ func TestMCPServersGenerateWiresConstraintsToDiscovery(t *testing.T) {
 
 	// The narrowing path. This is the half that silently does nothing if the column is not
 	// indexed, so asserting the generator honours the constraint is the half worth having.
-	narrowed, err := MCPServersGenerate(context.Background(), table.QueryContext{
+	narrowed, err := generate(context.Background(), table.QueryContext{
 		Constraints: map[string]table.ConstraintList{
 			"user": {Constraints: []table.Constraint{
 				{Operator: table.OperatorEquals, Expression: "alice"},
 			}},
 		},
-	})
+	}, rosterOf(t, root))
 	if err != nil {
 		t.Fatalf("constrained: %v", err)
 	}
@@ -216,19 +214,20 @@ func TestMCPServersGenerateWiresConstraintsToDiscovery(t *testing.T) {
 	}
 }
 
-// A users root that does not exist is the ordinary case on a machine with no such directory,
-// and it must not fail the table. DiscoverAll turns it into one warning row instead.
-func TestMCPServersGenerateSurfacesUnreadableRootAsAWarningRow(t *testing.T) {
-	original := fsscan.UsersRoot
-	fsscan.UsersRoot = filepath.Join(t.TempDir(), "absent")
-	t.Cleanup(func() { fsscan.UsersRoot = original })
-
-	rows, err := MCPServersGenerate(context.Background(), table.QueryContext{})
+// An empty account roster is a failure, not an answer.
+//
+// This previously asserted the opposite: that zero users was "a real answer" producing no
+// rows and no error. It is not. No supported OS genuinely has no accounts, and a virtual
+// table can log an internal error -- an OpenDirectory failure, seen on osquery 5.23.1 --
+// while still returning an empty result set with no SQL error. Normalising that as a clean
+// result is the exact silent-empty failure this table exists to prevent.
+func TestGenerateWithAnEmptyRosterReportsItRatherThanReturningNothing(t *testing.T) {
+	rows, err := generate(context.Background(), table.QueryContext{}, rosterFrom())
 	if err != nil {
-		t.Fatalf("a missing root must not error the table: %v", err)
+		t.Fatalf("an unavailable roster must not error the table: %v", err)
 	}
 	if len(rows) != 1 || rows[0]["warning"] == "" {
-		t.Fatalf("want exactly one row carrying a warning, got %v", rows)
+		t.Fatalf("want one row carrying a warning about the roster, got %v", rows)
 	}
 }
 
@@ -278,9 +277,6 @@ func TestDiagnosticRowsSatisfyTheIdentityColumnContract(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "alice", "code"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	original := fsscan.UsersRoot
-	fsscan.UsersRoot = root
-	t.Cleanup(func() { fsscan.UsersRoot = original })
 
 	inspect := func(label string, rows []Server) {
 		t.Helper()
@@ -304,15 +300,15 @@ func TestDiagnosticRowsSatisfyTheIdentityColumnContract(t *testing.T) {
 
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	inspect("cancelled query", DiscoverAll(cancelled, nil))
+	inspect("cancelled query", DiscoverAll(cancelled, rosterOf(t, root), nil))
 
 	t.Setenv(fsscan.WalkTimeoutEnv, "1ns")
-	inspect("budget exhausted", DiscoverAll(context.Background(), nil))
+	inspect("budget exhausted", DiscoverAll(context.Background(), rosterOf(t, root), nil))
 	t.Setenv(fsscan.WalkTimeoutEnv, "")
 
-	fsscan.UsersRoot = filepath.Join(root, "absent")
-	inspect("users root unreadable", DiscoverAll(context.Background(), nil))
-	fsscan.UsersRoot = root
+	// The roster is a query now, so "unreadable" means osquery could not answer. A clienter
+	// that fails to connect is the honest stand-in for that.
+	inspect("osquery unreachable", DiscoverAll(context.Background(), failingClienter{}, nil))
 
 	inspect("parse failure", finishProcessing([]byte(`{not json`), nil,
 		"/p/mcp.json", "alice", "cursor", false, extractEnvelopeSimple))
@@ -325,23 +321,13 @@ func TestDiagnosticRowsSatisfyTheIdentityColumnContract(t *testing.T) {
 		"/p/mcp.json", "alice", "cursor", false, extractEnvelopeSimple))
 }
 
-// TestUserEnumerationFailureNamesEachRequestedUser pins the roster-unreadable path against the
-// same defect the per-account skipped-home rows already fixed: a single aggregate diagnostic
-// with an empty user is discarded by `WHERE user = '<name>'`, so a constrained query was handed
-// a clean empty result for the one failure that can say nothing about any account at all.
-func TestUserEnumerationFailureNamesEachRequestedUser(t *testing.T) {
-	// A regular file where the users root should be makes ReadDir fail with ENOTDIR, which
-	// is the enumeration failure without needing unreadable directories or a fake root.
-	notADirectory := filepath.Join(t.TempDir(), "users")
-	if err := os.WriteFile(notADirectory, []byte("not a directory"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	original := fsscan.UsersRoot
-	fsscan.UsersRoot = notADirectory
-	t.Cleanup(func() { fsscan.UsersRoot = original })
-
+// TestRosterFailureNamesEachRequestedUser pins the roster-unreachable path against the
+// defect the per-account rows already fixed: a single aggregate diagnostic with an empty
+// user is discarded by `WHERE user = '<name>'`, so a constrained query was handed a clean
+// empty result for the one failure that can say nothing about any account at all.
+func TestRosterFailureNamesEachRequestedUser(t *testing.T) {
 	t.Run("constrained query gets the diagnostic under each name it asked about", func(t *testing.T) {
-		rows := DiscoverAll(context.Background(), map[string]struct{}{
+		rows := DiscoverAll(context.Background(), failingClienter{}, map[string]struct{}{
 			"erin": {}, "carol": {}, "alice": {}, "dave": {}, "bob": {},
 		})
 		var users []string
@@ -349,26 +335,22 @@ func TestUserEnumerationFailureNamesEachRequestedUser(t *testing.T) {
 			if row.Warning == "" {
 				t.Errorf("every row on this path must carry a warning; got %+v", row)
 			}
-			if !strings.Contains(row.Warning, "list users") {
-				t.Errorf("warning should name the enumeration failure, got %q", row.Warning)
-			}
 			users = append(users, row.User)
 		}
-		// Asserted before sorting: these rows go straight to osquery, and map iteration
-		// order is randomised per range, so emitting them unsorted makes the same query
-		// return the same rows in a different order each run.
+		// Asserted before sorting: these rows go straight to osquery, so a nondeterministic
+		// order makes the same query return the same rows differently each run.
 		if !sort.StringsAreSorted(users) {
 			t.Errorf("rows are not in a deterministic order: %q", users)
 		}
 		sort.Strings(users)
 		if !reflect.DeepEqual(users, []string{"alice", "bob", "carol", "dave", "erin"}) {
-			t.Errorf("users = %q, want all five requested; an empty user here is invisible to the "+
-				"constraint that asked the question", users)
+			t.Errorf("users = %q, want all five requested; an empty user here is invisible "+
+				"to the constraint that asked the question", users)
 		}
 	})
 
 	t.Run("unconstrained query keeps one aggregate row", func(t *testing.T) {
-		rows := DiscoverAll(context.Background(), nil)
+		rows := DiscoverAll(context.Background(), failingClienter{}, nil)
 		if len(rows) != 1 {
 			t.Fatalf("want exactly one aggregate row, got %d: %+v", len(rows), rows)
 		}
@@ -376,8 +358,50 @@ func TestUserEnumerationFailureNamesEachRequestedUser(t *testing.T) {
 			t.Errorf("aggregate row user = %q, want empty: no account was confirmed or "+
 				"ruled out, so naming one would be a claim we cannot make", rows[0].User)
 		}
-		if !strings.Contains(rows[0].Warning, "list users") {
-			t.Errorf("warning = %q, should name the enumeration failure", rows[0].Warning)
-		}
 	})
+}
+
+// failingClienter stands in for an osquery that cannot be reached.
+type failingClienter struct{}
+
+func (failingClienter) NewOsqueryClient() (utils.OsqueryClient, error) {
+	return nil, errors.New("dial: connection refused")
+}
+
+func TestEnvKeysColumnIsStableAcrossRepeatedParses(t *testing.T) {
+	// Enough keys that an unsorted order is overwhelmingly unlikely to repeat by chance:
+	// with 8 keys there are 40320 orderings.
+	config := []byte(`{"mcpServers":{"s":{"command":"npx","env":{
+		"ZULU":"1","ALPHA":"2","MIKE":"3","BRAVO":"4",
+		"YANKEE":"5","CHARLIE":"6","XRAY":"7","DELTA":"8"}}}}`)
+
+	var first string
+	for attempt := 0; attempt < 20; attempt++ {
+		servers, err := extractEnvelopeSimple(config)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if len(servers) != 1 {
+			t.Fatalf("got %d servers, want 1", len(servers))
+		}
+		row := serverToRow(servers[0])
+		var keys []string
+		if err := json.Unmarshal([]byte(row["env_keys"]), &keys); err != nil {
+			t.Fatalf("env_keys is not valid JSON: %v (%q)", err, row["env_keys"])
+		}
+		if len(keys) != 8 {
+			t.Fatalf("got %d keys, want 8: %v", len(keys), keys)
+		}
+		if !sort.StringsAreSorted(keys) {
+			t.Fatalf("env_keys is not sorted: %v", keys)
+		}
+		if attempt == 0 {
+			first = row["env_keys"]
+			continue
+		}
+		if row["env_keys"] != first {
+			t.Fatalf("env_keys differs between parses of an identical config:\n  %s\n  %s",
+				first, row["env_keys"])
+		}
+	}
 }

@@ -25,9 +25,9 @@ type classification struct {
 //   - `.mcp.json` under .claude/ is per-user; at a repo root it's project-local
 func classifyPath(absPath string) classification {
 	// Comparisons below are against slash-separated literals, so the path is normalised once
-	// rather than each site guessing. The literals describe macOS locations and the table is
-	// registered on macOS only, but the package compiles and its tests run elsewhere, and a
-	// match that silently never fires is worse than one that cannot fire.
+	// rather than each site guessing. Application-support locations come from appSupport*,
+	// which resolves per OS, so these cases fire on every platform the table is registered
+	// on rather than only where the macOS spelling happens to match.
 	slashed := filepath.ToSlash(absPath)
 	base := filepath.Base(absPath)
 	parent := filepath.Base(filepath.Dir(absPath))
@@ -35,7 +35,7 @@ func classifyPath(absPath string) classification {
 
 	// Most specific cases first.
 	switch {
-	case strings.Contains(slashed, "/Library/Application Support/Claude/") &&
+	case strings.Contains(slashed, appSupportMatch()+"Claude/") &&
 		base == "claude_desktop_config.json":
 		return classification{"claude_desktop", true, extractEnvelopeSimple, true}
 
@@ -47,7 +47,7 @@ func classifyPath(absPath string) classification {
 		// Copilot's portable config. Hyphenated, unlike every other name here.
 		return classification{"copilot", true, extractEnvelopeSimple, true}
 
-	case base == "mcp.json" && strings.Contains(slashed, "/Library/Application Support/"):
+	case base == "mcp.json" && isAppSupportPath(slashed):
 		// VS Code family, user scope or a per-profile directory under .../User/profiles/<id>/.
 		return classification{vscodeForkFromPath(absPath), true, extractEnvelopeSimple, true}
 
@@ -127,14 +127,14 @@ func isCodexTOMLPath(absPath string) bool {
 	return base == "config.toml" || strings.HasSuffix(base, ".config.toml")
 }
 
-// vscodeForkFromPath names the fork owning a path under Library/Application Support, so a
+// vscodeForkFromPath names the fork owning a path under the application-support root, so a
 // profile-scoped mcp.json is attributed to the editor that wrote it rather than to "unknown".
 func vscodeForkFromPath(absPath string) string {
 	slashed := filepath.ToSlash(absPath)
 	switch {
-	case strings.Contains(slashed, "/Application Support/Cursor/"):
+	case strings.Contains(slashed, appSupportMatch()+"Cursor/"):
 		return "cursor"
-	case strings.Contains(slashed, "/Application Support/Windsurf/"):
+	case strings.Contains(slashed, appSupportMatch()+"Windsurf/"):
 		return "windsurf"
 	default:
 		return "vscode"

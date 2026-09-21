@@ -7,10 +7,12 @@ import (
 	"runtime/debug"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/osquery/osquery-go/plugin/table"
 
 	"github.com/macadmins/osquery-extension/pkg/redact"
+	"github.com/macadmins/osquery-extension/pkg/utils"
 )
 
 // MCPServersColumns defines the schema for the mcp_servers virtual table.
@@ -48,6 +50,7 @@ import (
 func MCPServersColumns() []table.ColumnDefinition {
 	return []table.ColumnDefinition{
 		table.TextColumn("user"),
+		table.TextColumn("user_id"),
 		table.TextColumn("source_path"),
 		table.TextColumn("source_context"),
 		table.TextColumn("client"),
@@ -72,7 +75,21 @@ func MCPServersColumns() []table.ColumnDefinition {
 
 // MCPServersGenerate is the table plugin callback. Panic-safe, any internal
 // bug yields an error to the operator without taking down the extension process.
-func MCPServersGenerate(ctx context.Context, queryContext table.QueryContext) (rows []map[string]string, err error) {
+// KNOWN GAP: no test in this repository executes SQL
+// against a registered table, for this table or any other. The tests below call generate
+// directly with a hand-built QueryContext, which proves the generator honours a constraint
+// it is handed but says nothing about whether osquery hands it one. The row counts quoted
+// in the pull request come from running osqueryi by hand, so nothing fails in CI if they
+// stop being true.
+func MCPServersGenerate(ctx context.Context, queryContext table.QueryContext, socketPath string) ([]map[string]string, error) {
+	return generate(ctx, queryContext,
+		&utils.SocketOsqueryClienter{SocketPath: socketPath, Timeout: 10 * time.Second})
+}
+
+// generate is MCPServersGenerate with the osquery client injected, so tests drive it through
+// utils.MockOsqueryClienter instead of needing a live socket. This is the shape sofa,
+// wifi_network and alt_system_info already use.
+func generate(ctx context.Context, queryContext table.QueryContext, clienter utils.OsqueryClienter) (rows []map[string]string, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			rows = nil
@@ -83,7 +100,7 @@ func MCPServersGenerate(ctx context.Context, queryContext table.QueryContext) (r
 	userFilter := userConstraint(queryContext)
 	// ctx is osquery's, so a cancelled or abandoned query stops the walk rather than running
 	// it out against the watchdog.
-	servers := DiscoverAll(ctx, userFilter)
+	servers := DiscoverAll(ctx, clienter, userFilter)
 
 	rows = make([]map[string]string, 0, len(servers))
 	for _, s := range servers {
@@ -120,6 +137,7 @@ func userConstraint(qc table.QueryContext) map[string]struct{} {
 func serverToRow(s Server) map[string]string {
 	return map[string]string{
 		"user":           s.User,
+		"user_id":        s.UserID,
 		"source_path":    redact.Path(s.SourcePath),
 		"source_context": redact.String(s.SourceContext),
 		"client":         s.Client,

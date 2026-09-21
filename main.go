@@ -84,6 +84,18 @@ func main() {
 	// If there were windows only tables, they would go here
 	// }
 
+	// mcp_servers is not darwin-only: pkg/fsscan refuses symlinks on POSIX with iterated
+	// openat and O_NOFOLLOW, and the per-user config locations resolve per OS. Platforms
+	// without that backend report unsupported rather than degrading, so the table is
+	// registered where it can answer safely and left unregistered where it cannot.
+	if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
+		plugins = append(plugins, table.NewPlugin(
+			"mcp_servers", mcpservers.MCPServersColumns(),
+			func(ctx context.Context, queryContext table.QueryContext) ([]map[string]string, error) {
+				return mcpservers.MCPServersGenerate(ctx, queryContext, *flSocketPath)
+			}))
+	}
+
 	if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
 		linuxPlugins := []osquery.OsqueryPlugin{
 			table.NewPlugin(
@@ -110,7 +122,6 @@ func main() {
 			table.NewPlugin("privileges_events", privileges.PrivilegesEventsColumns(), privileges.PrivilegesEventsGenerate),
 			table.NewPlugin("macadmins_unified_log", unifiedlog.UnifiedLogColumns(), unifiedlog.UnifiedLogGenerate),
 			table.NewPlugin("macos_rsr", macosrsr.MacOSRsrColumns(), macosrsr.MacOSRsrGenerate),
-			table.NewPlugin("mcp_servers", mcpservers.MCPServersColumns(), mcpservers.MCPServersGenerate),
 			table.NewPlugin("sofa_security_release_info", sofa.SofaSecurityReleaseInfoColumns(), func(ctx context.Context, queryContext table.QueryContext) ([]map[string]string, error) {
 				return sofa.SofaSecurityReleaseInfoGenerate(ctx, queryContext, *flSocketPath, sofaOpts...)
 			}),

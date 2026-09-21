@@ -95,13 +95,10 @@ func TestDiscoverAllReportsSkippedHomesPerAccount(t *testing.T) {
 	if err := os.Symlink(filepath.Join(root, "bob"), filepath.Join(root, "alice")); err != nil {
 		t.Fatal(err)
 	}
-	original := fsscan.UsersRoot
-	fsscan.UsersRoot = root
-	t.Cleanup(func() { fsscan.UsersRoot = original })
 
 	// Unfiltered: the skipped account is named.
 	var found bool
-	for _, row := range DiscoverAll(context.Background(), nil) {
+	for _, row := range DiscoverAll(context.Background(), rosterOf(t, root), nil) {
 		if row.User == "alice" && row.Warning != "" {
 			found = true
 		}
@@ -112,7 +109,7 @@ func TestDiscoverAllReportsSkippedHomesPerAccount(t *testing.T) {
 
 	// Filtered to exactly the skipped account: the diagnostic must still arrive, since this is
 	// the query that would otherwise return nothing at all.
-	rows := DiscoverAll(context.Background(), map[string]struct{}{"alice": {}})
+	rows := DiscoverAll(context.Background(), rosterOf(t, root), map[string]struct{}{"alice": {}})
 	if len(rows) != 1 || rows[0].User != "alice" || rows[0].Warning == "" {
 		t.Errorf("a query for the skipped account must still explain itself: %+v", rows)
 	}
@@ -121,7 +118,7 @@ func TestDiscoverAllReportsSkippedHomesPerAccount(t *testing.T) {
 	}
 
 	// Filtered to the other account: no unrelated diagnostic.
-	for _, row := range DiscoverAll(context.Background(), map[string]struct{}{"bob": {}}) {
+	for _, row := range DiscoverAll(context.Background(), rosterOf(t, root), map[string]struct{}{"bob": {}}) {
 		if row.User == "alice" {
 			t.Errorf("a query for bob should not carry alice's diagnostic: %+v", row)
 		}

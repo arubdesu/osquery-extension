@@ -15,7 +15,7 @@ import (
 // discoverForTest supplies the context and the walk budget that DiscoverAll threads through in
 // production, so the per-home tests below can keep naming just the user and the home.
 func discoverForTest(user, home string) []Server {
-	return discoverForHome(context.Background(), user, home, fsscan.WalkTimeout())
+	return discoverForHome(context.Background(), fsscan.UserHome{Name: user, Path: home}, fsscan.WalkTimeout())
 }
 
 // buildFakeHome materializes a minimal user home with the given files.
@@ -263,15 +263,12 @@ func TestDiscoverAll_UserFilter(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	orig := fsscan.UsersRoot
-	fsscan.UsersRoot = root
-	t.Cleanup(func() { fsscan.UsersRoot = orig })
 
-	all := DiscoverAll(context.Background(), nil)
+	all := DiscoverAll(context.Background(), rosterOf(t, root), nil)
 	if len(all) != 2 {
 		t.Errorf("no filter: got %d rows, want 2: %v", len(all), all)
 	}
-	just := DiscoverAll(context.Background(), map[string]struct{}{"alice": {}})
+	just := DiscoverAll(context.Background(), rosterOf(t, root), map[string]struct{}{"alice": {}})
 	if len(just) != 1 || just[0].User != "alice" {
 		t.Errorf("filter alice: got %#v", just)
 	}
@@ -303,14 +300,11 @@ func TestDiscoverAllSharesOneWalkBudgetAcrossHomes(t *testing.T) {
 			}
 		}
 	}
-	original := fsscan.UsersRoot
-	fsscan.UsersRoot = root
-	t.Cleanup(func() { fsscan.UsersRoot = original })
 	t.Setenv(fsscan.WalkTimeoutEnv, "20ms")
 
 	measure := func(filter map[string]struct{}) (time.Duration, bool) {
 		start := time.Now()
-		rows := DiscoverAll(context.Background(), filter)
+		rows := DiscoverAll(context.Background(), rosterOf(t, root), filter)
 		elapsed := time.Since(start)
 		for _, row := range rows {
 			if row.Warning != "" {
@@ -349,13 +343,10 @@ func TestDiscoverAllReportsUsersTheBudgetNeverReached(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	original := fsscan.UsersRoot
-	fsscan.UsersRoot = root
-	t.Cleanup(func() { fsscan.UsersRoot = original })
 	t.Setenv(fsscan.WalkTimeoutEnv, "1ns")
 
 	reported := make(map[string]string, homes)
-	for _, row := range DiscoverAll(context.Background(), nil) {
+	for _, row := range DiscoverAll(context.Background(), rosterOf(t, root), nil) {
 		if row.Warning == "" {
 			t.Errorf("user %q: an unscanned user must carry a warning", row.User)
 		}
@@ -381,16 +372,13 @@ func TestDiscoverAllHonoursCallerCancellation(t *testing.T) {
 		[]byte(`{"mcpServers":{"s":{"command":"npx","args":["x"]}}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	original := fsscan.UsersRoot
-	fsscan.UsersRoot = root
-	t.Cleanup(func() { fsscan.UsersRoot = original })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	// Pass 1 now checks ctx before each direct read and Pass 2 is skipped entirely, so the
 	// assertion is about how the stop is reported: a cancelled query must not be described as
 	// a timeout, which is a budget outcome and means something different to an operator.
-	for _, row := range DiscoverAll(ctx, nil) {
+	for _, row := range DiscoverAll(ctx, rosterOf(t, root), nil) {
 		if strings.Contains(row.Warning, "timeout") {
 			t.Errorf("cancellation was reported as a timeout: %q", row.Warning)
 		}
@@ -524,7 +512,7 @@ func TestDiscoverForHomeReportsAnExhaustedBudget(t *testing.T) {
 		// is the point: both routes must report.
 		{"expires during pass 1", 1 * time.Nanosecond},
 	} {
-		rows := discoverForHome(context.Background(), "alice", home, testCase.budget)
+		rows := discoverForHome(context.Background(), fsscan.UserHome{Name: "alice", Path: home}, testCase.budget)
 		var diagnostics int
 		for _, row := range rows {
 			if row.Warning == "" {

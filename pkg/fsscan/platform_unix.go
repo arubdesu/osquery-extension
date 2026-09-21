@@ -7,14 +7,16 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
 // rootKeyOf identifies a directory by device and inode, so two paths naming the same
-// directory dedup to one walk root.
-func rootKeyOf(info os.FileInfo) (rootKey, bool) {
+// directory dedup to one walk root. The path is unused here: a POSIX stat already carries
+// the identity. Windows has to reopen by path to get it, which is why it is in the signature.
+func rootKeyOf(_ string, info os.FileInfo) (rootKey, bool) {
 	sys, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return rootKey{}, false
@@ -75,4 +77,18 @@ func isRefusedOrNotDirectory(err error) bool {
 		return errors.Is(pathErr.Err, syscall.ELOOP) || errors.Is(pathErr.Err, syscall.ENOTDIR)
 	}
 	return false
+}
+
+// ownerID returns the numeric uid owning a directory, as the stable identity for an account
+// enumerated from the filesystem rather than from an account database.
+//
+// On macOS the roster is /Users, so the account's identity is whatever owns its home. That
+// is the same number osquery's own users table reports in uid, which is the join this column
+// exists to make possible.
+func ownerID(info os.FileInfo) string {
+	sys, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return ""
+	}
+	return strconv.FormatUint(uint64(sys.Uid), 10)
 }

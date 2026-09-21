@@ -4,13 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/macadmins/osquery-extension/pkg/fsscan"
+	"github.com/macadmins/osquery-extension/pkg/redact"
+	"github.com/macadmins/osquery-extension/pkg/utils"
 )
 
 // MaxFileSize is the upper bound we'll read from any candidate JSON file. Anything
@@ -19,7 +24,16 @@ const MaxFileSize = 1 << 20 // 1 MiB
 
 // Server is the normalized record emitted by the discovery pipeline.
 type Server struct {
-	User           string
+	User string
+	// UserID is the identity the operating system records for the account, as opposed to
+	// the label a person sees: the SID on Windows, the uid on POSIX.
+	//
+	// Carried because `user` is not a join key on Windows. A local `alice` and a domain
+	// `alice` produce the same string, so a query correlating this table against osquery's
+	// users table on name alone can match the wrong account. It is empty where the roster
+	// could not supply one, which is itself information: it means the account could not be
+	// identified, not that it has no identity.
+	UserID         string
 	SourcePath     string
 	SourceContext  string // e.g., "mcpServers", "projects[/abs/path].mcpServers"
 	Client         string
@@ -76,9 +90,27 @@ type directSource struct {
 //   - The walker doesn't reach the location (e.g., paths under ~/Library are
 //     intentionally pruned during walks, too noisy and slow, but cline
 //     stores its config there, so we list those explicitly)
-var knownDirectSources = []directSource{
+var knownDirectSources = buildDirectSources()
+
+// buildDirectSources concatenates the hand-written sources with the generated VS Code family
+// ones.
+//
+// Written as an explicit copy rather than append(handWrittenDirectSources, generated...).
+// That form is correct only because a composite literal has len == cap so append must
+// reallocate; if anyone ever gave handWrittenDirectSources spare capacity, the append would
+// write into its backing array and the two package variables would alias. Not a bug today
+// and not worth leaving as one to discover later.
+func buildDirectSources() []directSource {
+	generated := vscodeFamilySources()
+	out := make([]directSource, 0, len(handWrittenDirectSources)+len(generated))
+	out = append(out, handWrittenDirectSources...)
+	out = append(out, generated...)
+	return out
+}
+
+var handWrittenDirectSources = []directSource{
 	{
-		relPath: "Library/Application Support/Claude/claude_desktop_config.json",
+		relPath: appSupport("Claude", "claude_desktop_config.json"),
 		client:  "claude_desktop",
 		jsonc:   true,
 		extract: extractEnvelopeSimple,
@@ -107,42 +139,11 @@ var knownDirectSources = []directSource{
 		jsonc:   true,
 		extract: extractGeminiSettings,
 	},
-	// Cline extension storage across major VS Code forks. Library is pruned by
-	// the walker, so these need explicit entries.
-	{
-		relPath: "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
-		client:  "cline",
-		jsonc:   true,
-		extract: extractEnvelopeSimple,
-	},
-	{
-		relPath: "Library/Application Support/Cursor/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
-		client:  "cline",
-		jsonc:   true,
-		extract: extractEnvelopeSimple,
-	},
-	{
-		relPath: "Library/Application Support/Windsurf/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
-		client:  "cline",
-		jsonc:   true,
-		extract: extractEnvelopeSimple,
-	},
-	{
-		relPath: "Library/Application Support/VSCodium/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
-		client:  "cline",
-		jsonc:   true,
-		extract: extractEnvelopeSimple,
-	},
 	// VS Code's own user-scope MCP config, one per fork. Documented by Microsoft as the
 	// user-profile counterpart to a workspace's .vscode/mcp.json, reached in the UI through
 	// "MCP: Open User Configuration". It uses `servers` rather than `mcpServers`, which
 	// extractEnvelope already accepts. Library is pruned by the walker, so these need to be
 	// named explicitly the same way Cline's storage is.
-	{relPath: "Library/Application Support/Code/User/mcp.json", client: "vscode", jsonc: true, extract: extractEnvelopeSimple},
-	{relPath: "Library/Application Support/Code - Insiders/User/mcp.json", client: "vscode", jsonc: true, extract: extractEnvelopeSimple},
-	{relPath: "Library/Application Support/Cursor/User/mcp.json", client: "cursor", jsonc: true, extract: extractEnvelopeSimple},
-	{relPath: "Library/Application Support/Windsurf/User/mcp.json", client: "windsurf", jsonc: true, extract: extractEnvelopeSimple},
-	{relPath: "Library/Application Support/VSCodium/User/mcp.json", client: "vscode", jsonc: true, extract: extractEnvelopeSimple},
 	// Copilot's portable config, which Microsoft documents as shared across the Agent Host
 	// and other Copilot tools. Note the hyphen: mcp-config.json was not in walkableBasenames
 	// either, so before this the file could not be found by any pathway.
@@ -167,11 +168,30 @@ var knownDirectSources = []directSource{
 // for cancellation only: the budget is passed to each scan as a duration, because fsscan
 // classifies a deadline it set itself as a truncation and a deadline on the caller's context as
 // a cancellation, and exhausting our own budget is the former.
-func DiscoverAll(ctx context.Context, userFilter map[string]struct{}) []Server {
+func DiscoverAll(ctx context.Context, clienter utils.OsqueryClienter, userFilter map[string]struct{}) []Server {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	enumerated, err := fsscan.ListUserHomes(fsscan.UsersRoot)
+	// The account roster comes from osquery. There is no filesystem fallback: the socket is
+	// how this extension returns rows at all, so if it cannot be reached osquery is not
+	// receiving results either, and a guessed roster would only make that quieter.
+	client, err := clienter.NewOsqueryClient()
+	if err != nil {
+		return rosterDiagnostic(userFilter, fsscan.UsersRoot,
+			"could not reach osquery to list user accounts: "+err.Error())
+	}
+	// KNOWN GAP: this Close is correct and currently
+	// does nothing. The pinned osquery-go revision opens a transport in NewClient and never
+	// assigns it to the struct, so Close finds a nil transport and returns. The socket is
+	// left to the garbage collector, and this table opens one per query. Written anyway
+	// because the call site is right and only the dependency is wrong; fixing it is an
+	// osquery-go bump, which is a repository-wide change.
+	defer client.Close()
+	// Established before the roster is read, not after. The roster is now a query back to
+	// osquery rather than a filesystem walk, so it is fast, but it is still work the budget
+	// should cover: a deadline created afterwards excludes whatever the roster cost.
+	deadline := time.Now().Add(fsscan.WalkTimeout())
+	enumerated, err := fsscan.ListUserHomes(client)
 	if err != nil {
 		// The roster itself is unreadable, so no account can be confirmed or ruled out.
 		//
@@ -184,39 +204,66 @@ func DiscoverAll(ctx context.Context, userFilter map[string]struct{}) []Server {
 		// An unconstrained query keeps the single aggregate row: there is no roster to
 		// enumerate names from, so inventing them is not an option, and an empty user is
 		// the honest answer to "which accounts" when that is precisely what failed.
-		warning := "list users: " + err.Error()
-		if userFilter == nil {
-			return []Server{diagnosticRow("", fsscan.UsersRoot, "", warning)}
-		}
-		requested := make([]string, 0, len(userFilter))
-		for name := range userFilter {
-			requested = append(requested, name)
-		}
-		// Map iteration order is random and these rows go straight to osquery.
-		sort.Strings(requested)
-		rows := make([]Server, 0, len(requested))
-		for _, name := range requested {
-			rows = append(rows, diagnosticRow(name, filepath.Join(fsscan.UsersRoot, name), "",
-				warning))
-		}
-		return rows
+		return rosterDiagnostic(userFilter, fsscan.UsersRoot, "list users: "+err.Error())
 	}
-	deadline := time.Now().Add(fsscan.WalkTimeout())
 	var out []Server
-	// One row per skipped account, carrying that account's name.
+	// The roster itself came back short, so there is no list of who is missing -- which is
+	// exactly why this cannot be a single empty-user row. SQLite applies `WHERE user =
+	// 'alice'` to whatever the generator returns, so an empty-user warning is discarded by
+	// the one query most likely to be asked, and Alice being past the profile cap or served
+	// only by LDAP produces the clean empty result the warning exists to prevent.
+	if enumerated.Truncated != "" {
+		out = append(out, rosterDiagnostic(userFilter, fsscan.UsersRoot, enumerated.Truncated)...)
+	}
+	scanned := make(map[string][]Server, len(enumerated.Homes))
+	// One row per skipped account, carrying that account's own name, identity and the path
+	// the roster claimed for it.
 	//
 	// An aggregate row with an empty user was filtered out by `WHERE user = '<name>'`, so if
 	// the account asked about was the skipped one the caller saw a clean empty result. The
 	// userFilter is applied here too, so a narrowed query still gets the diagnostic that
 	// concerns it and not the others.
-	for _, name := range enumerated.Skipped {
+	//
+	// The path comes from the omission rather than being synthesised as <UsersRoot>/<name>.
+	// A Windows profile can live on another volume or a redirected path, and reporting a
+	// constructed path that does not exist sent an administrator looking in the wrong place.
+	unusableHomes := 0
+	for _, omission := range enumerated.Skipped {
+		// An account whose home does not exist is worth a row only when someone asked
+		// about it. Unconstrained, these are mostly service accounts that never had a home
+		// created, and one row each buries the omissions that matter; they are counted and
+		// reported together below instead.
+		if omission.HomeUnusable && userFilter == nil {
+			unusableHomes++
+			continue
+		}
+		path := omission.Path
+		if path == "" {
+			path = fsscan.UsersRoot
+		}
+		// An omission with no resolvable name cannot be matched against a requested user,
+		// and emitting it under an empty user hands a constrained query a row SQLite then
+		// discards. It is not nothing, though: it means the roster cannot say whether the
+		// account being asked about was covered, so it is reported as roster-level
+		// uncertainty under each name the query named.
+		if omission.Name == "" {
+			out = append(out, rosterDiagnostic(userFilter, path, omission.Warning())...)
+			continue
+		}
 		if userFilter != nil {
-			if _, ok := userFilter[name]; !ok {
+			if _, ok := userFilter[omission.Name]; !ok {
 				continue
 			}
 		}
-		out = append(out, diagnosticRow(name, filepath.Join(fsscan.UsersRoot, name), "",
-			enumerated.Warning(name)))
+		row := diagnosticRow(omission.Name, path, "", omission.Warning())
+		row.UserID = omission.ID
+		out = append(out, row)
+	}
+	if unusableHomes > 0 {
+		out = append(out, diagnosticRow("", fsscan.UsersRoot, "", fmt.Sprintf(
+			"%d account(s) have no usable home directory -- none declared, missing, or not "+
+				"a directory -- and were not inspected; query a specific user to see which",
+			unusableHomes)))
 	}
 	for _, h := range enumerated.Homes {
 		if userFilter != nil {
@@ -227,8 +274,8 @@ func DiscoverAll(ctx context.Context, userFilter map[string]struct{}) []Server {
 		// Checked per home, before Pass 1 runs. Direct-path reads take no context, so without
 		// this a cancelled query still performed ten opens per home for every home on the box.
 		if ctx.Err() != nil {
-			out = append(out, diagnosticRow(h.Name, h.Path, "",
-				"scan truncated: query cancelled before this user was scanned"))
+			out = append(out, stampUserID([]Server{diagnosticRow(h.Name, h.Path, "",
+				"scan truncated: query cancelled before this user was scanned")}, h.ID)...)
 			continue
 		}
 		remaining := time.Until(deadline)
@@ -236,11 +283,22 @@ func DiscoverAll(ctx context.Context, userFilter map[string]struct{}) []Server {
 			// Say so per user rather than stopping quietly. A user who was never scanned
 			// and a user with no MCP configuration are otherwise the same empty answer,
 			// which is the confusion the truncation contract exists to prevent.
-			out = append(out, diagnosticRow(h.Name, h.Path, "",
-				"scan truncated: walk budget exhausted before this user was scanned"))
+			out = append(out, stampUserID([]Server{diagnosticRow(h.Name, h.Path, "",
+				"scan truncated: walk budget exhausted before this user was scanned")}, h.ID)...)
 			continue
 		}
-		out = append(out, discoverForHome(ctx, h.Name, h.Path, remaining)...)
+		// Scanned once per directory, reported once per account. Accounts legitimately
+		// share a home, and the roster now keeps every one of them so a constrained query
+		// cannot lose an account another had claimed -- which means the duplicate work has
+		// to be avoided here instead, after the filter, rather than by discarding accounts
+		// before it.
+		key := scanKey(h)
+		rows, cached := scanned[key]
+		if !cached {
+			rows = discoverForHome(ctx, h, remaining)
+			scanned[key] = rows
+		}
+		out = append(out, stampUserID(copyRowsFor(rows, h.Name), h.ID)...)
 	}
 	return out
 }
@@ -255,11 +313,106 @@ func DiscoverAll(ctx context.Context, userFilter map[string]struct{}) []Server {
 //
 // Dedup is by absolute source path, so a file findable by both passes is
 // emitted once.
-func discoverForHome(ctx context.Context, user, home string, budget time.Duration) []Server {
+// stampUserID attaches the account's stable identity to every row discovered for it,
+// including the diagnostic rows, so a correlation query does not lose the identity precisely
+// on the rows describing what went wrong.
+func stampUserID(rows []Server, id string) []Server {
+	if id == "" {
+		return rows
+	}
+	for i := range rows {
+		rows[i].UserID = id
+	}
+	return rows
+}
+
+// scanKey names everything discovery depends on, so a cached result is only reused where it
+// would genuinely have been identical.
+//
+// The home path alone is wrong on Windows. discoverForHome resolves Roaming AppData from the
+// registry hive named by the account's SID, so two accounts reporting the same profile path
+// can have different roaming roots, different warnings and different rows. Keyed on path
+// alone, the first account scanned decided the answer for the rest and copyRowsFor merely
+// relabelled it -- attributing one account's redirected AppData, or its "could not be
+// determined" warning, to another.
+//
+// Elsewhere discovery is a pure function of the directory, so the path is the whole key and
+// a shared home is scanned once.
+func scanKey(account fsscan.UserHome) string {
+	return scanKeyFor(runtime.GOOS, account)
+}
+
+// scanKeyFor takes the OS as a parameter so both branches are reachable from a test on any
+// host. The Windows branch is the one that matters and the one no test here can otherwise
+// execute, which is exactly how it went wrong in the first place.
+func scanKeyFor(goos string, account fsscan.UserHome) string {
+	if goos == "windows" {
+		return account.ID + "\x00" + account.Path
+	}
+	return account.Path
+}
+
+// copyRowsFor re-stamps a cached scan for another account sharing the same home.
+//
+// Copied rather than returned directly: the cached slice is reused for every account naming
+// that directory, and stamping the user onto the shared backing array would rewrite the
+// rows already emitted for the previous one.
+func copyRowsFor(rows []Server, user string) []Server {
+	out := make([]Server, len(rows))
+	copy(out, rows)
+	for i := range out {
+		out[i].User = user
+	}
+	return out
+}
+
+// rosterDiagnostic renders a finding that cannot be attributed to one named account.
+//
+// An unconstrained query gets a single row with an empty user, which is the honest answer.
+// A constrained one gets the same warning repeated under every name it asked about, because
+// osquery applies the WHERE clause to the rows this generator returns: an empty-user row is
+// filtered out after the fact, so the query that asks about exactly the account the roster
+// could not vouch for is the one guaranteed not to hear about it.
+func rosterDiagnostic(userFilter map[string]struct{}, path, warning string) []Server {
+	if userFilter == nil {
+		return []Server{diagnosticRow("", path, "", warning)}
+	}
+	requested := make([]string, 0, len(userFilter))
+	for name := range userFilter {
+		requested = append(requested, name)
+	}
+	// Map iteration order is random and these rows go straight to osquery.
+	sort.Strings(requested)
+	rows := make([]Server, 0, len(requested))
+	for _, name := range requested {
+		rows = append(rows, diagnosticRow(name, path, "", warning))
+	}
+	return rows
+}
+
+func discoverForHome(ctx context.Context, account fsscan.UserHome, budget time.Duration) []Server {
+	user, home := account.Name, account.Path
+
+	// One row when the home itself cannot be opened, rather than one per candidate inside
+	// it. Every direct source under an unreadable home fails identically, so without this
+	// an ordinary unprivileged run produced sixteen rows all saying "permission denied" on
+	// the same directory, plus a truncation summary -- seventeen ways of being told one
+	// thing. The information an operator needs is that this account was not inspected.
+	if handle, err := os.Open(home); err != nil {
+		return []Server{diagnosticRow(user, home, "",
+			"this account's home directory could not be opened ("+redact.ErrorText(err.Error())+
+				"), so none of its configuration is listed")}
+	} else {
+		_ = handle.Close()
+	}
+
+	// Before the deadline, deliberately: resolving this reads a registry hive, which is
+	// work the budget must cover rather than work that happens outside it.
+	deadline := time.Now().Add(budget)
+
 	// The absolute form of the remaining allowance, so the direct pass and the walk draw on
 	// one deadline instead of the walk receiving a duration computed before the direct reads
 	// had run.
-	deadline := time.Now().Add(budget)
 	var out []Server
 	stoppedEarly := false
 	seen := make(map[string]struct{})
@@ -279,11 +432,22 @@ func discoverForHome(ctx context.Context, user, home string, budget time.Duratio
 			stoppedEarly = true
 			break
 		}
-		path := filepath.Join(home, src.relPath)
+		// snap keeps its configuration behind a `current` symlink, which the traversal
+		// refuses. Resolved to the revision directory here so the read has a real path to
+		// walk; a source that does not resolve is simply not installed for this user.
+		relPath, resolvable := resolveSnapPath(home, src.relPath)
+		if !resolvable {
+			continue
+		}
+		path := filepath.Join(home, relPath)
 		if _, dup := seen[path]; dup {
 			continue
 		}
-		rows := processOneBeneath(home, src.relPath, path, user, src.client, src.jsonc, src.extract)
+		// The *resolved* path, not src.relPath. Passing the original meant the read walked
+		// back through snap's `current` symlink, was refused, and had the refusal read as
+		// expected absence -- so the resolution above changed only the dedup key and the
+		// reported source_path while the file itself stayed undiscoverable.
+		rows := processOneBeneath(home, relPath, path, user, src.client, src.jsonc, src.extract)
 		if rows == nil {
 			continue
 		}
@@ -306,7 +470,7 @@ func discoverForHome(ctx context.Context, user, home string, budget time.Duratio
 	}
 
 	// Pass 2: walker over high-signal dev dirs
-	walkRoots := buildWalkRoots(home)
+	walkRoots, profileClients := buildWalkRoots(home)
 	if len(walkRoots) > 0 {
 		// ScanContext rather than Scan, because Scan discards the truncation flag along with
 		// the error, and a walk that quietly returns fewer rows is indistinguishable from a
@@ -364,6 +528,12 @@ func discoverForHome(ctx context.Context, user, home string, budget time.Duratio
 				continue
 			}
 			c := classifyPath(path)
+			// A profile root knows its own client; path-based classification does not,
+			// once the root has been redirected out from under the conventional spelling.
+			if owner, ok := clientForProfileRoot(path, profileClients); ok &&
+				filepath.Base(path) == "mcp.json" {
+				c = classification{owner, true, extractEnvelopeSimple, true}
+			}
 			if !c.supported {
 				continue
 			}
@@ -426,29 +596,57 @@ var clientConfigSubdirs = []string{".claude", ".codex", ".continue", ".copilot"}
 //
 // Walking them is safe despite the Library prune: pruning applies to directories descended
 // *below* a root, and a root is never tested against it. Non-existent roots are skipped.
-var vscodeProfileRoots = []string{
-	"Library/Application Support/Code/User/profiles",
-	"Library/Application Support/Code - Insiders/User/profiles",
-	"Library/Application Support/Cursor/User/profiles",
-	"Library/Application Support/Windsurf/User/profiles",
-	"Library/Application Support/VSCodium/User/profiles",
-}
+var vscodeProfileRoots = vscodeProfileRootPaths()
 
 // buildWalkRoots returns the absolute paths under home that the walker should
 // scan. Two categories:
 //   - Dev project dirs (~/code, ~/dev, ~/Documents, ...) from fsscan
 //   - MCP client config dotdirs (~/.claude, ~/.codex, ~/.continue)
-func buildWalkRoots(home string) []string {
+func buildWalkRoots(home string) (roots []string, profileClients map[string]string) {
 	dev := fsscan.DevSubdirRoots(home)
+	profileClients = make(map[string]string, len(vscodeProfileRoots))
 	out := make([]string, 0, len(dev)+len(clientConfigSubdirs)+len(vscodeProfileRoots))
 	out = append(out, dev...)
 	for _, s := range clientConfigSubdirs {
 		out = append(out, filepath.Join(home, s))
 	}
-	for _, s := range vscodeProfileRoots {
-		out = append(out, filepath.Join(home, s))
+	for _, root := range vscodeProfileRoots {
+		s := root.relPath
+		// Same `current` resolution as the direct sources: a snap profile root is otherwise
+		// a symlinked walk root, which resolveRoot refuses, so the profiles beneath it were
+		// never reached.
+		relPath, resolvable := resolveSnapPath(home, s)
+		if !resolvable {
+			continue
+		}
+		absolute := filepath.Join(home, relPath)
+		out = append(out, absolute)
+		profileClients[profileRootKey(absolute)] = root.client
 	}
-	return out
+	return out, profileClients
+}
+
+// profileRootKey normalises a profile root for prefix matching. Case-folded because Windows
+// paths are case-insensitive and the registry can hand back a spelling that differs from the
+// one the walker reports, which would silently defeat the lookup.
+func profileRootKey(path string) string {
+	slashed := filepath.ToSlash(path)
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(slashed)
+	}
+	return slashed
+}
+
+// clientForProfileRoot reports the client owning a walked path, when that path lies beneath
+// a profile root this run generated.
+func clientForProfileRoot(path string, profileClients map[string]string) (string, bool) {
+	key := profileRootKey(path)
+	for root, client := range profileClients {
+		if strings.HasPrefix(key, root+"/") {
+			return client, true
+		}
+	}
+	return "", false
 }
 
 // processOne reads, parses, and normalizes a file the walker found (Pass 2).
@@ -701,6 +899,15 @@ func materialize(in map[string]rawServerEntry, ctx string) ([]Server, error) {
 			s.Disabled = *e.Disabled
 		}
 		if len(e.Env) > 0 {
+			// Collected in map order and sorted at the emit boundary, not here:
+			// redactedJSONStringArray sorts after redacting, which is the only place that
+			// can guarantee the column is stable for every JSON-array column at once.
+			// Sorting here as well would be redundant, and sorting *instead* of there would
+			// leave env_keys stable while the other array columns were not.
+			//
+			// The ordering matters because env_keys is part of the row value: an unsorted
+			// column would make a scheduled query with differential logging report the same
+			// unchanged server as removed and re-added on every run.
 			s.EnvKeys = make([]string, 0, len(e.Env))
 			for k := range e.Env {
 				s.EnvKeys = append(s.EnvKeys, k)

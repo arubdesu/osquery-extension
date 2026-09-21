@@ -35,7 +35,7 @@ var errUnsupported = errors.New("fsscan: symlink-safe traversal requires POSIX o
 // Left as is rather than papered over with case-folded path dedup, which would be wrong on a
 // case-sensitive volume. The consequence is duplicate paths on a platform where the subsequent
 // reads all fail anyway, and the table that uses this is registered on macOS only.
-func rootKeyOf(os.FileInfo) (rootKey, bool) {
+func rootKeyOf(string, os.FileInfo) (rootKey, bool) {
 	return rootKey{}, false
 }
 
@@ -53,3 +53,8 @@ func openBeneathComponents(string, string, []string) (*os.File, error) {
 func isRefusedOrNotDirectory(error) bool {
 	return false
 }
+
+// ownerID has nothing to report here. This platform's roster does not come from enumerating
+// a directory, so no caller reaches it; returning empty is the documented "no identity
+// available" value rather than a placeholder.
+func ownerID(os.FileInfo) string { return "" }

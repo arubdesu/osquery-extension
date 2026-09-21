@@ -141,7 +141,7 @@ func resolveRoot(root, beneath string, seen map[rootKey]struct{}) (string, rootD
 	if !info.IsDir() {
 		return "", rootNotDirectory
 	}
-	if key, ok := rootKeyOf(info); ok {
+	if key, ok := rootKeyOf(absRoot, info); ok {
 		if _, duplicate := seen[key]; duplicate {
 			return "", rootDuplicate
 		}

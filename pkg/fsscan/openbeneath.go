@@ -77,6 +77,13 @@ func ReadBoundedUnder(baseDir, relPath string, maxSize int64) ([]byte, error) {
 
 // splitSafeComponents decomposes relPath into path components, rejecting
 // absolute paths and any ".." traversal.
+// isPathSeparator adapts os.IsPathSeparator, which takes a byte, for strings.FieldsFunc,
+// which supplies a rune. Separators are ASCII on every platform Go supports, so a non-ASCII
+// rune is never one and the range check costs nothing.
+func isPathSeparator(r rune) bool {
+	return r < 0x80 && os.IsPathSeparator(byte(r))
+}
+
 func splitSafeComponents(relPath string) ([]string, error) {
 	if filepath.IsAbs(relPath) {
 		return nil, errors.New("openbeneath: absolute path not permitted")
@@ -85,13 +92,20 @@ func splitSafeComponents(relPath string) ([]string, error) {
 	// checking afterwards accepted an interior ".." that the documented contract rejects.
 	// Nothing escaped -- Clean normalises within the base -- but a caller relying on the
 	// contract to reason about which path was opened was being told the wrong thing.
-	for _, part := range strings.Split(relPath, string(os.PathSeparator)) {
+	//
+	// Split on every separator the platform honours, not just os.PathSeparator. Windows
+	// accepts both "/" and "\\", and Clean rewrites the first into the second: splitting on
+	// the native separator alone left "a/../secret.json" as a single part that matched
+	// nothing, and Clean then collapsed the "..", so the guard passed and the interior ".."
+	// the contract rejects was accepted. os.IsPathSeparator is the platform's own answer to
+	// what separates a component, and on Unix it still admits only "/".
+	for _, part := range strings.FieldsFunc(relPath, isPathSeparator) {
 		if part == ".." {
 			return nil, errors.New("openbeneath: '..' not permitted")
 		}
 	}
 	cleaned := filepath.Clean(relPath)
-	parts := strings.Split(cleaned, string(os.PathSeparator))
+	parts := strings.FieldsFunc(cleaned, isPathSeparator)
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
 		if p == "" || p == "." {
