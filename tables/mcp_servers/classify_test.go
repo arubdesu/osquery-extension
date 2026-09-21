@@ -9,10 +9,10 @@ func TestClassifyPath(t *testing.T) {
 		wantOK     bool
 	}{
 		// Direct global paths
-		{"/Users/x/Library/Application Support/Claude/claude_desktop_config.json", "claude_desktop", true},
+		{"/Users/x/" + appSupport("Claude", "claude_desktop_config.json"), "claude_desktop", true},
 		{"/Users/x/.claude.json", "claude_code", true},
 		// Cline anywhere (basename match, no path constraint)
-		{"/Users/x/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json", "cline", true},
+		{"/Users/x/" + appSupport("Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings", "cline_mcp_settings.json"), "cline", true},
 		// Gemini path-aware (only under .gemini/)
 		{"/Users/x/.gemini/settings.json", "gemini", true},
 		// Cursor: both global and workspace

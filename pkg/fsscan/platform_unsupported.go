@@ -53,8 +53,3 @@ func openBeneathComponents(string, string, []string) (*os.File, error) {
 func isRefusedOrNotDirectory(error) bool {
 	return false
 }
-
-// ownerID has nothing to report here. This platform's roster does not come from enumerating
-// a directory, so no caller reaches it; returning empty is the documented "no identity
-// available" value rather than a placeholder.
-func ownerID(os.FileInfo) string { return "" }

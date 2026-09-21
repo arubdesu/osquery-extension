@@ -67,3 +67,26 @@ func itoa(n int) string {
 	}
 	return string(digits)
 }
+
+// withoutRosterNotes drops diagnostics that describe the roster as a whole rather than one
+// account, so a test can assert what it is actually about.
+//
+// On Linux every run carries one: osquery's users table omits directory-served accounts
+// unless an expensive option is set, and the table says so. That is correct and must keep
+// firing, but it is not what a test counting discovered servers is measuring — and because
+// a constrained query repeats the note under each requested username, it inflates the
+// filtered counts too. Tests that assert exact row counts were written on macOS, where no
+// such note exists, and failed on Linux for a reason unrelated to their subject.
+//
+// Identified structurally rather than by matching the message: a roster-level row is the one
+// whose source path is the users root, because there is no single home it belongs to.
+func withoutRosterNotes(rows []Server) []Server {
+	out := make([]Server, 0, len(rows))
+	for _, row := range rows {
+		if row.Warning != "" && row.SourcePath == fsscan.UsersRoot {
+			continue
+		}
+		out = append(out, row)
+	}
+	return out
+}

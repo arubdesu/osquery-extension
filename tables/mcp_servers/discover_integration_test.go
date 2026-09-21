@@ -37,7 +37,7 @@ func buildFakeHome(t *testing.T, files map[string]string) string {
 
 func TestDiscoverForHome_AllKnownClientsViaDirectPaths(t *testing.T) {
 	home := buildFakeHome(t, map[string]string{
-		"Library/Application Support/Claude/claude_desktop_config.json": `{
+		appSupport("Claude", "claude_desktop_config.json"): `{
 			// JSONC: top-of-file comment
 			"mcpServers": {"desktop-srv": {"command": "npx", "args": ["-y", "desktop-mcp@1.0.0"]}}
 		}`,
@@ -52,7 +52,7 @@ func TestDiscoverForHome_AllKnownClientsViaDirectPaths(t *testing.T) {
 		".codeium/windsurf/mcp_config.json": `{"mcpServers": {"wind-srv": {"command": "docker", "args": ["run", "--rm", "myimg:tag"]}}}`,
 		".gemini/settings.json":             `{"mcpServers": {"gemini-srv": {"command": "npx", "args": ["-y", "gemini-mcp"]}}, "unrelated": "ignored"}`,
 		".codex/mcp.json":                   `{"servers": {"codex-srv": {"command": "node", "args": ["s.js"]}}}`,
-		"Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json": `{"mcpServers": {"cline-srv": {"command": "npx", "args": ["cline-mcp"]}}}`,
+		appSupport("Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings", "cline_mcp_settings.json"): `{"mcpServers": {"cline-srv": {"command": "npx", "args": ["cline-mcp"]}}}`,
 	})
 
 	rows := discoverForTest("alice", home)
@@ -264,11 +264,11 @@ func TestDiscoverAll_UserFilter(t *testing.T) {
 		}
 	}
 
-	all := DiscoverAll(context.Background(), rosterOf(t, root), nil)
+	all := withoutRosterNotes(DiscoverAll(context.Background(), rosterOf(t, root), nil))
 	if len(all) != 2 {
 		t.Errorf("no filter: got %d rows, want 2: %v", len(all), all)
 	}
-	just := DiscoverAll(context.Background(), rosterOf(t, root), map[string]struct{}{"alice": {}})
+	just := withoutRosterNotes(DiscoverAll(context.Background(), rosterOf(t, root), map[string]struct{}{"alice": {}}))
 	if len(just) != 1 || just[0].User != "alice" {
 		t.Errorf("filter alice: got %#v", just)
 	}
@@ -424,13 +424,13 @@ func TestCodexPluginCatalogIsExcluded(t *testing.T) {
 // visible.
 func TestDiscoverForHome_VSCodeUserScopeProfilesAndCopilot(t *testing.T) {
 	home := buildFakeHome(t, map[string]string{
-		"Library/Application Support/Code/User/mcp.json": `{
+		appSupport("Code", "User", "mcp.json"): `{
 			// JSONC is accepted here too
 			"servers": {"vscode-user": {"command": "npx", "args": ["-y", "vs-mcp@1.0.0"]}}
 		}`,
-		"Library/Application Support/Code/User/profiles/abc123/mcp.json": `{"servers":{"vscode-profile":{"command":"node","args":["p.js"]}}}`,
-		"Library/Application Support/Cursor/User/mcp.json":               `{"servers":{"cursor-user":{"command":"uvx","args":["c-mcp"]}}}`,
-		".copilot/mcp-config.json":                                       `{"mcpServers":{"copilot-srv":{"type":"http","url":"https://example.test/mcp"}}}`,
+		appSupport("Code", "User", "profiles", "abc123", "mcp.json"): `{"servers":{"vscode-profile":{"command":"node","args":["p.js"]}}}`,
+		appSupport("Cursor", "User", "mcp.json"):                     `{"servers":{"cursor-user":{"command":"uvx","args":["c-mcp"]}}}`,
+		".copilot/mcp-config.json":                                   `{"mcpServers":{"copilot-srv":{"type":"http","url":"https://example.test/mcp"}}}`,
 	})
 	rows := discoverForTest("alice", home)
 	got := map[string]string{}

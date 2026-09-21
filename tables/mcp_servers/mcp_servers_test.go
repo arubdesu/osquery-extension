@@ -179,6 +179,7 @@ func TestMCPServersGenerateWiresConstraintsToDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unconstrained: %v", err)
 	}
+	rows = serverRowsOnly(rows)
 	if len(rows) != 2 {
 		t.Fatalf("unconstrained: got %d rows, want one per user: %v", len(rows), rows)
 	}
@@ -209,6 +210,11 @@ func TestMCPServersGenerateWiresConstraintsToDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("constrained: %v", err)
 	}
+	// Same filter as above. A constrained query repeats a roster-level note under each
+	// requested username, so on Linux the narrowed result carries alice's server *and* a
+	// note addressed to alice -- which is the designed behaviour, not a constraint being
+	// ignored.
+	narrowed = serverRowsOnly(narrowed)
 	if len(narrowed) != 1 || narrowed[0]["user"] != "alice" {
 		t.Fatalf("user constraint not honoured: %v", narrowed)
 	}
@@ -404,4 +410,22 @@ func TestEnvKeysColumnIsStableAcrossRepeatedParses(t *testing.T) {
 				first, row["env_keys"])
 		}
 	}
+}
+
+// serverRowsOnly drops diagnostics describing the roster as a whole rather than one account.
+//
+// On Linux every run carries one, because osquery's users table omits directory-served
+// accounts unless an expensive option is set, and the table says so. That is correct and
+// must keep firing; it is simply not what a test counting discovered servers measures.
+// Identified structurally rather than by message: a roster-level row names the users root as
+// its source, because there is no single home it belongs to.
+func serverRowsOnly(rows []map[string]string) []map[string]string {
+	out := make([]map[string]string, 0, len(rows))
+	for _, row := range rows {
+		if row["warning"] != "" && row["source_path"] == fsscan.UsersRoot {
+			continue
+		}
+		out = append(out, row)
+	}
+	return out
 }

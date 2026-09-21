@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -77,18 +76,4 @@ func isRefusedOrNotDirectory(err error) bool {
 		return errors.Is(pathErr.Err, syscall.ELOOP) || errors.Is(pathErr.Err, syscall.ENOTDIR)
 	}
 	return false
-}
-
-// ownerID returns the numeric uid owning a directory, as the stable identity for an account
-// enumerated from the filesystem rather than from an account database.
-//
-// On macOS the roster is /Users, so the account's identity is whatever owns its home. That
-// is the same number osquery's own users table reports in uid, which is the join this column
-// exists to make possible.
-func ownerID(info os.FileInfo) string {
-	sys, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return ""
-	}
-	return strconv.FormatUint(uint64(sys.Uid), 10)
 }
