@@ -2,13 +2,17 @@
 
 package fsscan
 
-// KNOWN GAP: nothing in this file has ever executed. It is verified by
-// cross-compilation and go vet only -- there is no Windows CI job and it is not
-// developed on Windows -- so the symlink-refusing traversal here is unproven
-// rather than tested. Most of it can be checked on a real host without administrator
-// rights: junctions need no privilege and are what the reparse-point refusal is
-// written against, and an unprivileged run exercises the diagnostic paths because
-// other profiles are unreadable.
+// PARTIALLY VERIFIED. Exercised on a real Windows host: ordinary bounded reads of
+// configuration under a user profile, root enumeration and dedup during the walk, and the
+// case this file exists for -- a junction planted at a probed configuration path was
+// refused rather than followed, producing no row and no warning, which is the designed
+// silent-absence result.
+//
+// KNOWN GAP: not continuously exercised. There is no Windows CI job, so `go vet` and
+// cross-compilation are the only automated checks that ever see this file, and the
+// coverage gate cannot measure it at all. Nothing has stress-tested the post-open identity
+// re-check against a path genuinely being replaced mid-traversal; that race is reasoned
+// about rather than demonstrated.
 
 import (
 	"errors"

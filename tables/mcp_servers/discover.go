@@ -1,6 +1,7 @@
 package mcp_servers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -776,6 +777,19 @@ func finishProcessing(data []byte, readErr error, path, user, client string, jso
 		}
 		return []Server{diagnosticRow(user, path, client, "read: "+readErr.Error())}
 	}
+	// A UTF-8 byte-order mark is stripped before anything looks at the content.
+	//
+	// Go's encoding/json rejects one outright -- "invalid character '\ufeff' looking for
+	// beginning of value" -- so a JSON or JSONC config carrying one was reported as
+	// malformed rather than read. BurntSushi/toml happens to tolerate a leading BOM, so
+	// Codex configs were never affected; the strip is applied here rather than on the JSON
+	// path alone so that tolerance stays an implementation detail of the dependency rather
+	// than something this table relies on. That is a Windows shape in particular:
+	// Notepad has historically written UTF-8 with a BOM, and PowerShell's
+	// `Set-Content -Encoding utf8` still does on Windows PowerShell 5.1. The file is
+	// perfectly valid; only the marker is in the way.
+	data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
+
 	if jsonc {
 		stripped, terminated := stripJSONC(data)
 		if !terminated {

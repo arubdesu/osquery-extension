@@ -1213,3 +1213,63 @@ func TestEnvelopeCollisionUsesDeclaredNamesNotDecodedOnes(t *testing.T) {
 		})
 	}
 }
+
+// TestByteOrderMarkedConfigsParse pins the BOM strip.
+//
+// Go's encoding/json rejects a UTF-8 BOM outright, so a JSON or JSONC config carrying one
+// was reported as malformed rather than read -- the file is valid and only the marker is in
+// the way. BurntSushi/toml already tolerates it, so the Codex case below passes with or
+// without the strip; it is here to keep the shared preprocessing consistent and to catch
+// the decoder becoming stricter or a refactor routing TOML around it.
+//
+// This is a Windows shape above all: Notepad has historically written UTF-8 with a BOM, and
+// Windows PowerShell 5.1's `Set-Content -Encoding utf8` still does, so the most likely way
+// for a hand-written config to reach this table on Windows is with one attached.
+func TestByteOrderMarkedConfigsParse(t *testing.T) {
+	bom := []byte{0xEF, 0xBB, 0xBF}
+
+	for _, tc := range []struct {
+		name    string
+		body    string
+		jsonc   bool
+		extract func([]byte) ([]Server, error)
+		want    string
+	}{
+		{
+			name: "json envelope", jsonc: false, extract: extractEnvelopeSimple,
+			body: `{"mcpServers":{"bommed":{"command":"npx"}}}`, want: "bommed",
+		},
+		{
+			name: "jsonc with a comment", jsonc: true, extract: extractEnvelopeSimple,
+			body: "// a comment\n{\"servers\":{\"bommed\":{\"command\":\"npx\"}}}", want: "bommed",
+		},
+		{
+			// This case passes with or without the strip: BurntSushi/toml tolerates a
+			// leading BOM where encoding/json does not. Worth keeping anyway -- it pins
+			// that a Codex config is unaffected either way, and it would catch the
+			// dependency becoming stricter or a refactor routing TOML around the shared
+			// preprocessing. Adding it also corrected the claim above: the original
+			// comment asserted the TOML decoder rejected a BOM, and writing the test is
+			// what showed otherwise.
+			name: "codex toml", jsonc: false, extract: extractCodexTOML,
+			body: "[mcp_servers.bommed]\ncommand = \"npx\"\n", want: "bommed",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := finishProcessing(append(bom, []byte(tc.body)...), nil,
+				"/p/mcp.json", "alice", "cursor", tc.jsonc, tc.extract)
+			var found bool
+			for _, row := range rows {
+				if row.Warning != "" {
+					t.Errorf("a byte-order mark produced a diagnostic: %s", row.Warning)
+				}
+				if row.ServerName == tc.want {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("server %q not found; rows=%+v", tc.want, rows)
+			}
+		})
+	}
+}

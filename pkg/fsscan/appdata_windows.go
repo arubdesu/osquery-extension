@@ -2,13 +2,17 @@
 
 package fsscan
 
-// KNOWN GAP: nothing in this file has ever executed. It is verified by
-// cross-compilation and go vet only -- there is no Windows CI job and it is not
-// developed on Windows -- so the Roaming known-folder resolution here is unproven
-// rather than tested. Most of it can be checked on a real host without administrator
-// rights: junctions need no privilege and are what the reparse-point refusal is
-// written against, and an unprivileged run exercises the diagnostic paths because
-// other profiles are unreadable.
+// PARTIALLY VERIFIED. Exercised on a real Windows host: resolution for the logged-on
+// account through the already-mounted HKU\<SID> hive, redirection detected and reported
+// when Roaming points outside the profile, and the account-scoped warning raised when the
+// location cannot be determined.
+//
+// KNOWN GAP: the logged-off path has never run. RegLoadAppKey is only reached for an
+// account that has a real profile directory and is not currently logged on, and a
+// single-user machine has no such account -- so the load, the read through the returned
+// private handle, and the NTUSER.DAT pre-check that stops the API creating an empty hive
+// are all unproven. There is no Windows CI job, so nothing here is continuously exercised
+// either; `go vet` and cross-compilation are the only automated checks that see this file.
 
 import (
 	"os"
@@ -52,7 +56,6 @@ import (
 const (
 	shellFoldersKey    = `Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders`
 	shellFoldersValue  = "AppData"
-	hiveMountPrefix    = `osquery-macadmins-`
 	ntUserDatFilename  = "NTUSER.DAT"
 	defaultRoamingPath = `AppData\Roaming`
 )

@@ -129,6 +129,12 @@ func TestSharedHomesKeepEveryAccount(t *testing.T) {
 func TestAccountIDPrefersTheSIDOnlyWhenThereIsOne(t *testing.T) {
 	for _, tc := range []struct{ uid, uuid, want string }{
 		{"1001", "S-1-5-21-1-2-3-1001", "S-1-5-21-1-2-3-1001"}, // Windows: the SID identifies
+		// Entra ID issues SIDs under authority 12, not 21. Confirmed on a real
+		// Entra-joined machine, where user_id came back as S-1-12-1-... A check written
+		// against "S-1-5-21-" specifically would have dropped the identity on exactly the
+		// fleets most likely to deploy this.
+		{"1002", "S-1-12-1-3623811015-3361044348-30300820-1013",
+			"S-1-12-1-3623811015-3361044348-30300820-1013"},
 		{"501", "8733DFD7-5C92-470B-9FAF-E61653A10FC7", "501"}, // macOS: a GUID is not an ID
 		{"1000", "", "1000"}, // Linux: uid only
 	} {
