@@ -239,6 +239,10 @@ func TestSanitizeRemoteURL(t *testing.T) {
 		{"https://mcp.example.com/mcp/abc123tokenhere/sse", "https://mcp.example.com"},
 		{"http://localhost:8080/foo", "http://localhost:8080"},
 		{"//example.com/path", "//example.com"},
+		// Scheme-less with a path parses as all-path and no host. The endpoint is dropped
+		// rather than guessed at: inventing a scheme would report one the config never
+		// named, and the query string it arrives with is exactly where a key hides.
+		{"mcp.example.com/path?api_key=abc", ""},
 		{"not a url", ""},
 		{"", ""},
 	}
