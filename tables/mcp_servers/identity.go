@@ -49,7 +49,15 @@ func inferIdentity(s *Server) {
 	exe, embedded := commandFields(s.Command, len(s.Args) > 0)
 	argTok := s.Args
 	if len(embedded) > 0 {
-		argTok = embedded
+		// Redacted here because these arguments never passed through materialize, which is
+		// where the declared args array gets the same treatment. Without it the two forms
+		// of the same configuration behaved differently: `{"args": ["--token", "SECRET",
+		// "pkg"]}` had SECRET replaced before inference and reported package_name=pkg,
+		// while {"command": "npx --token SECRET pkg"} handed SECRET to the identity scanner
+		// as the first package-shaped positional and copied it into package_name and
+		// requested_spec. An opaque secret is exactly what the final redactor cannot
+		// recognise, so it reached the row intact.
+		argTok = redactArgs(embedded)
 	}
 	// launcherName, not the plain filename: on Windows `npx` resolves to `npx.cmd`, and a
 	// config naming the resolved file is legal and common.

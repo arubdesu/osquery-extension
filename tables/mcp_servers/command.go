@@ -3,6 +3,7 @@ package mcp_servers
 import (
 	"runtime"
 	"strings"
+	"unicode"
 )
 
 // The `command` field of an MCP config is one JSON string holding either of two shapes:
@@ -22,10 +23,22 @@ import (
 // inference splitting again on its own rules, which is how one config could report basename
 // "Program" alongside package_manager "".
 
-// whitespaceChars is every ASCII space character, not just space and tab. A hostile config
-// can JSON-encode a literal newline into the command field, and a split that knew only about
-// " \t" let "node\n--api-key=AAAA..." through as one token.
-const whitespaceChars = " \t\n\r\v\f"
+// containsWhitespace reports whether s holds any Unicode space character.
+//
+// Unicode-aware rather than a list of ASCII bytes, and every whitespace test in this file
+// goes through it or through unicode.IsSpace directly. Two separate reasons:
+//
+//   - a split that knew only about " \t" let "node\n--api-key=AAAA..." through as one token,
+//     because a config can JSON-encode a literal newline into the command field;
+//   - an ASCII-only list disagreed with strings.Fields and strings.TrimSpace, which are
+//     Unicode-aware, so a field separated by U+00A0 or U+2028 was seen as having no
+//     whitespace at all. It was then returned whole, and the entire invocation -- flag,
+//     secret and package -- landed in command_basename, which is the one thing that column
+//     exists to prevent. A non-breaking space is what a copy-paste from documentation or a
+//     chat client produces, so this is an ordinary accident and not only a hostile input.
+func containsWhitespace(s string) bool {
+	return strings.IndexFunc(s, unicode.IsSpace) >= 0
+}
 
 // commandFields splits the command field into the executable and any arguments embedded in
 // it. embedded is empty when the field carries none, or when the config declared its own
@@ -50,7 +63,7 @@ func commandFieldsFor(goos, cmd string, argsPresent bool) (string, []string) {
 		}
 		return quoted, strings.Fields(rest)
 	}
-	if !strings.ContainsAny(cmd, whitespaceChars) {
+	if !containsWhitespace(cmd) {
 		return cmd, nil
 	}
 	// Which shape the field has is decided from the field alone, the same way in both
@@ -143,7 +156,7 @@ func commandShapeOf(goos, cmd string) commandShape {
 	if _, known := launcherIdentity[launcherNameFor(goos, head)]; known {
 		return shapeInvocation
 	}
-	first, _ := cutWhitespace(strings.TrimLeft(tail, whitespaceChars))
+	first, _ := cutWhitespace(strings.TrimLeftFunc(tail, unicode.IsSpace))
 	if strings.HasPrefix(first, "-") || isRootedPath(goos, first) {
 		return shapeInvocation
 	}
@@ -172,7 +185,7 @@ func cutQuoted(field string) (quoted, rest string, ok bool) {
 
 // cutWhitespace splits a field at its first run of whitespace.
 func cutWhitespace(field string) (head, tail string) {
-	i := strings.IndexAny(field, whitespaceChars)
+	i := strings.IndexFunc(field, unicode.IsSpace)
 	if i < 0 {
 		return field, ""
 	}
@@ -231,7 +244,7 @@ func executableNameFor(goos, exe string) string {
 	if i := strings.LastIndexAny(exe, pathSeparators(goos)); i >= 0 {
 		exe = exe[i+1:]
 	}
-	if strings.ContainsAny(exe, whitespaceChars) {
+	if containsWhitespace(exe) {
 		return ""
 	}
 	return exe

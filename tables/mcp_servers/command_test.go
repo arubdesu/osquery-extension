@@ -382,3 +382,103 @@ func TestEveryLauncherAssignsAPackageManager(t *testing.T) {
 		}
 	}
 }
+
+// TestEmbeddedArgumentsAreRedactedLikeDeclaredOnes pins the two spellings of one
+// configuration against each other.
+//
+// A declared args array is redacted in materialize, before identity inference ever sees it,
+// so `["--token", "SECRET", "pkg"]` reaches the scanner as `["--token", "[REDACTED]", "pkg"]`
+// and pkg is reported. Arguments embedded in the command field are split inside
+// inferIdentity and skipped that pass entirely, so SECRET was the first package-shaped
+// positional and was copied into package_name and requested_spec -- an opaque value, which
+// is precisely what the final known-token redactor cannot recognise.
+//
+// The inline form `--token=SECRET` was never exposed: it is a single dash-prefixed token, so
+// the scanner skips it. Only the two-argument form leaked, which is why both appear here.
+func TestEmbeddedArgumentsAreRedactedLikeDeclaredOnes(t *testing.T) {
+	const secret = "opaqueSecretValue"
+	for _, tc := range []struct{ name, body string }{
+		{"declared", `{"mcpServers":{"a":{"command":"npx","args":["--token","` + secret + `","real-package"]}}}`},
+		{"embedded two-argument", `{"mcpServers":{"a":{"command":"npx --token ` + secret + ` real-package"}}}`},
+		{"embedded inline", `{"mcpServers":{"a":{"command":"npx --token=` + secret + ` real-package"}}}`},
+		{"embedded api-key", `{"mcpServers":{"a":{"command":"uvx --api-key ` + secret + ` real-package"}}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := finishProcessing([]byte(tc.body), nil, "/p/.mcp.json", "alice", "claude-code",
+				true, extractEnvelopeSimple)
+			if len(rows) != 1 {
+				t.Fatalf("want one row, got %d", len(rows))
+			}
+			for column, value := range serverToRow(rows[0]) {
+				if strings.Contains(value, secret) {
+					t.Errorf("%s = %q, which carries the secret", column, value)
+				}
+			}
+			if got := rows[0].PackageName; got != "real-package" {
+				t.Errorf("package_name = %q, want real-package: the argument after the "+
+					"secret-bearing flag is the package", got)
+			}
+		})
+	}
+}
+
+// TestNonASCIIWhitespaceSplitsLikeASpace pins every whitespace test in command.go to the
+// same definition strings.Fields and strings.TrimSpace already use.
+//
+// An ASCII-only list disagreed with them: a command separated by U+00A0 or U+2028 was seen
+// as holding no whitespace, so it was returned whole and the entire invocation -- flag,
+// secret and package -- was emitted as command_basename. The floor meant to keep argument
+// text out of that column never fired, because it was looking for the same ASCII bytes it
+// had already failed to find. A no-break space is what copying a command out of
+// documentation or a chat client produces, so this is an ordinary accident and not only a
+// hostile input.
+//
+// Separators are built from rune values rather than written literally: a literal U+00A0 in
+// source is invisible to a reviewer and indistinguishable from the space beside it.
+//
+// The assertion is equality with the ASCII spelling rather than a property, so a later
+// change cannot satisfy it by emptying the column for every separator at once.
+func TestNonASCIIWhitespaceSplitsLikeASpace(t *testing.T) {
+	const secret = "opaqueSecretValue"
+	body := func(separator string) []byte {
+		return []byte(`{"mcpServers":{"a":{"command":"npx` + separator + `--token` + separator +
+			secret + separator + `pkg"}}}`)
+	}
+	identity := func(raw []byte) map[string]string {
+		t.Helper()
+		rows := finishProcessing(raw, nil, "/p/.mcp.json", "alice", "claude-code",
+			true, extractEnvelopeSimple)
+		if len(rows) != 1 {
+			t.Fatalf("want one row, got %d", len(rows))
+		}
+		return serverToRow(rows[0])
+	}
+
+	want := identity(body(" "))
+	if want["command_basename"] != "npx" || want["package_name"] != "pkg" {
+		t.Fatalf("the ASCII baseline is itself wrong: %v", want)
+	}
+	for _, separator := range []struct {
+		name string
+		code rune
+	}{
+		{"U+0085 next line", 0x0085},
+		{"U+00A0 no-break space", 0x00A0},
+		{"U+2028 line separator", 0x2028},
+		{"U+2029 paragraph separator", 0x2029},
+		{"U+3000 ideographic space", 0x3000},
+	} {
+		got := identity(body(string(separator.code)))
+		for _, column := range []string{"command_basename", "package_name", "requested_spec"} {
+			if got[column] != want[column] {
+				t.Errorf("%s: %s = %q, want %q as with an ordinary space",
+					separator.name, column, got[column], want[column])
+			}
+		}
+		for column, value := range got {
+			if strings.Contains(value, secret) {
+				t.Errorf("%s: %s = %q, which carries the secret", separator.name, column, value)
+			}
+		}
+	}
+}
