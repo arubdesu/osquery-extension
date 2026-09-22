@@ -58,7 +58,9 @@ func MCPServersColumns() []table.ColumnDefinition {
 		table.TextColumn("transport"),
 		// Replaces the previous `command` column. Just the executable name,
 		// no args, no flags, no paths. Whitespace-embedded args are stripped
-		// before this is written.
+		// before this is written, while a path that merely contains a space --
+		// `C:\Program Files\nodejs\npx.cmd` -- is not mistaken for a pair of
+		// them. command.go decides which of the two a field is.
 		table.TextColumn("command_basename"),
 		table.IntegerColumn("args_count"),
 		table.TextColumn("url_endpoint"),
@@ -145,7 +147,7 @@ func serverToRow(s Server) map[string]string {
 		"transport":      s.Transport,
 		// Pass command_basename through redact.String as well, defense in
 		// depth in case a hostile binary filename matches a known token shape.
-		"command_basename": redact.String(redact.CommandBasename(s.Command)),
+		"command_basename": redact.String(commandBasename(s.Command, len(s.Args) > 0)),
 		// The length of the JSON args array as written, not the number of arguments the
 		// launcher effectively receives. A config of {"command": "uvx pkg@1.0"} with no args
 		// array reports 0 here while package_name and version are still inferred from the

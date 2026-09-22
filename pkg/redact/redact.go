@@ -20,6 +20,7 @@ package redact
 import (
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // RedactedMark uses square brackets so the marker survives JSON encoding
@@ -36,8 +37,16 @@ const RedactedMark = "[REDACTED]"
 // pair and the prefix is only two characters plus a dash. Unanchored, it matched inside
 // ordinary identifiers: task-management-service-client became ta[REDACTED], and a project
 // directory named task-tracker-frontend-app mangled every source_path that contained it.
-// disk-, risk- and desk- do the same. The other prefixes are distinctive enough that matching
-// mid-string is a feature rather than a hazard, so they are deliberately left unanchored.
+// disk-, risk- and desk- do the same.
+//
+// The boundary excludes alphanumerics only. It used to exclude "-" and "_" as well, which
+// was too wide in the dangerous direction: a real key written after an ordinary separator
+// -- server-sk-..., MY_sk-... -- was left in the clear, which is the one outcome this
+// package exists to prevent. Every false positive above is blocked by the character before
+// "sk" being a letter, so separators can safely delimit a token.
+//
+// The other prefixes are distinctive enough that matching mid-string is a feature rather
+// than a hazard, so they are deliberately left unanchored.
 //
 // Group 1 is the consumed separator, replayed by String so only the credential is replaced.
 // For every other alternative it captures nothing and the group expands to empty.
@@ -47,7 +56,7 @@ var knownTokenRe = regexp.MustCompile(strings.Join([]string{
 	`gitlab-[a-z]+-[A-Za-z0-9_-]{20,}`,
 	`glpat-[A-Za-z0-9_-]{20,}`,
 	`xox[abprs]-[A-Za-z0-9-]{10,}`,
-	`(^|[^A-Za-z0-9_-])(sk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,})`,
+	`(^|[^A-Za-z0-9])(sk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,})`,
 	`AKIA[0-9A-Z]{16}`,
 	`ASIA[0-9A-Z]{16}`,
 	`AIza[0-9A-Za-z_-]{35}`,
@@ -99,36 +108,22 @@ func ErrorText(s string) string {
 	return Truncate(String(s), 500)
 }
 
-// Truncate caps s at max characters, appending "..." if cut. Used in error
+// Truncate caps s at limit bytes, appending "..." if cut. Used in error
 // strings to bound row size when an attacker plants a 30 MiB lockfile key.
+//
+// The cut moves back to a rune boundary, so the result is never invalid UTF-8. A blind
+// slice at the byte limit can land inside a multi-byte rune, and the trailing fragment
+// travels: encoding/json rewrites it as U+FFFD, so a filename or error message that merely
+// contained non-ASCII would be reported with a corrupted final character. The bound is on
+// bytes because the point is to bound the row, so a string of multi-byte runes yields
+// fewer characters than limit, by design.
 func Truncate(s string, limit int) string {
 	if len(s) <= limit {
 		return s
 	}
-	return s[:limit] + "..."
-}
-
-// CommandBasename returns just the basename of a command string. Strips any
-// leading directory and any whitespace-embedded arguments. Used in place of
-// the full command field on MCP rows: args/flags/paths can carry secrets
-// in ways regex can't reliably catch, but a basename like "npx" or
-// "atlassian.sh" can't (it's at most a binary name).
-//
-// All ASCII whitespace is treated as a separator: including newline,
-// carriage return, vertical tab, and form feed. A hostile MCP config can
-// JSON-encode a literal `\n` inside the `command` field, which decodes to
-// a real newline; without the broader split, a payload like
-// "node\n--api-key=AAAA..." would survive as a single token.
-func CommandBasename(cmd string) string {
-	cmd = strings.TrimSpace(cmd)
-	if cmd == "" {
-		return ""
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
 	}
-	if i := strings.IndexAny(cmd, " \t\n\r\v\f"); i > 0 {
-		cmd = cmd[:i]
-	}
-	if i := strings.LastIndexByte(cmd, '/'); i >= 0 {
-		cmd = cmd[i+1:]
-	}
-	return cmd
+	return s[:cut] + "..."
 }

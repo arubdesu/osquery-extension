@@ -1273,3 +1273,49 @@ func TestByteOrderMarkedConfigsParse(t *testing.T) {
 		})
 	}
 }
+
+// TestJSONCAcceptsTrailingCommas pins the three Copilot findings that were about a valid
+// config being rejected rather than about a crash.
+//
+// The VS Code family documents mcp.json as JSON-with-comments and accepts trailing commas,
+// so a file the editor itself wrote and considers valid reached encoding/json, which
+// refuses them, and the whole file became one parse-warning row. Losing every server in a
+// file because of a comma is exactly the silent-incompleteness this table exists to avoid.
+func TestJSONCAcceptsTrailingCommas(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"object", `{"servers":{"a":{"command":"npx"},}}`},
+		{"array", `{"servers":{"a":{"command":"npx","args":["x",]}}}`},
+		{"nested and spaced", "{\"servers\":{\n \"a\":{\"command\":\"npx\"} ,\n}\n}"},
+		{"with a comment too", "// note\n{\"servers\":{\"a\":{\"command\":\"npx\"},}}"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := finishProcessing([]byte(tc.body), nil, "/p/mcp.json", "alice", "vscode",
+				true, extractEnvelopeSimple)
+			for _, row := range rows {
+				if row.Warning != "" {
+					t.Errorf("a trailing comma produced a diagnostic: %s", row.Warning)
+				}
+			}
+			if len(rows) != 1 || rows[0].ServerName != "a" {
+				t.Errorf("want one server named a, got %+v", rows)
+			}
+		})
+	}
+}
+
+// TestTrailingCommaStripIsStringAware guards the other direction: a comma inside a string
+// value is data, and removing it would corrupt the configuration this is meant to rescue.
+func TestTrailingCommaStripIsStringAware(t *testing.T) {
+	body := `{"servers":{"a":{"command":"npx","args":["a,}","b, ]"],}}}`
+	rows := finishProcessing([]byte(body), nil, "/p/mcp.json", "alice", "vscode",
+		true, extractEnvelopeSimple)
+	if len(rows) != 1 || rows[0].Warning != "" {
+		t.Fatalf("want one clean row, got %+v", rows)
+	}
+	// The exact values, not the count. An implementation that stripped commas inside
+	// strings would yield "a}" and "b ]", the JSON would still parse, the count would
+	// still be two, and a length check would pass while the data was corrupted.
+	if !reflect.DeepEqual(rows[0].Args, []string{"a,}", "b, ]"}) {
+		t.Errorf("args were corrupted: %q", rows[0].Args)
+	}
+}

@@ -42,67 +42,20 @@ func inferIdentity(s *Server) {
 		return
 	}
 
-	// Quirk: some configs (e.g., Cursor) put the entire invocation in `command`
-	// with empty `args`, like "uvx some-pkg@latest". Split into effective tokens for
-	// identity inference without mutating the original fields (we still surface them
-	// verbatim to the operator).
-	cmdTok, argTok := effectiveCommandArgs(s.Command, s.Args)
-	cmd := commandBasename(cmdTok)
-	// Assign RequestedSpec only if the candidate passes looksLikePackageSpec,
-	// otherwise we'd leak URL credentials, file paths, etc. that the launcher
-	// happens to accept as positional args. PackageName is set from the split
-	// result, which already rejects bad shapes.
-	assignIfClean := func(cand string, splitter func(string) (string, string)) {
-		if !looksLikePackageSpec(cand) {
-			return
-		}
-		s.RequestedSpec = cand
-		name, ver := splitter(cand)
-		s.PackageName = name
-		s.Version = ver
+	// commandFields resolves the two shapes a `command` field takes: an executable path, or
+	// an invocation with its arguments embedded, which some configs (e.g. Cursor) write as
+	// {"command": "uvx some-pkg@latest"} with no args array. The original fields are not
+	// mutated; they are still surfaced verbatim to the operator.
+	exe, embedded := commandFields(s.Command, len(s.Args) > 0)
+	argTok := s.Args
+	if len(embedded) > 0 {
+		argTok = embedded
 	}
-
-	switch cmd {
-	case "npx":
-		s.PackageManager = "npx"
-		cand, ver := npxIdentity(argTok)
-		if looksLikePackageSpec(cand) {
-			s.RequestedSpec = cand
-			s.PackageName, _ = splitNPMSpec(cand)
-			s.Version = ver
-		}
-	case "bunx":
-		s.PackageManager = "bunx"
-		assignIfClean(firstPositional(argTok), splitNPMSpec)
-	case "uvx":
-		s.PackageManager = "uvx"
-		assignIfClean(firstPositional(argTok), splitPyPISpec)
-	case "uv":
-		s.PackageManager = "uv"
-		assignIfClean(uvRunIdentity(argTok), splitPyPISpec)
-	case "pipx":
-		s.PackageManager = "pipx"
-		assignIfClean(pipxIdentity(argTok), splitPyPISpec)
-	case "docker", "podman":
-		s.PackageManager = "docker"
-		// Docker refs aren't package specs in the npm/pypi sense; splitDockerRef
-		// returns (name, version) for valid refs and "", "" otherwise. We
-		// accept whatever it produces.
-		// Validated against the reference grammar before anything is assigned. The old
-		// guard only excluded "://", so user:secret@reg/img was emitted verbatim as both
-		// requested_spec and package_name.
-		if ref := dockerRunIdentity(argTok); dockerRefRe.MatchString(ref) {
-			s.RequestedSpec = ref
-			s.PackageName, s.Version = splitDockerRef(ref)
-		}
-	case "python", "python3":
-		if mod := pythonModule(argTok); mod != "" && looksLikePackageSpec(mod) {
-			s.PackageManager = "python"
-			s.PackageName = mod
-			s.RequestedSpec = "python:" + mod
-		}
-	case "node", "deno", "bun":
-		s.PackageManager = cmd
+	// launcherName, not the plain filename: on Windows `npx` resolves to `npx.cmd`, and a
+	// config naming the resolved file is legal and common.
+	cmd := launcherName(exe)
+	if identify, known := launcherIdentity[cmd]; known {
+		identify(s, argTok)
 	}
 
 	// Sanity: if identity contains an unresolved shell variable, clear the fields,
@@ -125,31 +78,93 @@ func inferIdentity(s *Server) {
 	}
 }
 
-// commandBasename strips any leading path so absolute commands like
-// "/usr/local/bin/npx" still match the "npx" case.
-func commandBasename(cmd string) string {
-	if i := strings.LastIndexByte(cmd, '/'); i >= 0 {
-		return cmd[i+1:]
-	}
-	return cmd
+// launcherIdentity is the one list of launchers this table understands. It dispatches
+// identity inference, and its keys are the names commandFieldsFor treats as launchers while
+// deciding whether a `command` field is a path or an invocation.
+//
+// One table rather than a switch beside a parallel set, because the two have to agree and
+// nothing in the compiler would have said otherwise. Membership is what lets the splitter
+// read `/usr/bin/node src/server.js` as an invocation rather than as one path containing a
+// space; a launcher dispatched here but absent from the set would have had that field read
+// as a path, reporting the argument's filename -- "server.js" -- as the launcher.
+var launcherIdentity = map[string]func(s *Server, args []string){
+	"npx": func(s *Server, args []string) {
+		s.PackageManager = "npx"
+		cand, ver := npxIdentity(args)
+		if looksLikePackageSpec(cand) {
+			s.RequestedSpec = cand
+			s.PackageName, _ = splitNPMSpec(cand)
+			s.Version = ver
+		}
+	},
+	"bunx": func(s *Server, args []string) {
+		s.PackageManager = "bunx"
+		assignIfClean(s, firstPositional(args), splitNPMSpec)
+	},
+	"uvx": func(s *Server, args []string) {
+		s.PackageManager = "uvx"
+		assignIfClean(s, firstPositional(args), splitPyPISpec)
+	},
+	"uv": func(s *Server, args []string) {
+		s.PackageManager = "uv"
+		assignIfClean(s, uvRunIdentity(args), splitPyPISpec)
+	},
+	"pipx": func(s *Server, args []string) {
+		s.PackageManager = "pipx"
+		assignIfClean(s, pipxIdentity(args), splitPyPISpec)
+	},
+	"docker": dockerIdentity,
+	"podman": dockerIdentity,
+	// python is the one launcher that claims no package manager unless its arguments say
+	// what is being run: `python` alone is a script host, not a package installer.
+	"python":  pythonIdentity,
+	"python3": pythonIdentity,
+	// node, deno and bun run a local script or binary rather than fetching a package, so
+	// the launcher is the whole of the identity they can support.
+	"node": plainLauncher("node"),
+	"deno": plainLauncher("deno"),
+	"bun":  plainLauncher("bun"),
 }
 
-// effectiveCommandArgs handles the common quirk of a "command" field that contains
-// whitespace and embeds its own arguments, with an empty "args" array. Real example
-// from the wild (Cursor mcp.json): {"command": "uvx some-pkg@latest"}. We tokenize
-// by whitespace, good enough since MCP launchers don't legitimately use quoted
-// path segments here.
-//
-// Returns the original (command, args) if no splitting is warranted.
-func effectiveCommandArgs(cmd string, args []string) (string, []string) {
-	if len(args) > 0 || !strings.ContainsAny(cmd, " \t") {
-		return cmd, args
+// assignIfClean sets RequestedSpec only if the candidate passes looksLikePackageSpec,
+// otherwise we'd leak URL credentials, file paths, etc. that the launcher happens to accept
+// as positional args. PackageName is set from the split result, which already rejects bad
+// shapes.
+func assignIfClean(s *Server, cand string, splitter func(string) (string, string)) {
+	if !looksLikePackageSpec(cand) {
+		return
 	}
-	toks := strings.Fields(cmd)
-	if len(toks) == 0 {
-		return cmd, args
+	s.RequestedSpec = cand
+	name, ver := splitter(cand)
+	s.PackageName = name
+	s.Version = ver
+}
+
+func dockerIdentity(s *Server, args []string) {
+	s.PackageManager = "docker"
+	// Docker refs aren't package specs in the npm/pypi sense; splitDockerRef returns
+	// (name, version) for valid refs and "", "" otherwise. We accept whatever it produces.
+	//
+	// Validated against the reference grammar before anything is assigned. The old guard
+	// only excluded "://", so user:secret@reg/img was emitted verbatim as both
+	// requested_spec and package_name.
+	if ref := dockerRunIdentity(args); dockerRefRe.MatchString(ref) {
+		s.RequestedSpec = ref
+		s.PackageName, s.Version = splitDockerRef(ref)
 	}
-	return toks[0], toks[1:]
+}
+
+func pythonIdentity(s *Server, args []string) {
+	if mod := pythonModule(args); mod != "" && looksLikePackageSpec(mod) {
+		s.PackageManager = "python"
+		s.PackageName = mod
+		s.RequestedSpec = "python:" + mod
+	}
+}
+
+// plainLauncher reports the launcher as the package manager and infers nothing else.
+func plainLauncher(name string) func(*Server, []string) {
+	return func(s *Server, _ []string) { s.PackageManager = name }
 }
 
 // guessRemoteTransport returns "sse" if the args or URL hint at server-sent events,

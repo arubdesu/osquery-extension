@@ -95,6 +95,37 @@ func TestScan_RespectsMaxDepth(t *testing.T) {
 	}
 }
 
+// TestScan_DepthIsMeasuredFromACleanedRoot pins MaxDepth against roots spelled with
+// redundant separators.
+//
+// Depth is separator arithmetic on the root string, and WalkDir builds children with
+// filepath.Join, which cleans. Any separator the root carries that its children do not
+// shifts every measurement: "<dir>/" counts one extra, so children measure one level
+// shallower and the walk descends one past the limit, and "/./A/.." counts three extra.
+// Absolute roots were the only ones affected -- filepath.Abs cleans on its way out, so the
+// relative branch never saw this.
+//
+// The limit is 3 against a file at depth 3 so every spelling is load-bearing: at 2 the
+// single trailing slash produces the right answer for the wrong reason, because the file is
+// far enough down that an off-by-one still excludes it.
+func TestScan_DepthIsMeasuredFromACleanedRoot(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "A", ".mcp.json"), `{}`)
+	writeFile(t, filepath.Join(root, "A", "B", "C", ".mcp.json"), `{}`)
+
+	for _, spelling := range []string{root, root + "/", root + "//", root + "/./A/.."} {
+		got := Scan(ScanConfig{
+			Roots:    []string{spelling},
+			MaxDepth: 3,
+			Accept:   acceptByBasename(".mcp.json"),
+		})
+		if len(got) != 1 {
+			t.Errorf("root %q: got %d results at depth limit 3, want 1: %v",
+				spelling, len(got), got)
+		}
+	}
+}
+
 func TestScan_NonexistentRootIgnored(t *testing.T) {
 	got := Scan(ScanConfig{
 		Roots:  []string{"/this/path/does/not/exist"},

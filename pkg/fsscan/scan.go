@@ -114,6 +114,13 @@ func resolveRoot(root, beneath string, seen map[rootKey]struct{}) (string, rootD
 		}
 		absRoot = resolved
 	}
+	// Cleaned even when already absolute, because depth is counted by separator arithmetic
+	// against this string and WalkDir builds children with filepath.Join, which cleans.
+	// Any separator the root carries that its children do not shifts every measurement: a
+	// root passed as "<home>/code/" counts one extra, so each child measures one level
+	// shallower and the walk descends one past MaxDepth. filepath.Abs cleans on its way
+	// out, so only the already-absolute branch arrived here unnormalised.
+	absRoot = filepath.Clean(absRoot)
 	if beneath != "" {
 		disposition := checkComponentsBeneath(absRoot, beneath)
 		if disposition != rootUsable {

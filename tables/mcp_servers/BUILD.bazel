@@ -4,6 +4,7 @@ go_library(
     name = "mcp_servers",
     srcs = [
         "classify.go",
+        "command.go",
         "discover.go",
         "identity.go",
         "jsonc.go",
@@ -28,6 +29,7 @@ go_test(
     name = "mcp_servers_test",
     srcs = [
         "classify_test.go",
+        "command_test.go",
         "discover_integration_test.go",
         "discover_symlink_unix_test.go",
         "mcp_servers_test.go",
