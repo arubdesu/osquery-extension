@@ -34,7 +34,10 @@ var errUnsupported = errors.New("fsscan: symlink-safe traversal requires POSIX o
 //
 // Left as is rather than papered over with case-folded path dedup, which would be wrong on a
 // case-sensitive volume. The consequence is duplicate paths on a platform where the subsequent
-// reads all fail anyway, and the table that uses this is registered on macOS only.
+// reads all fail anyway -- and this file builds for neither unix nor windows, which is exactly
+// the set of platforms where main.go does not register mcp_servers at all. An earlier version
+// of this sentence said the table was macOS-only; that stopped being true when Linux and
+// Windows support landed, and each of those has a real backend rather than this one.
 func rootKeyOf(string, os.FileInfo) (rootKey, bool) {
 	return rootKey{}, false
 }

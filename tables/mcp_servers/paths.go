@@ -34,8 +34,9 @@ func appSupportDir() string {
 }
 
 // appSupportDirFor takes the OS as a parameter so every platform's answer is reachable from
-// a test on any host. Only macOS has a CI runner and only macOS is developed on, so the
-// Windows and Linux spellings would otherwise be asserted by nothing at all.
+// a test on any host. The test, lint and coverage workflows run on ubuntu-latest and only the
+// build workflow runs on macOS, so no job executes the Darwin branch and none executes the
+// Windows one; parameterising the OS is what gets all three spellings asserted anywhere.
 func appSupportDirFor(goos string) string {
 	switch goos {
 	case "windows":

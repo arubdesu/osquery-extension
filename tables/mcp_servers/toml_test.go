@@ -137,6 +137,9 @@ func TestCodexTOMLParsersAgree(t *testing.T) {
 // Whichever parser ships, the rows have to come out sanitized the same way a JSON-sourced row
 // does: env values dropped, endpoint reduced to scheme and host, transport inferred.
 func TestCodexTOMLIsSanitizedLikeJSON(t *testing.T) {
+	// Valid https, credential in the userinfo and a token in the query -- the shape this
+	// reduction exists for, not malformed input. See the note in TestSanitizeRemoteURL:
+	// quoted with the credential masked, this line reads as though it had no scheme.
 	servers, err := extractCodexTOML([]byte(`
 [mcp_servers.remote]
 url = "https://user:pw@example.test/sse?token=abc"

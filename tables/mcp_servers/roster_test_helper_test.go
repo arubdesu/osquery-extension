@@ -68,22 +68,33 @@ func itoa(n int) string {
 	return string(digits)
 }
 
-// withoutRosterNotes drops diagnostics that describe the roster as a whole rather than one
-// account, so a test can assert what it is actually about.
+// withoutStandingNotes drops the diagnostics a platform raises on every run whatever the test
+// is about, so a test can assert what it is actually measuring.
 //
-// On Linux every run carries one: osquery's users table omits directory-served accounts
-// unless an expensive option is set, and the table says so. That is correct and must keep
-// firing, but it is not what a test counting discovered servers is measuring — and because
-// a constrained query repeats the note under each requested username, it inflates the
-// filtered counts too. Tests that assert exact row counts were written on macOS, where no
-// such note exists, and failed on Linux for a reason unrelated to their subject.
+// Two of them, one per platform, and neither is a defect:
 //
+// On Linux, a roster-level note. osquery's users table omits directory-served accounts unless
+// an expensive option is set, and the table says so. Because a constrained query repeats that
+// note under each requested username, it inflates filtered counts as well as unfiltered ones.
 // Identified structurally rather than by matching the message: a roster-level row is the one
 // whose source path is the users root, because there is no single home it belongs to.
-func withoutRosterNotes(rows []Server) []Server {
+//
+// On Windows, one roaming-application-data note per account. Resolving that location reads
+// the account's registry hive, and a fixture home is a temp directory with no hive and no
+// SID, so the lookup fails and every fake account draws the row. Identified by identity with
+// the constant the code emits, so improving the wording cannot silently stop the filter
+// working. The alternative -- mocking the hive -- would mean the tests no longer exercise the
+// resolution path they are wrapped around.
+//
+// Tests asserting exact row counts were written on macOS, where neither note exists, and
+// failed elsewhere for reasons unrelated to their subject.
+func withoutStandingNotes(rows []Server) []Server {
 	out := make([]Server, 0, len(rows))
 	for _, row := range rows {
 		if row.Warning != "" && row.SourcePath == fsscan.UsersRoot {
+			continue
+		}
+		if row.Warning == roamingUndeterminedNote {
 			continue
 		}
 		out = append(out, row)

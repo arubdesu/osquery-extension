@@ -133,8 +133,11 @@ func extractEnvelope(raw []byte) (envelopeEntries, int, error) {
 // Decoding the whole map in one Unmarshal meant a single entry with a wrong field type -- one
 // `"command": 123` -- failed the document and took every healthy server in the file with it.
 // A per-entry decode keeps the healthy ones. The skip count matters because a server that is
-// configured but unreadable is not the same as one that is absent, and an operator filtering
-// on an empty warning should not be shown a silently short list.
+// configured but unreadable is not the same as one that is absent, so the shortfall is said
+// out loud on a row of its own. Note what that does and does not buy: the diagnostic is a
+// separate row, so `warning = ”` selects the healthy servers and discards the notice with
+// the rest. Counting here is what makes the notice exist at all; reading it is the
+// operator's second query, and the README says so.
 func decodeInto(out map[string]rawServerEntry, in map[string]json.RawMessage) int {
 	skipped := 0
 	for name, value := range in {
@@ -205,12 +208,45 @@ func extractFlat(raw []byte) (map[string]rawServerEntry, int, error) {
 		}
 		if looksLikeServerEntry(entry) {
 			out[name] = entry
+			continue
+		}
+		// Decoded cleanly but holds nothing usable. In the envelope shapes every key under
+		// `mcpServers` is a server by construction, so decodeInto counts all of these. Here
+		// the siblings are arbitrary -- `$schema`, `inputs` -- and counting them would
+		// attach a "could not be decoded" warning to files that are perfectly fine.
+		//
+		// The distinguishing question is whether the object was *trying* to be a server
+		// entry. `{"command": null}` names a server key and produces nothing; `{"note":
+		// "hi"}` names none and is metadata. Before this, the first was dropped in silence:
+		// a file holding only that entry returned no rows and no warning, which reads as a
+		// file with no MCP servers in it.
+		if namesServerKey(value) {
+			skipped++
 		}
 	}
 	if len(out) == 0 {
 		return nil, skipped, nil
 	}
 	return out, skipped, nil
+}
+
+// namesServerKey reports whether a decoded-but-unusable object carried any of the keys that
+// would have made it a server entry, so the caller can tell a broken entry from a metadata
+// sibling. Keys only -- the values are what failed, so their contents say nothing.
+func namesServerKey(value json.RawMessage) bool {
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(value, &keys); err != nil {
+		return false
+	}
+	// The same set looksLikeServerEntry reads, by their JSON names. `env` and `disabled` are
+	// deliberately absent: neither makes an entry a server on its own, and an object holding
+	// only those is as likely to be configuration for something else.
+	for _, key := range []string{"command", "args", "url", "serverUrl", "httpUrl", "type", "transport"} {
+		if _, ok := keys[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func looksLikeServerEntry(e rawServerEntry) bool {

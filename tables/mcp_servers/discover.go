@@ -19,8 +19,15 @@ import (
 	"github.com/macadmins/osquery-extension/pkg/utils"
 )
 
-// MaxFileSize is the upper bound we'll read from any candidate JSON file. Anything
-// larger is skipped with a diagnostic, MCP configs are tiny in practice.
+// MaxFileSize is the upper bound we'll read from any candidate JSON file. Anything larger is
+// skipped with a diagnostic (fsscan reports "file exceeds N byte cap", which finishProcessing
+// turns into a warning row), so an oversized config costs an account its inventory but never
+// costs it silently.
+//
+// MCP configs proper are tiny. The one file that can outgrow this is ~/.claude.json, which is
+// not only configuration: Claude Code keeps per-project state in it, and on a long-lived
+// workstation that accumulates. Raising the cap trades a bounded read for a larger one on a
+// path that runs per account per query, so the bound stays and the warning is the contract.
 const MaxFileSize = 1 << 20 // 1 MiB
 
 // Server is the normalized record emitted by the discovery pipeline.
@@ -213,10 +220,22 @@ func DiscoverAll(ctx context.Context, clienter utils.OsqueryClienter, userFilter
 	// 'alice'` to whatever the generator returns, so an empty-user warning is discarded by
 	// the one query most likely to be asked, and Alice being past the profile cap or served
 	// only by LDAP produces the clean empty result the warning exists to prevent.
+	// Whether anything was emitted that says the roster itself may be incomplete. The
+	// missing-name diagnostic below points at such a row, and pointing at one that was
+	// never emitted told an operator to go read a warning that does not exist.
+	rosterUncertain := false
 	if enumerated.Truncated != "" {
 		out = append(out, rosterDiagnostic(userFilter, fsscan.UsersRoot, enumerated.Truncated)...)
+		rosterUncertain = true
 	}
 	scanned := make(map[string][]Server, len(enumerated.Homes))
+	// Which of the requested names the roster could say something about, so the ones it
+	// could not are answered explicitly below. Only built for a constrained query: an
+	// unconstrained one asked about nobody in particular and has nothing to miss.
+	var answered map[string]struct{}
+	if userFilter != nil {
+		answered = make(map[string]struct{}, len(userFilter))
+	}
 	// One row per skipped account, carrying that account's own name, identity and the path
 	// the roster claimed for it.
 	//
@@ -249,6 +268,7 @@ func DiscoverAll(ctx context.Context, clienter utils.OsqueryClienter, userFilter
 		// uncertainty under each name the query named.
 		if omission.Name == "" {
 			out = append(out, rosterDiagnostic(userFilter, path, omission.Warning())...)
+			rosterUncertain = true
 			continue
 		}
 		if userFilter != nil {
@@ -259,6 +279,9 @@ func DiscoverAll(ctx context.Context, clienter utils.OsqueryClienter, userFilter
 		row := diagnosticRow(omission.Name, path, "", omission.Warning())
 		row.UserID = omission.ID
 		out = append(out, row)
+		if answered != nil {
+			answered[omission.Name] = struct{}{}
+		}
 	}
 	if unusableHomes > 0 {
 		out = append(out, diagnosticRow("", fsscan.UsersRoot, "", fmt.Sprintf(
@@ -272,6 +295,13 @@ func DiscoverAll(ctx context.Context, clienter utils.OsqueryClienter, userFilter
 				continue
 			}
 		}
+		// Marked before the two branches below, not after. Both of them report on this
+		// account -- cancelled, or out of budget -- so an account that reached either one
+		// has been answered; counting it as unaccounted for would add a second row saying
+		// no such account exists.
+		if answered != nil {
+			answered[h.Name] = struct{}{}
+		}
 		// Checked per home, before Pass 1 runs. Direct-path reads take no context, so without
 		// this a cancelled query still performed ten opens per home for every home on the box.
 		if ctx.Err() != nil {
@@ -279,29 +309,95 @@ func DiscoverAll(ctx context.Context, clienter utils.OsqueryClienter, userFilter
 				"scan truncated: query cancelled before this user was scanned")}, h.ID)...)
 			continue
 		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			// Say so per user rather than stopping quietly. A user who was never scanned
-			// and a user with no MCP configuration are otherwise the same empty answer,
-			// which is the confusion the truncation contract exists to prevent.
-			out = append(out, stampUserID([]Server{diagnosticRow(h.Name, h.Path, "",
-				"scan truncated: walk budget exhausted before this user was scanned")}, h.ID)...)
-			continue
-		}
 		// Scanned once per directory, reported once per account. Accounts legitimately
 		// share a home, and the roster now keeps every one of them so a constrained query
 		// cannot lose an account another had claimed -- which means the duplicate work has
 		// to be avoided here instead, after the filter, rather than by discarding accounts
 		// before it.
+		//
+		// Looked up before the budget is consulted, not after. The budget question is
+		// whether there is time to do *new* filesystem work, and restamping a result
+		// already in hand is none: two accounts sharing a home, where the first one's scan
+		// spent the last of the allowance, had the second told "walk budget exhausted
+		// before this user was scanned" about a home that had just been scanned in full.
+		// The statement was false and it cost the account every row the cache was holding
+		// for it.
 		key := scanKey(h)
 		rows, cached := scanned[key]
 		if !cached {
-			rows = discoverForHome(ctx, h, remaining)
+			if time.Until(deadline) <= 0 {
+				// Say so per user rather than stopping quietly. A user who was never
+				// scanned and a user with no MCP configuration are otherwise the same
+				// empty answer, which is the confusion the truncation contract exists to
+				// prevent.
+				out = append(out, stampUserID([]Server{diagnosticRow(h.Name, h.Path, "",
+					"scan truncated: walk budget exhausted before this user was scanned")}, h.ID)...)
+				continue
+			}
+			rows = discoverForHome(ctx, h, deadline)
 			scanned[key] = rows
 		}
 		out = append(out, stampUserID(copyRowsFor(rows, h.Name), h.ID)...)
 	}
+	// A rostered account that cannot log in. Skipped on purpose -- it keeps no editor or
+	// agent configuration -- and silent unless someone asked for it by name, because a host
+	// carries dozens of them and a row each would bury the omissions that matter. Asked for
+	// by name it gets a real answer, which is the whole point of separating these from the
+	// names the roster never mentioned: "daemon cannot log in" and "there is no daemon" are
+	// different facts and only one of them is true.
+	if userFilter != nil {
+		for _, omission := range enumerated.NonLogin {
+			if _, ok := userFilter[omission.Name]; !ok {
+				continue
+			}
+			path := omission.Path
+			if path == "" {
+				path = fsscan.UsersRoot
+			}
+			row := diagnosticRow(omission.Name, path, "", omission.Warning())
+			row.UserID = omission.ID
+			out = append(out, row)
+			if answered != nil {
+				answered[omission.Name] = struct{}{}
+			}
+		}
+	}
+	// A name the roster never mentioned at all. Returning nothing for it is the one answer
+	// this table refuses to give: `WHERE user = 'bob'` coming back empty reads as "bob has
+	// no MCP servers", when what happened is that osquery's users table has no bob -- a
+	// typo, a deleted account, or an account the roster does not enumerate. Every other
+	// branch in this function exists to stop exactly that confusion; the requested name
+	// nobody accounted for was the one path still taking it.
+	for _, name := range unanswered(userFilter, answered) {
+		// The cause depends on whether anything else in this result questioned the roster.
+		// With no roster-level warning emitted, the roster answered in full and the name is
+		// genuinely absent; claiming otherwise sent an operator looking for a companion row
+		// that is not there. With one emitted, the name may simply be behind it.
+		reason := "the roster reported no limits of its own, so the name is absent rather " +
+			"than unreported: it may be misspelled, or the account may have been removed"
+		if rosterUncertain {
+			reason = "the name may be misspelled, the account may have been removed, or it " +
+				"may be one the roster does not enumerate -- a roster-level warning " +
+				"alongside this row says which"
+		}
+		out = append(out, diagnosticRow(name, fsscan.UsersRoot, "",
+			"no account of this name is in the roster osquery returned, so nothing was "+
+				"scanned for it; "+reason))
+	}
 	return out
+}
+
+// unanswered returns the requested usernames no home and no omission accounted for, sorted
+// because map iteration is random and these rows go straight to osquery.
+func unanswered(userFilter, answered map[string]struct{}) []string {
+	var names []string
+	for name := range userFilter {
+		if _, ok := answered[name]; !ok {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 // discoverForHome runs both discovery passes against one user home and returns
@@ -327,6 +423,15 @@ func stampUserID(rows []Server, id string) []Server {
 	return rows
 }
 
+// roamingUndeterminedNote is raised for an account whose Roaming AppData location could not
+// be read at all. Named rather than written inline because a Windows test fixture cannot
+// supply a registry hive, so every fixture account draws this row and the tests have to
+// recognise it -- structurally, by identity with this constant, rather than by matching a
+// sentence that will drift the first time the wording is improved.
+const roamingUndeterminedNote = "roaming application data location could not be determined " +
+	"for this account, so its editor and agent configuration may not be listed; the " +
+	"conventional location was scanned instead"
+
 // roamingRootFor reports the account's roaming application-data directory and, when the
 // answer is not the conventional one, a diagnostic describing why.
 //
@@ -341,9 +446,7 @@ func roamingRootFor(account fsscan.UserHome) (root, note string) {
 	}
 	resolved, redirected, ok := fsscan.RoamingAppDataFor(account.ID, account.Path)
 	if !ok {
-		return "", "roaming application data location could not be determined for this " +
-			"account, so its editor and agent configuration may not be listed; the " +
-			"conventional location was scanned instead"
+		return "", roamingUndeterminedNote
 	}
 	if !redirected {
 		return "", ""
@@ -449,7 +552,12 @@ func rosterDiagnostic(userFilter map[string]struct{}, path, warning string) []Se
 	return rows
 }
 
-func discoverForHome(ctx context.Context, account fsscan.UserHome, budget time.Duration) []Server {
+// deadline is absolute rather than a remaining duration. A duration is re-based on arrival,
+// so everything this function does before re-basing it -- the home open below, which on a
+// network-backed or automounted home can block for the mount timeout -- fell outside the
+// budget and the home then received the whole of it again. One home overshooting the
+// query-wide deadline by its own open time is small; every home doing it is not.
+func discoverForHome(ctx context.Context, account fsscan.UserHome, deadline time.Time) []Server {
 	user, home := account.Name, account.Path
 
 	// One row when the home itself cannot be opened, rather than one per candidate inside
@@ -465,9 +573,14 @@ func discoverForHome(ctx context.Context, account fsscan.UserHome, budget time.D
 		_ = handle.Close()
 	}
 
-	// Before the deadline, deliberately: resolving this reads a registry hive, which is
-	// work the budget must cover rather than work that happens outside it.
-	deadline := time.Now().Add(budget)
+	// Charged against the same deadline the open just ran under. Opening a home on a dead
+	// automount can consume most of a budget, and continuing into a full walk afterwards
+	// spends time the query no longer has.
+	if time.Until(deadline) <= 0 {
+		return []Server{diagnosticRow(user, home, "",
+			"scan truncated: the walk budget was exhausted opening this account's home "+
+				"directory, so none of its configuration is listed")}
+	}
 
 	// Where this account actually keeps roaming application data. On Windows that is a
 	// per-user known folder a policy can redirect; everywhere else it is a fixed subpath of
@@ -544,6 +657,19 @@ func discoverForHome(ctx context.Context, account fsscan.UserHome, budget time.D
 
 	// Pass 2: walker over high-signal dev dirs
 	walkRoots, profileClients := buildWalkRoots(home, appData)
+	// Re-read after buildWalkRoots, not before it. That function Lstats and Readlinks its way
+	// through the snap and flatpak profile roots, so the deadline can pass inside it -- and
+	// ScanContext applies a timeout only when cfg.Timeout is positive, treating zero as "no
+	// timeout". Computing the remaining time directly in the ScanConfig literal therefore had
+	// a window where a query that had just exhausted its budget started an unbounded walk.
+	// The directory and file caps do not close it: WalkDir reads a whole directory before any
+	// callback, so neither cap interrupts one enormous or stalled read.
+	walkBudget := time.Until(deadline)
+	if walkBudget <= 0 {
+		return append(out, diagnosticRow(user, home, "",
+			"scan truncated: the walk budget was exhausted resolving this user's project "+
+				"directories, so the project-local walk did not run"))
+	}
 	if len(walkRoots) > 0 {
 		// ScanContext rather than Scan, because Scan discards the truncation flag along with
 		// the error, and a walk that quietly returns fewer rows is indistinguishable from a
@@ -567,7 +693,7 @@ func discoverForHome(ctx context.Context, account fsscan.UserHome, budget time.D
 			// while the paths it returns still read as though they were inside it.
 			Beneath:  home,
 			MaxDepth: 6, // up to monorepo/packages/foo/.cursor/mcp.json
-			Timeout:  time.Until(deadline),
+			Timeout:  walkBudget,
 			Accept: func(path string, d fs.DirEntry) bool {
 				if _, ok := walkableBasenames[d.Name()]; ok {
 					return true
@@ -1035,9 +1161,27 @@ func transportFromRawURL(rawURL string, args []string) string {
 	return guessRemoteTransport(rawURL, args)
 }
 
+// normalizeTransport maps a declared transport onto the documented set, and distinguishes a
+// field that was not supplied from one that was supplied and is not recognised.
+//
+// The difference decides whether the caller may guess. An absent transport is an invitation
+// to infer one from the URL or the command; a present but unfamiliar one is a statement
+// about the file, and overwriting it reports something the file does not say. A config
+// declaring `"type": "websocket"` beside an `https://` URL was reported as `transport=http`,
+// so a transport this table does not support was indistinguishable from one it does -- and
+// the next transport MCP adds would arrive disguised as an existing protocol rather than
+// showing up as something to look at.
+//
+// "unknown" is already one of the four documented values of this column, so reporting it
+// costs no schema change and is what a reader filtering for the supported set already
+// excludes.
 func normalizeTransport(t1, t2 string) string {
+	declared := false
 	for _, t := range [2]string{t1, t2} {
-		switch strings.ToLower(t) {
+		if strings.TrimSpace(t) != "" {
+			declared = true
+		}
+		switch strings.ToLower(strings.TrimSpace(t)) {
 		case "stdio":
 			return "stdio"
 		case "sse":
@@ -1045,6 +1189,9 @@ func normalizeTransport(t1, t2 string) string {
 		case "http", "streamable-http", "streamablehttp":
 			return "http"
 		}
+	}
+	if declared {
+		return "unknown"
 	}
 	return ""
 }

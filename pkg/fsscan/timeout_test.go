@@ -90,3 +90,42 @@ func TestWalkTimeoutHonoursEnvOverride(t *testing.T) {
 		}
 	}
 }
+
+// A negative Timeout means expired, not unlimited.
+//
+// Zero is documented as "no timeout", and a caller computing `time.Until(deadline)` from a
+// deadline that has already passed produces a negative value. Reading that as zero gave the
+// one caller who had proved it was out of time an unbounded walk, which is the most
+// dangerous possible reading of the value.
+func TestNegativeTimeoutIsExpiredNotUnlimited(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "found.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	accept := func(_ string, d fs.DirEntry) bool { return d.Name() == "found.json" }
+
+	expired, err := ScanContext(context.Background(), ScanConfig{
+		Roots: []string{root}, Timeout: -time.Second, Accept: accept,
+	})
+	if err != nil {
+		t.Fatalf("an expired budget is a truncation, not an error: %v", err)
+	}
+	if len(expired.Paths) != 0 {
+		t.Errorf("walked %d path(s) on an already-expired budget: %v", len(expired.Paths), expired.Paths)
+	}
+	if !expired.Truncated {
+		t.Error("an expired budget returned no truncation flag, so a short result reads as complete")
+	}
+
+	// Zero still means no timeout, which is the documented behaviour and what most callers
+	// rely on. Pinned so the guard above cannot be widened into it by accident.
+	unbounded, err := ScanContext(context.Background(), ScanConfig{
+		Roots: []string{root}, Timeout: 0, Accept: accept,
+	})
+	if err != nil {
+		t.Fatalf("zero timeout: %v", err)
+	}
+	if len(unbounded.Paths) != 1 {
+		t.Errorf("zero timeout walked %d path(s), want 1: zero means no timeout", len(unbounded.Paths))
+	}
+}

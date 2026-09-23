@@ -111,7 +111,7 @@ var launcherIdentity = map[string]func(s *Server, args []string){
 	},
 	"uvx": func(s *Server, args []string) {
 		s.PackageManager = "uvx"
-		assignIfClean(s, firstPositional(args), splitPyPISpec)
+		assignIfClean(s, uvxIdentity(args), splitPyPISpec)
 	},
 	"uv": func(s *Server, args []string) {
 		s.PackageManager = "uv"
@@ -205,35 +205,60 @@ func guessRemoteTransport(u string, args []string) string {
 //
 // Only options that take a separate value need listing; the `--flag=value` form carries its
 // own value and is skipped by the dash prefix.
+//
+// Two rules govern what may be added here, both learned the hard way.
+//
+// An option whose value IS the package must never be listed. `uvx --from httpx httpx-cli`
+// names httpx as the package and httpx-cli as the command to run inside it, so listing
+// `--from` here would skip the package and report the command. Both launchers read it
+// explicitly instead -- uvxIdentity and uvRunIdentity -- and this map has to stay out of
+// their way. Leaving it to the generic positional scan was the earlier arrangement and it
+// was wrong: it worked only while the value happened to be package-shaped, and a Git spec
+// is not, so the scan walked past it and reported the command.
+//
+// A boolean must never be listed either, because it would consume the real package and
+// empty the identity. `--quiet`/`-q` and `--verbose`/`-v` are the trap: uv documents them
+// with an argument-looking `<COLOR_CHOICE>`-style signature in some renderings, and they are
+// counters that take nothing.
+//
+// KNOWN GAP: one map is shared by npx, uvx and pipx,
+// which do not share a grammar, and no launcher's grammar is modelled completely. Docker is
+// not among them: dockerRunIdentity enumerates the booleans instead and assumes everything
+// else consumes a value, which is the inversion that made its scan stable.
+// An unlisted value option still donates its value to package_name -- `uvx --color always
+// real-server` reported package_name=always before `--color` was added below, and the next
+// unlisted one will do the same. The structural fix is per-launcher arity; the alternative
+// offered in review, treating every unknown option as value-taking, empties the identity of
+// every row carrying an ordinary boolean flag, which trades a narrow wrong answer for a
+// broad missing one. That trade wants a decision rather than a patch.
 var runnerValueFlags = map[string]struct{}{
 	"--python": {}, "-p": {}, "--with": {}, "--index": {}, "--index-url": {},
 	"--extra-index-url": {}, "--find-links": {}, "--constraint": {}, "-c": {},
 	"--registry": {}, "--cache-dir": {}, "--refresh-package": {}, "--prerelease": {},
 	"--resolution": {}, "--exclude-newer": {}, "--config-file": {}, "--directory": {},
 	"--project": {}, "--package": {},
+	// Added from the uv CLI reference after `uvx --color always real-server` was reported
+	// as package_name=always. Short spellings included because the separated form accepts
+	// either.
+	"--color": {}, "--index-strategy": {}, "--keyring-provider": {}, "--link-mode": {},
+	"--python-platform": {}, "--with-editable": {}, "--with-requirements": {}, "-w": {},
+	"--default-index": {}, "-i": {}, "-f": {}, "--config-setting": {},
+	"--config-settings": {}, "-C": {}, "--no-binary-package": {},
+	"--prerelease-package": {}, "--reinstall-package": {}, "--upgrade-package": {},
+	"-P": {}, "--upgrade-group": {}, "--allow-insecure-host": {}, "--trusted-host": {},
 }
 
 // firstPositional returns the first non-flag argument that passes looksLikePackageSpec,
 // skipping any argument consumed as a value by the option before it. Rejected candidates are
 // walked past so a credential URL appearing before the real package (e.g.
 // `--registry https://u:p@h pkg`) does not permanently mask identity inference.
+//
+// The launchers that take a subcommand need the same scan starting one token later, so there
+// is one implementation and this names the no-subcommand case. Two byte-identical copies of
+// the loop lived here before, which is one copy too many for a scan that decides what lands
+// in package_name: a guard added to either would have protected only its own callers.
 func firstPositional(args []string) string {
-	for i, a := range args {
-		if strings.HasPrefix(a, "-") {
-			continue
-		}
-		if i > 0 {
-			if _, consumed := runnerValueFlags[args[i-1]]; consumed {
-				continue
-			}
-		}
-		if looksLikePackageSpec(a) {
-			return a
-		}
-		// Else: not a flag but also not package-spec-shaped (URL, path,
-		// tarball, etc.). Skip and keep looking.
-	}
-	return ""
+	return firstOperandAfter(args, "")
 }
 
 func npxIdentity(args []string) (spec, ver string) {
@@ -242,66 +267,115 @@ func npxIdentity(args []string) (spec, ver string) {
 	// The scan covers every argument including the last. Only the two-token form has to look
 	// ahead, so only that branch is guarded; bounding the whole loop at len(args)-1 meant an
 	// inline `--package=pkg@1.2.3` in final position was never seen.
-	for i := 0; i < len(args); i++ {
-		if strings.HasPrefix(args[i], "--package=") {
-			spec = strings.TrimPrefix(args[i], "--package=")
-			_, ver = splitNPMSpec(spec)
-			return
-		}
-		if (args[i] == "--package" || args[i] == "-p") && i+1 < len(args) {
-			spec = args[i+1]
-			_, ver = splitNPMSpec(spec)
-			return
-		}
+	//
+	// Bounded at the first positional, because past that point the options belong to the
+	// program npx launched rather than to npx. `npx real-package --package evil` reported
+	// evil: the server's own --package option, read as though npx had been asked to install
+	// it. Whatever a launched MCP server chooses to call its flags is outside this table's
+	// control, so the scan has to stop where the launcher's grammar does.
+	if value, found := launcherOptionValue(args, npxGrammar, npxPackageFlags); found {
+		spec = value
+		_, ver = splitNPMSpec(spec)
+		return
 	}
-	spec = firstNonFlag(args)
+	// The full list, not the option prefix: the package npx runs *is* the first positional,
+	// so the fallback has to see past where the option walk stops.
+	spec = firstPositional(args)
 	_, ver = splitNPMSpec(spec)
 	return
 }
 
-// firstNonFlag returns the first arg that doesn't start with '-' AND passes
-// looksLikePackageSpec. Continues past rejected candidates (credential URLs,
-// file paths) so identity isn't lost when one of those precedes the real
-// package in args. Does not allocate.
-func firstNonFlag(args []string) string {
-	for i, a := range args {
-		if strings.HasPrefix(a, "-") {
-			continue
-		}
-		if i > 0 {
-			if _, consumed := runnerValueFlags[args[i-1]]; consumed {
-				continue
-			}
-		}
-		if looksLikePackageSpec(a) {
-			return a
-		}
+// uvxIdentity resolves `uvx`, where --from names the package and the trailing token names
+// the command inside it.
+//
+// firstPositional was doing this, and it was right only while the package happened to be
+// package-shaped: `uvx --from httpx httpx-cli` reported httpx because the option was skipped
+// as a flag and its value was simply the first positional. Give --from a value the grammar
+// rejects -- `uvx --from git+https://github.com/acme/mcp-suite.git actual-server`, the
+// Git-backed form Astral documents -- and the scan walked past it and reported
+// actual-server, the command the package exports, as the package itself.
+//
+// When --from is present it *is* the identity. If its value cannot be represented, the
+// identity is empty: assignIfClean rejects it and nothing after it is consulted.
+func uvxIdentity(args []string) string {
+	if value, found := launcherOptionValue(args, uvGrammar, uvFromFlag); found {
+		return value
 	}
+	return firstPositional(args)
+}
+
+// uvRunIdentity resolves `uv run --from <pkg>` and `uv tool run <pkg>`.
+//
+// Both halves used to cross the boundary. The --from search now stops at the first operand,
+// and the tool-run fallback no longer rescans the whole vector for the words: it searched
+// for any adjacent `tool run` anywhere, so `uv run actual-command tool run fake-package`
+// found the pair inside the launched command's own arguments and reported fake-package. The
+// other direction was broken too -- subcommands were recognised only at argument zero, so
+// `uv --color always run --from real-package command` lost the identity to a global option.
+func uvRunIdentity(args []string) string {
+	rest, toolRun, found := uvSubcommandArgs(args)
+	if !found {
+		return ""
+	}
+	if value, ok := launcherOptionValue(rest, uvGrammar, uvFromFlag); ok {
+		return value
+	}
+	if toolRun {
+		// `uv tool run <pkg>`: the package is the first operand of the subcommand.
+		return firstPositional(rest)
+	}
+	// Plain `uv run <cmd>` runs a command from the project environment. That names no
+	// package, and reporting the command as one is the confusion this function exists to
+	// avoid.
 	return ""
 }
 
-func uvRunIdentity(args []string) string {
-	// Look for `uv run --from <pkg>` or `uv tool run <pkg>`.
-	for i := 0; i < len(args)-1; i++ {
-		if args[i] == "--from" {
-			return args[i+1]
-		}
+// uvSubcommandArgs skips uv's global options and the one top-level subcommand path,
+// returning what follows it. found is false when neither `run` nor `tool run` is reached
+// before the first operand, so a later occurrence among the launched command's arguments is
+// never mistaken for the subcommand.
+func uvSubcommandArgs(args []string) (rest []string, toolRun, found bool) {
+	index := skipLeadingOptions(args, uvGrammar)
+	switch {
+	case index+1 < len(args) && args[index] == "tool" && args[index+1] == "run":
+		return args[index+2:], true, true
+	case index < len(args) && args[index] == "run":
+		return args[index+1:], false, true
 	}
-	// `uv tool run --python 3.12 actual-server` returned --python, because this indexed to
-	// run+2 without regard for what sat there.
-	for i := 0; i < len(args)-1; i++ {
-		if args[i] == "tool" && args[i+1] == "run" {
-			return firstOperandAfter(args[i+1:], "run")
+	return nil, false, false
+}
+
+// skipLeadingOptions returns the index of the first argument that is not one of the
+// launcher's own options, consuming the value of any option that takes one.
+func skipLeadingOptions(args []string, grammar launcherGrammar) int {
+	index := 0
+	for index < len(args) {
+		argument := args[index]
+		if argument == "--" || !strings.HasPrefix(argument, "-") {
+			return index
 		}
+		name, _, hasInline := strings.Cut(argument, "=")
+		if hasInline {
+			index++
+			continue
+		}
+		_, takesValue := grammar.valueFlags[name]
+		if !takesValue {
+			_, takesValue = runnerValueFlags[name]
+		}
+		if takesValue {
+			index += 2
+			continue
+		}
+		index++
 	}
-	return ""
+	return index
 }
 
 func pipxIdentity(args []string) string {
-	for i := 0; i < len(args)-1; i++ {
-		if args[i] == "--spec" {
-			return args[i+1]
-		}
+	// Bounded like the others: `pipx run server --spec evil` names the server's option.
+	if value, found := launcherOptionValue(args, pipxGrammar, pipxSpecFlag); found {
+		return value
 	}
 	// `pipx run --python 3.12 actual-server` returned 3.12: the scan skipped flags but not
 	// the values they consume, and 3.12 is name-shaped so no grammar rejects it either.
@@ -312,10 +386,11 @@ func pipxIdentity(args []string) string {
 // argument consumed as a value by the option before it, and requiring the result to be
 // package-shaped.
 //
-// One scanner for the launchers that take a subcommand. Each of pipx, uv and docker previously
-// had its own partial version: pipx skipped flags but not their values, uv indexed blindly to
-// run+2, and docker maintained a hand-written list of value-taking options that kept needing
-// additions. Arity comes from runnerValueFlags, which they now share.
+// One scanner for the launchers that take a subcommand. pipx and uv each had their own
+// partial version before: pipx skipped flags but not their values, and uv indexed blindly to
+// run+2. Arity comes from runnerValueFlags, which they share. Docker went the other way and
+// kept its own parser -- a hand-written list of value-taking options needed an addition every
+// time one produced a wrong image, so dockerRunIdentity enumerates the booleans instead.
 func firstOperandAfter(args []string, subcommand string) string {
 	started := subcommand == ""
 	for i, argument := range args {
@@ -332,10 +407,24 @@ func firstOperandAfter(args []string, subcommand string) string {
 			if _, consumed := runnerValueFlags[args[i-1]]; consumed {
 				continue
 			}
+			// A value belonging to an option whose *name* says it carries a credential.
+			// runnerValueFlags cannot be complete -- every launcher keeps adding options,
+			// and the entries here were each added after a wrong package name was seen --
+			// so the arity list alone lets `uvx --auth-token opaquevalue real-server`
+			// report the token as the package. An opaque value is exactly what redactSecret
+			// cannot recognise on its way out, and package_name is emitted verbatim.
+			//
+			// Skipping the whole dangerous subset needs no arity knowledge: the option
+			// named it. redactArgs already refuses the same values for the same reason.
+			if isSecretFlagName(args[i-1]) {
+				continue
+			}
 		}
 		if looksLikePackageSpec(argument) {
 			return argument
 		}
+		// Else: not a flag but also not package-spec-shaped (URL, path, tarball, etc.).
+		// Skip and keep looking.
 	}
 	return ""
 }
@@ -483,10 +572,238 @@ var dockerNegatableValueFlags = map[string]struct{}{
 	"--blkio-weight": {}, "--cpu-period": {}, "--cpu-quota": {},
 }
 
+// launcherGrammar is the little that has to be known about a launcher's command line to walk
+// its own options without straying into the launched program's.
+//
+// An index into the argument list is not enough, which is how the first attempt at this went
+// wrong: the caller rescanned the prefix without knowing which tokens had been consumed as
+// values, so `python -c -m evilmod` reported evilmod -- the argument of -c, read a second
+// time as though it were python's own -m. The walk has to be the thing that answers the
+// question, not a boundary handed to something that asks it again.
+type launcherGrammar struct {
+	// subcommandPaths are the subcommand words that may precede the options, longest first
+	// and matched only at the start, so a later occurrence is the operand it actually is.
+	subcommandPaths [][]string
+	// valueFlags take a separate value, consumed whatever it looks like -- including when
+	// it begins with a dash, which is what `-c -m` needs.
+	valueFlags map[string]struct{}
+}
+
+var (
+	npxGrammar = launcherGrammar{}
+	// No subcommandPaths: uv's top-level shape is parsed by uvSubcommandArgs, which has to
+	// tell a subcommand in its own position from the same word among the launched
+	// command's arguments. This grammar describes only what follows it.
+	uvGrammar = launcherGrammar{
+		valueFlags: map[string]struct{}{"--from": {}},
+	}
+	pipxGrammar = launcherGrammar{
+		subcommandPaths: [][]string{{"run"}},
+		valueFlags:      map[string]struct{}{"--spec": {}},
+	}
+
+	// pythonLongValueFlags are the interpreter's long options that take a separate value.
+	// The short options cluster and are read character by character instead; see
+	// pythonShortCluster.
+	pythonLongValueFlags = map[string]struct{}{"--check-hash-based-pycs": {}}
+
+	npxPackageFlags = map[string]struct{}{"--package": {}, "-p": {}}
+	uvFromFlag      = map[string]struct{}{"--from": {}}
+	pipxSpecFlag    = map[string]struct{}{"--spec": {}}
+)
+
+// launcherOptionValue walks a launcher's own options and returns the value assigned to the
+// first option in want, stopping where the launcher's options stop.
+//
+// Every scanner in this file used to read the whole argument list, so an option belonging to
+// the launched server was indistinguishable from one belonging to the launcher: an MCP
+// server free to accept --package, --from or --spec had its argument reported as what was
+// installed. Three things end the launcher's options, and each was a way through before it
+// was handled -- a bare positional, `--`, and a value that happens to look like an option.
+func launcherOptionValue(args []string, grammar launcherGrammar, want map[string]struct{}) (string, bool) {
+	index := consumeSubcommands(args, grammar.subcommandPaths)
+	for index < len(args) {
+		argument := args[index]
+		switch {
+		case argument == "--":
+			// Everything after this is an operand by definition.
+			return "", false
+		case strings.HasPrefix(argument, "-"):
+			name, inlineValue, hasInline := strings.Cut(argument, "=")
+			if _, wanted := want[name]; wanted {
+				if hasInline {
+					return inlineValue, true
+				}
+				if index+1 < len(args) {
+					return args[index+1], true
+				}
+				return "", false
+			}
+			if hasInline {
+				// The inline form carries its own value and consumes nothing.
+				index++
+				continue
+			}
+			_, takesValue := grammar.valueFlags[name]
+			if !takesValue {
+				_, takesValue = runnerValueFlags[name]
+			}
+			if takesValue {
+				index += 2
+				continue
+			}
+			index++
+		default:
+			// A positional that is not a subcommand: the launched program begins here.
+			return "", false
+		}
+	}
+	return "", false
+}
+
+// consumeSubcommands returns how many leading arguments are subcommand words, matching the
+// longest declared path. Only at the start, so a later occurrence of the same word is the
+// operand it actually is.
+func consumeSubcommands(args []string, paths [][]string) int {
+	for _, path := range paths {
+		if len(path) > len(args) {
+			continue
+		}
+		matched := true
+		for offset, word := range path {
+			if args[offset] != word {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return len(path)
+		}
+	}
+	return 0
+}
+
+// CPython's single-dash options cluster, and the cluster decides what the rest of the
+// command line means. Verified against python3 3.9.6 rather than read off the grammar:
+// `-um this`, `-umthis`, `-OOm this` and `-qIm this` all run the module, and
+// `-ucprint(9) -m evilmod` prints 9 -- the -c command ran and `-m evilmod` was its argv.
+const (
+	// Options taking no argument. A cluster runs through these to whatever follows.
+	//
+	// -P is deliberately absent although current CPython accepts it: it arrived in 3.11,
+	// and this table resolves no interpreter -- the launchers it knows are the
+	// version-neutral names `python` and `python3`. On 3.9.6 `python3 -Pm this` exits with
+	// "Unknown option: -P" and runs nothing, so accepting the letter asserts a module for
+	// an invocation that never executed. Leaving it out costs the identity of a clustered
+	// `-Pm` on 3.11 and newer, which is the empty answer this file prefers to a wrong one.
+	// Modelling a 3.11 baseline instead would have to be a stated, tested decision.
+	pythonBooleanShorts = "bBdEiIOqRsSuvx"
+	// Options that print and exit, so nothing is run and nothing is installed.
+	pythonTerminatingShorts = "hV?"
+	// The four that take an argument -- c, m, W and X -- are named directly in the switch
+	// below rather than listed here, because each one does something different with it and
+	// a parallel list would be a second copy to keep in agreement for no gain.
+)
+
+// pythonClusterOutcome says what a short-option cluster leaves the caller to do.
+type pythonClusterOutcome int
+
+const (
+	pythonClusterDone       pythonClusterOutcome = iota // booleans only; nothing consumed
+	pythonClusterModule                                 // the module was attached to the cluster
+	pythonClusterModuleNext                             // an -m ended the cluster: the module is next
+	pythonClusterValueNext                              // a -W or -X ended it: its value is next
+	pythonClusterStop                                   // no module can follow
+)
+
+// pythonShortCluster interprets one single-dash group, left to right, the way CPython's own
+// parser does: a boolean letter yields to the next, and the first value-taking letter claims
+// the rest of the cluster or the following token.
+func pythonShortCluster(group string) (string, pythonClusterOutcome) {
+	for position := 0; position < len(group); position++ {
+		letter := group[position]
+		rest := group[position+1:]
+		switch {
+		case strings.IndexByte(pythonBooleanShorts, letter) >= 0:
+			continue
+		case letter == 'm':
+			if rest != "" {
+				return rest, pythonClusterModule
+			}
+			return "", pythonClusterModuleNext
+		case letter == 'c':
+			// python is running a command string. Everything after it, including a later
+			// -m, is that command's argv and python never reads it as an option.
+			return "", pythonClusterStop
+		case letter == 'W' || letter == 'X':
+			if rest != "" {
+				return "", pythonClusterDone
+			}
+			return "", pythonClusterValueNext
+		case strings.IndexByte(pythonTerminatingShorts, letter) >= 0:
+			return "", pythonClusterStop
+		default:
+			// A letter this does not model. Failing closed is the point: letting the scan
+			// continue is how a cluster containing an unrecognised c-like option would let
+			// a later -m manufacture an identity out of the command's own arguments.
+			return "", pythonClusterStop
+		}
+	}
+	return "", pythonClusterDone
+}
+
+// pythonModule returns the module named by -m, which python accepts only among its own
+// options: everything after the module or script belongs to that program.
+//
+// Read here rather than through the generic option walk for two reasons, and the second was
+// a false positive rather than a gap. CPython attaches a short option's argument to the
+// option itself, so `-mhttp.server` is one token and went unreported. And it clusters them,
+// so `-ucprint(9) -m evilmod` hid a -c inside a group this used to skip as a boolean: the
+// scan continued and reported evilmod, the argv of the command python actually ran. A
+// comment here claimed the parser failed toward an empty answer. For clusters it did not.
 func pythonModule(args []string) string {
-	for i := 0; i < len(args)-1; i++ {
-		if args[i] == "-m" {
-			return args[i+1]
+	for index := 0; index < len(args); index++ {
+		argument := args[index]
+		switch {
+		case argument == "--" || argument == "-":
+			// Both end the interpreter's options: past -- everything is a file name, and a
+			// lone - selects stdin.
+			return ""
+		case !strings.HasPrefix(argument, "-"):
+			// The script. Its arguments are its own.
+			return ""
+		case strings.HasPrefix(argument, "--"):
+			// --check-hash-based-pycs is the only long option CPython documents that does
+			// not end the run. Everything else prints and exits -- --help, --help-env,
+			// --help-xoptions, --help-all, --version -- and an unrecognised one is an
+			// error. Verified: `python3 --version -m this` prints the version and does not
+			// run the module, and `--definitely-unknown` exits with "unknown option".
+			// Treating them as harmless booleans and continuing let a later -m report a
+			// module for a command that executed nothing, which is the same false identity
+			// the cluster parser exists to prevent.
+			name, _, hasInline := strings.Cut(argument, "=")
+			if _, takesValue := pythonLongValueFlags[name]; takesValue {
+				if !hasInline {
+					index++
+				}
+				continue
+			}
+			return ""
+		}
+		module, outcome := pythonShortCluster(argument[1:])
+		switch outcome {
+		case pythonClusterModule:
+			return module
+		case pythonClusterModuleNext:
+			if index+1 < len(args) {
+				return args[index+1]
+			}
+			return ""
+		case pythonClusterValueNext:
+			index++
+		case pythonClusterStop:
+			return ""
+		case pythonClusterDone:
 		}
 	}
 	return ""

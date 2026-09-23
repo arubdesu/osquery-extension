@@ -9,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // Everything here is unix-only for one of two reasons: it needs mkfifo, or it exercises
@@ -477,5 +479,40 @@ func TestScan_DedupesAcrossRoots(t *testing.T) {
 	})
 	if len(got) != 1 {
 		t.Errorf("expected 1 (dedup), got %d: %v", len(got), got)
+	}
+}
+
+// Every descriptor OpenBeneath opens carries FD_CLOEXEC.
+//
+// os.OpenFile sets it because the runtime does that for every fd it owns, but the traversal
+// is built out of unix.Open and unix.Openat, which are raw syscalls and do not. This is one
+// process hosting many tables and several of them shell out, so an fd left inheritable is a
+// handle onto another user's home directory surviving into an unrelated subprocess -- past
+// every check this package makes to obtain it.
+func TestOpenBeneathDescriptorsAreCloseOnExec(t *testing.T) {
+	home := t.TempDir()
+	nested := filepath.Join(home, "Library", "Application Support", "Claude")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(nested, "claude_desktop_config.json")
+	if err := os.WriteFile(target, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := OpenBeneath(home, filepath.Join("Library", "Application Support", "Claude",
+		"claude_desktop_config.json"))
+	if err != nil {
+		t.Fatalf("OpenBeneath: %v", err)
+	}
+	defer func() { _ = file.Close() }()
+
+	flags, err := unix.FcntlInt(file.Fd(), unix.F_GETFD, 0)
+	if err != nil {
+		t.Fatalf("F_GETFD: %v", err)
+	}
+	if flags&unix.FD_CLOEXEC == 0 {
+		t.Error("the returned descriptor is inheritable across exec; a table that shells " +
+			"out would hand this handle to its child")
 	}
 }

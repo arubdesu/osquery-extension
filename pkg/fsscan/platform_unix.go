@@ -36,17 +36,28 @@ func openNoFollow(path string) (*os.File, error) {
 // O_NOFOLLOW so a symlink substituted at any intermediate fails with ELOOP. This is
 // openat2(RESOLVE_NO_SYMLINKS) built portably out of iterated openat, which is what macOS
 // has to do because it has no openat2.
+// O_CLOEXEC on every descriptor this function opens. os.OpenFile sets it for us -- the
+// runtime does it for every fd it owns -- but unix.Open and unix.Openat are raw syscalls and
+// do not. Without it each intermediate directory handle and the final file handle survive an
+// exec, and this extension is one process hosting many tables, several of which shell out.
+// A descriptor onto another user's home directory, held open across an unrelated table's
+// subprocess, is a handle that outlives every check this package makes to obtain it.
+const (
+	openBeneathDirFlags  = syscall.O_RDONLY | unix.O_DIRECTORY | syscall.O_NOFOLLOW | unix.O_CLOEXEC
+	openBeneathFileFlags = syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_NONBLOCK | unix.O_CLOEXEC
+)
+
 func openBeneathComponents(baseDir, relPath string, components []string) (*os.File, error) {
 	// O_DIRECTORY ensures baseDir is a directory; O_NOFOLLOW ensures baseDir is not itself
 	// a symlink.
-	currentFD, err := unix.Open(baseDir, syscall.O_RDONLY|unix.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	currentFD, err := unix.Open(baseDir, openBeneathDirFlags, 0)
 	if err != nil {
 		return nil, fmt.Errorf("openbeneath: open base %q: %w", baseDir, err)
 	}
 	for i, component := range components {
-		flags := syscall.O_RDONLY | unix.O_DIRECTORY | syscall.O_NOFOLLOW
+		flags := openBeneathDirFlags
 		if i == len(components)-1 {
-			flags = syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_NONBLOCK
+			flags = openBeneathFileFlags
 		}
 		nextFD, err := unix.Openat(currentFD, component, flags, 0)
 		// Always close the previous fd, even on error.

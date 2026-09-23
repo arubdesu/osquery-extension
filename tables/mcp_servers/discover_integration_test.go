@@ -14,8 +14,14 @@ import (
 
 // discoverForTest supplies the context and the walk budget that DiscoverAll threads through in
 // production, so the per-home tests below can keep naming just the user and the home.
+// The standing-notes filter is applied here rather than at each call site: a fixture account
+// has no registry hive, so on Windows every one of these tests would otherwise carry an extra
+// roaming-application-data row and fail a count or a no-warning assertion for a reason that
+// has nothing to do with discovery. See withoutStandingNotes.
 func discoverForTest(user, home string) []Server {
-	return discoverForHome(context.Background(), fsscan.UserHome{Name: user, Path: home}, fsscan.WalkTimeout())
+	rows := discoverForHome(context.Background(), fsscan.UserHome{Name: user, Path: home},
+		time.Now().Add(fsscan.WalkTimeout()))
+	return withoutStandingNotes(rows)
 }
 
 // buildFakeHome materializes a minimal user home with the given files.
@@ -264,11 +270,11 @@ func TestDiscoverAll_UserFilter(t *testing.T) {
 		}
 	}
 
-	all := withoutRosterNotes(DiscoverAll(context.Background(), rosterOf(t, root), nil))
+	all := withoutStandingNotes(DiscoverAll(context.Background(), rosterOf(t, root), nil))
 	if len(all) != 2 {
 		t.Errorf("no filter: got %d rows, want 2: %v", len(all), all)
 	}
-	just := withoutRosterNotes(DiscoverAll(context.Background(), rosterOf(t, root), map[string]struct{}{"alice": {}}))
+	just := withoutStandingNotes(DiscoverAll(context.Background(), rosterOf(t, root), map[string]struct{}{"alice": {}}))
 	if len(just) != 1 || just[0].User != "alice" {
 		t.Errorf("filter alice: got %#v", just)
 	}
@@ -304,7 +310,7 @@ func TestDiscoverAllSharesOneWalkBudgetAcrossHomes(t *testing.T) {
 
 	measure := func(filter map[string]struct{}) (time.Duration, bool) {
 		start := time.Now()
-		rows := DiscoverAll(context.Background(), rosterOf(t, root), filter)
+		rows := withoutStandingNotes(DiscoverAll(context.Background(), rosterOf(t, root), filter))
 		elapsed := time.Since(start)
 		for _, row := range rows {
 			if row.Warning != "" {
@@ -512,7 +518,8 @@ func TestDiscoverForHomeReportsAnExhaustedBudget(t *testing.T) {
 		// is the point: both routes must report.
 		{"expires during pass 1", 1 * time.Nanosecond},
 	} {
-		rows := discoverForHome(context.Background(), fsscan.UserHome{Name: "alice", Path: home}, testCase.budget)
+		rows := withoutStandingNotes(discoverForHome(context.Background(),
+			fsscan.UserHome{Name: "alice", Path: home}, time.Now().Add(testCase.budget)))
 		var diagnostics int
 		for _, row := range rows {
 			if row.Warning == "" {
@@ -529,6 +536,36 @@ func TestDiscoverForHomeReportsAnExhaustedBudget(t *testing.T) {
 		if diagnostics != 1 {
 			t.Errorf("%s: want exactly one diagnostic, got %d: %+v",
 				testCase.name, diagnostics, rows)
+		}
+	}
+}
+
+// The home open is charged against the query deadline rather than running outside it.
+//
+// discoverForHome took a remaining duration and re-based it after opening the home, so the
+// open -- which on a network-backed or automounted home blocks for the mount timeout -- cost
+// nothing and the home then received the whole budget again. Once per home, that compounds
+// across a host. It takes an absolute deadline now, and checks it after the open.
+func TestHomeOpenIsChargedAgainstTheDeadline(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".cursor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".cursor", "mcp.json"),
+		[]byte(`{"mcpServers":{"x":{"command":"npx"}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A deadline already past when the function is entered. Under a duration this arrived as
+	// a positive budget and the whole home was walked.
+	rows := withoutStandingNotes(discoverForHome(context.Background(),
+		fsscan.UserHome{Name: "alice", Path: home}, time.Now().Add(-time.Second)))
+	if len(rows) == 0 {
+		t.Fatal("an exhausted deadline produced no row at all, which reads as an account " +
+			"with no configuration")
+	}
+	for _, row := range rows {
+		if row.Warning == "" {
+			t.Errorf("a server row was produced after the deadline had passed: %+v", row)
 		}
 	}
 }

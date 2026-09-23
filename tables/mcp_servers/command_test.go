@@ -482,3 +482,134 @@ func TestNonASCIIWhitespaceSplitsLikeASpace(t *testing.T) {
 		}
 	}
 }
+
+// A quoted argument embedded in `command` is one argument, not one per word.
+//
+// strings.Fields split it, and the pieces went two places that both matter. redactArgs
+// redacts a credential by looking back at the option before it, so it redacted only the
+// first fragment and left the rest standing: `--token "opaque superSecret value"` put
+// superSecret in the row as its own argument, where looksLikePackageSpec accepted it and
+// reported it as package_name. The same split reported `--out "a b c" real-package` as
+// package_name=b. Both are fixed by keeping the span together: redaction covers all of it,
+// and a value holding whitespace can no longer pass as a package.
+func TestQuotedEmbeddedArgumentIsOneArgument(t *testing.T) {
+	const secret = "superSecretValue"
+	cases := []struct{ name, command, wantSpec string }{
+		{"quoted credential stays whole", `npx --token "opaque ` + secret + ` value" real-package`, "real-package"},
+		{"single quotes too", `npx --token 'opaque ` + secret + ` value' real-package`, "real-package"},
+		{"quoted value of an ordinary option", `npx --out "a b c" real-package`, "real-package"},
+		{"quoted launcher and quoted credential",
+			`"/opt/my tool/npx" --token "opaque ` + secret + ` value" real-package`, "real-package"},
+		{"inline quoted value", `npx --flag="a b" real-package`, "real-package"},
+		// Where the argument ends is unknowable, so every boundary after it is a guess.
+		// The launcher was settled before the quote and still stands.
+		{"unterminated quote yields no identity", `npx --token "opaque ` + secret + ` real-package`, ""},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, args := commandFieldsFor("darwin", testCase.command, false)
+			redacted := redactArgs(args)
+			for _, arg := range redacted {
+				if strings.Contains(arg, secret) {
+					t.Errorf("a credential fragment survived as an argument: %q", redacted)
+				}
+			}
+			if spec, _ := npxIdentity(redacted); spec != testCase.wantSpec {
+				t.Errorf("identity = %q, want %q (args %q)", spec, testCase.wantSpec, redacted)
+			}
+		})
+	}
+}
+
+// Backslash is a path separator here, not an escape. Treating it as one would corrupt every
+// Windows command this table reads.
+func TestWindowsPathInCommandSurvivesSplitting(t *testing.T) {
+	base, args := commandFieldsFor("windows", `C:\Users\x\npx.cmd real-package`, false)
+	if base != `C:\Users\x\npx.cmd` {
+		t.Errorf("launcher = %q, want the path unchanged", base)
+	}
+	if len(args) != 1 || args[0] != "real-package" {
+		t.Errorf("args = %q, want [real-package]", args)
+	}
+}
+
+// Backslash means opposite things on the two platforms, so the splitter is told which one it
+// is reading for.
+//
+// On POSIX an escaped space joins rather than separates, and not honouring that leaked the
+// same way the quoted form did: `--token opaque\ secret\ finalPiece` split into four tokens,
+// redactArgs covered only the first, and finalPiece passed the package grammar. On Windows
+// the byte is a path separator and has to stay literal.
+func TestEscapedWhitespaceIsPlatformAware(t *testing.T) {
+	const secret = "superSecretValue"
+	t.Run("posix honours the escape", func(t *testing.T) {
+		_, args := commandFieldsFor("darwin",
+			`npx --token opaque\ `+secret+`\ finalPiece real-package`, false)
+		redacted := redactArgs(args)
+		for _, arg := range redacted {
+			if strings.Contains(arg, secret) || strings.Contains(arg, "finalPiece") {
+				t.Errorf("a credential fragment survived: %q", redacted)
+			}
+		}
+		if spec, _ := npxIdentity(redacted); spec != "real-package" {
+			t.Errorf("identity = %q, want real-package (args %q)", spec, redacted)
+		}
+	})
+	t.Run("an escaped value of an ordinary option stays whole", func(t *testing.T) {
+		_, args := commandFieldsFor("darwin", `npx --out a\ b\ c real-package`, false)
+		if len(args) != 3 || args[1] != "a b c" {
+			t.Errorf("args = %q, want [--out \"a b c\" real-package]", args)
+		}
+	})
+	t.Run("a trailing backslash fails closed", func(t *testing.T) {
+		_, args := commandFieldsFor("darwin", `npx real-package trailing\`, false)
+		if len(args) != 0 {
+			t.Errorf("args = %q, want none: where the argument ends is unknowable", args)
+		}
+	})
+	t.Run("windows keeps backslashes literal", func(t *testing.T) {
+		base, args := commandFieldsFor("windows",
+			`C:\Users\x\npx.cmd --token "opaque `+secret+`" real-package`, false)
+		if base != `C:\Users\x\npx.cmd` {
+			t.Errorf("launcher = %q, want the path unchanged", base)
+		}
+		redacted := redactArgs(args)
+		for _, arg := range redacted {
+			if strings.Contains(arg, secret) {
+				t.Errorf("a credential survived: %q", redacted)
+			}
+		}
+		if spec, _ := npxIdentity(redacted); spec != "real-package" {
+			t.Errorf("identity = %q, want real-package", spec)
+		}
+	})
+}
+
+// Inside double quotes POSIX escapes only five characters. Before anything else the
+// backslash is literal and both bytes survive.
+//
+// Treating it as an escape before every character turned `"foo\bar"` into `foobar`, which
+// the package grammar accepts -- so a value a shell would have passed through unchanged, and
+// which no grammar would have accepted, was reported as the configured package.
+func TestDoubleQuotedBackslashFollowsPOSIXRules(t *testing.T) {
+	cases := []struct{ name, command, wantArg, wantSpec string }{
+		{"literal before an ordinary character", `npx "foo\bar"`, `foo\bar`, ""},
+		{"escape before a dollar", `npx "a\$b"`, `a$b`, ""},
+		{"escape before a quote", `npx "say \"hi\""`, `say "hi"`, ""},
+		{"escape before a backslash", `npx "back\\slash"`, `back\slash`, ""},
+		// Single quotes take no escapes at all, and outside quotes the escape applies to
+		// anything -- which is what makes an escaped space join rather than separate.
+		{"single quotes keep it literal", `npx 'lit\eral' real-package`, `lit\eral`, "real-package"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, args := commandFieldsFor("darwin", testCase.command, false)
+			if len(args) == 0 || args[0] != testCase.wantArg {
+				t.Errorf("args = %q, want first %q", args, testCase.wantArg)
+			}
+			if spec, _ := npxIdentity(redactArgs(args)); spec != testCase.wantSpec {
+				t.Errorf("identity = %q, want %q", spec, testCase.wantSpec)
+			}
+		})
+	}
+}

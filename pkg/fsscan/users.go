@@ -128,6 +128,19 @@ type UserHomes struct {
 	// Truncated is set when the roster itself was short, as opposed to individual accounts
 	// failing. There is no list of who is missing in that case, so it cannot be an Omission.
 	Truncated string
+
+	// NonLogin holds the rostered accounts that cannot log in and so were not inspected.
+	//
+	// Separate from Skipped rather than folded into it, because the two want opposite
+	// default behaviour. A caller emits a row per Skipped account; a host has dozens of
+	// service accounts, and a row each would bury the omissions that matter in an
+	// inventory nobody narrowed. But dropping them entirely was worse in the one case that
+	// counts: a caller reconciling requested names against what the roster accounted for
+	// saw no trace of them, so `WHERE user = 'daemon'` was answered "no account of this
+	// name is in the roster osquery returned" about an account the roster did return and
+	// this package deliberately excluded. Reported here so a caller can stay quiet about
+	// them until someone asks by name, and answer accurately when they do.
+	NonLogin []Omission
 }
 
 // nonLoginShells mark an account that cannot log in and so keeps no editor or agent
@@ -243,6 +256,10 @@ func homesFromUsers(rows []map[string]string) UserHomes {
 			continue
 		}
 		if _, nonLogin := nonLoginShells[row["shell"]]; nonLogin {
+			result.NonLogin = append(result.NonLogin, Omission{
+				Name: name, ID: accountID(row), Path: home,
+				Reason: "this account cannot log in, its shell being " + row["shell"] +
+					", so it keeps no editor or agent configuration"})
 			continue
 		}
 		if home == "" {

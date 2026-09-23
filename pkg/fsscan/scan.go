@@ -482,6 +482,15 @@ func ScanContext(ctx context.Context, cfg ScanConfig) (ScanResult, error) {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, cfg.Timeout)
 		defer cancel()
+	} else if cfg.Timeout < 0 {
+		// Zero means "no timeout" and is documented as such, but negative means a caller
+		// computed a remaining duration from a deadline that had already passed. Reading
+		// that as "no timeout" is the most dangerous possible interpretation: the one
+		// caller who proved it has no time left would get an unbounded walk. Treated as
+		// expired instead, which is what the value says.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 0)
+		defer cancel()
 	}
 	// The budget is checked between operations, which is as far as a context reaches here:
 	// neither filepath.WalkDir nor os.ReadDir takes one, so a single read blocked on an
@@ -494,8 +503,12 @@ func ScanContext(ctx context.Context, cfg ScanConfig) (ScanResult, error) {
 	// callbacks for its children, and MaxFiles counts accepted candidates rather than every
 	// regular file seen, so a single enormous or stalled directory can overrun both before
 	// either is consulted.
+	// Timeout != 0 rather than > 0: a negative value is a budget this function imposed on
+	// itself just as much as a positive one is, and reading it as "no budget of our own"
+	// reported an expired scan as a caller cancellation -- an error, where the contract says
+	// an exhausted budget returns what it found with a truncation warning.
 	budgetExpired := func() bool {
-		return cfg.Timeout > 0 && callerCtx.Err() == nil && ctx.Err() != nil
+		return cfg.Timeout != 0 && callerCtx.Err() == nil && ctx.Err() != nil
 	}
 	if cfg.MaxDepth <= 0 {
 		cfg.MaxDepth = 8

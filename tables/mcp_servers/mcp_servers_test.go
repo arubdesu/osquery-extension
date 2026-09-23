@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/macadmins/osquery-extension/pkg/fsscan"
+	"github.com/macadmins/osquery-extension/pkg/redact"
 	"github.com/macadmins/osquery-extension/pkg/utils"
 	"github.com/osquery/osquery-go/plugin/table"
 )
@@ -270,6 +272,88 @@ func TestRedactionRemovesKnownShapesButNotOpaqueOnes(t *testing.T) {
 	}
 }
 
+// A credential-named assignment is caught in every column a user's file can reach, however
+// the option is delimited -- which is the claim the schema comment and the README both make.
+//
+// Two gaps produced this test. The embedded pattern was bounded on the left by `\s`, so an
+// option introduced by a path separator, a bracket or non-ASCII whitespace was not an option
+// as far as the regexp was concerned and its value survived. And source_path and warning are
+// assembled after parsing, so they never passed through redactSecret at all: a project
+// directory literally named `--token=<secret>` reached the row intact. Both are emission-time
+// properties, so this asserts on serverToRow rather than on the redactor.
+func TestServerToRowRedactsDelimitedAssignmentsInEveryColumnAUserControls(t *testing.T) {
+	const secret = "opaqueSecretValue123"
+	row := serverToRow(Server{
+		SourcePath:    "/Users/alice/--token=" + secret + "/project/.mcp.json",
+		SourceContext: "projects[/tmp/--api-key=" + secret + "].mcpServers",
+		ServerName:    "group/--api-key=" + secret,
+		Command:       "/opt/--dd-key=" + secret + "/bin/tool",
+		URL:           "https://host/--token=" + secret,
+		PackageName:   "pkg/--token=" + secret,
+		RequestedSpec: "pkg@--token=" + secret,
+		Version:       "1.0.0-\u00a0--token=" + secret,
+		EnvKeys:       []string{"A=--token=" + secret},
+		Warning:       "could not read /Users/alice/--token=" + secret + "/x: denied",
+	})
+	for column, value := range row {
+		if strings.Contains(value, secret) {
+			t.Errorf("%s leaked a credential-named assignment: %q", column, value)
+		}
+	}
+	// Over-redaction is the intended direction to fail, but a column that lost everything
+	// would be a different bug: the marker has to be there, so a reader can tell a redacted
+	// value from an empty one.
+	for _, column := range []string{"source_path", "source_context", "server_name", "warning"} {
+		if !strings.Contains(row[column], redact.RedactedMark) {
+			t.Errorf("%s = %q, expected the redaction marker", column, row[column])
+		}
+	}
+}
+
+// The same guarantee for a value carrying a newline, taken from JSON rather than built in Go
+// so the escape is the one a real config would use.
+//
+// A newline defeated both halves of the redactor at once: the whole-value pattern was a
+// regexp whose `.` does not cross one, and the embedded pattern's value has to start at a
+// non-space character. `"--token=\nsecret"` is a legal server name and reached the row with
+// the credential intact.
+func TestServerToRowRedactsAnAssignmentCarryingANewline(t *testing.T) {
+	const secret = "opaqueSecretValue123"
+	data := []byte(`{"mcpServers":{"--token=\n` + secret + `":{"command":"npx","args":["x"]}}}`)
+	servers, err := extractEnvelopeSimple(data)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(servers) != 1 {
+		t.Fatalf("got %d servers, want 1: %+v", len(servers), servers)
+	}
+	row := serverToRow(servers[0])
+	for column, value := range row {
+		if strings.Contains(value, secret) {
+			t.Errorf("%s leaked a credential across a newline: %q", column, value)
+		}
+	}
+	if !strings.Contains(row["server_name"], redact.RedactedMark) {
+		t.Errorf("server_name = %q, expected the redaction marker", row["server_name"])
+	}
+
+	// The same value in the two columns assembled after parsing, which no parse-time
+	// sanitization reaches. Without the emission-boundary pass these carry the credential
+	// even though the identically-shaped server name above does not.
+	built := serverToRow(Server{
+		SourcePath: "/Users/alice/--token=\n" + secret + "/.mcp.json",
+		Warning:    "could not read --token=\n" + secret,
+	})
+	for _, column := range []string{"source_path", "warning"} {
+		if strings.Contains(built[column], secret) {
+			t.Errorf("%s leaked a credential across a newline: %q", column, built[column])
+		}
+		if !strings.Contains(built[column], redact.RedactedMark) {
+			t.Errorf("%s = %q, expected the redaction marker", column, built[column])
+		}
+	}
+}
+
 // Every row the table emits has to satisfy the identity columns' documented sets, including
 // the rows that report a problem instead of a server. Diagnostics are built outside
 // inferIdentity, so they were leaving transport and confidence empty -- a value in neither
@@ -367,6 +451,167 @@ func TestRosterFailureNamesEachRequestedUser(t *testing.T) {
 	})
 }
 
+// The roster answering "no such account" is not the same as the account having no MCP
+// servers, and returning nothing says the second. Every other branch of DiscoverAll already
+// refuses that trade -- a skipped home, an unreachable roster, a budget that ran out -- and
+// the requested name the roster never mentioned was the one route still taking it.
+func TestQueryForANameTheRosterDoesNotHaveSaysSo(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "alice", "code"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := DiscoverAll(context.Background(), rosterOf(t, root), map[string]struct{}{
+		"nosuchuser": {},
+	})
+	var named int
+	for _, row := range rows {
+		if row.User != "nosuchuser" {
+			t.Errorf("a query for one name returned a row for %q: %+v", row.User, row)
+			continue
+		}
+		if row.Warning == "" {
+			t.Errorf("no account of this name exists, so any row for it must explain "+
+				"itself: %+v", row)
+			continue
+		}
+		named++
+	}
+	if named == 0 {
+		t.Error("a query for an account the roster does not have returned nothing, which " +
+			"reads as the account having no MCP servers")
+	}
+
+	// The other half: a name the roster does have must not draw the same row, or every
+	// ordinary constrained query carries a warning that is not true of it.
+	for _, row := range DiscoverAll(context.Background(), rosterOf(t, root),
+		map[string]struct{}{"alice": {}}) {
+		if strings.Contains(row.Warning, "no account of this name") {
+			t.Errorf("an account that exists was reported as missing: %+v", row)
+		}
+	}
+
+	// And an account the walk never reached is still an account. The budget and
+	// cancellation branches report on it themselves, so treating "not scanned" as "not
+	// found" would hand one query two contradictory warnings about the same user.
+	t.Setenv(fsscan.WalkTimeoutEnv, "1ns")
+	for _, row := range DiscoverAll(context.Background(), rosterOf(t, root),
+		map[string]struct{}{"alice": {}}) {
+		if strings.Contains(row.Warning, "no account of this name") {
+			t.Errorf("an account the budget never reached was reported as missing: %+v", row)
+		}
+	}
+}
+
+// A rostered account that cannot log in is not an account the roster never mentioned, and
+// saying so was a false statement about what osquery returned.
+//
+// homesFromUsers drops non-login accounts on purpose: they keep no editor or agent
+// configuration, and a row each would bury the omissions that matter. But they were dropped
+// from the accounting as well as from the scan, so `WHERE user = 'daemon'` fell through to
+// the unanswered branch and came back "no account of this name is in the roster osquery
+// returned" -- about an account that was in the roster osquery returned.
+func TestQueryForANonLoginAccountIsNotToldItIsAbsent(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "daemon")
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	roster := rosterFrom(map[string]string{
+		"uid": "1", "uuid": "", "username": "daemon", "directory": home,
+		"shell": "/usr/bin/false",
+	})
+
+	rows := withoutStandingNotes(DiscoverAll(context.Background(), roster,
+		map[string]struct{}{"daemon": {}}))
+	if len(rows) == 0 {
+		t.Fatal("a query for a rostered non-login account returned nothing, which reads " +
+			"as the account having no MCP servers")
+	}
+	for _, row := range rows {
+		if strings.Contains(row.Warning, "no account of this name") {
+			t.Errorf("a rostered account was reported as absent from the roster: %+v", row)
+		}
+		if row.User != "daemon" {
+			t.Errorf("row for %q in a query constrained to daemon: %+v", row.User, row)
+		}
+		if row.UserID != "1" {
+			t.Errorf("row carries user_id %q, want the roster's identity: %+v", row.UserID, row)
+		}
+	}
+
+	// The other half of the trade: unconstrained, these stay quiet. A host carries dozens
+	// of service accounts and a row each would drown the inventory.
+	unconstrained := withoutStandingNotes(DiscoverAll(context.Background(), roster, nil))
+	for _, row := range unconstrained {
+		if strings.Contains(row.Warning, "cannot log in") {
+			t.Errorf("an unconstrained inventory reported a service account: %+v", row)
+		}
+	}
+}
+
+// The missing-name diagnostic used to close with "a roster-level warning alongside this row
+// says which" whatever the roster had done. On a complete roster no such row is emitted, so
+// the sentence sent an operator looking for something that is not there.
+func TestMissingNameDiagnosticOnlyPromisesAWarningThatExists(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "alice"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const pointer = "warning alongside this row"
+
+	// A roster that reported no limits of its own. Any row promising a companion warning
+	// has to be backed by one actually present in the same result.
+	rows := DiscoverAll(context.Background(), rosterOf(t, root),
+		map[string]struct{}{"nosuchuser": {}})
+	var missing *Server
+	for i, row := range rows {
+		if strings.Contains(row.Warning, "no account of this name") {
+			missing = &rows[i]
+		}
+	}
+	if missing == nil {
+		t.Fatal("no missing-name diagnostic was emitted")
+	}
+	if strings.Contains(missing.Warning, pointer) {
+		// Linux always carries the local-accounts-only roster note, so the pointer is
+		// truthful there; anywhere else it is not.
+		var rosterLevel int
+		for _, row := range rows {
+			// The missing-name row carries the users root as its path too, having no home
+			// to name, so it would otherwise count as its own corroboration.
+			if strings.Contains(row.Warning, "no account of this name") {
+				continue
+			}
+			if row.Warning != "" && row.SourcePath == fsscan.UsersRoot {
+				rosterLevel++
+			}
+		}
+		if rosterLevel == 0 {
+			t.Errorf("the diagnostic points at a roster-level warning, but none was "+
+				"emitted: %q", missing.Warning)
+		}
+	}
+
+	// And a roster that was short must still point at the row explaining why, or the one
+	// case the pointer exists for loses it.
+	short := rosterFrom(map[string]string{
+		"uid": "", "uuid": "", "username": "", "directory": "", "shell": "/bin/zsh",
+	})
+	var pointed bool
+	for _, row := range DiscoverAll(context.Background(), short,
+		map[string]struct{}{"nosuchuser": {}}) {
+		if strings.Contains(row.Warning, "no account of this name") &&
+			strings.Contains(row.Warning, pointer) {
+			pointed = true
+		}
+	}
+	if !pointed {
+		t.Error("with roster-level uncertainty reported, the missing-name diagnostic no " +
+			"longer points at the row that explains it")
+	}
+}
+
 // failingClienter stands in for an osquery that cannot be reached.
 type failingClienter struct{}
 
@@ -419,13 +664,157 @@ func TestEnvKeysColumnIsStableAcrossRepeatedParses(t *testing.T) {
 // must keep firing; it is simply not what a test counting discovered servers measures.
 // Identified structurally rather than by message: a roster-level row names the users root as
 // its source, because there is no single home it belongs to.
+// serverRowsOnly is withoutStandingNotes for the generate path, which has already rendered
+// rows as the string maps osquery consumes. Same two platform notes, same reasons.
 func serverRowsOnly(rows []map[string]string) []map[string]string {
 	out := make([]map[string]string, 0, len(rows))
 	for _, row := range rows {
 		if row["warning"] != "" && row["source_path"] == fsscan.UsersRoot {
 			continue
 		}
+		if row["warning"] == roamingUndeterminedNote {
+			continue
+		}
 		out = append(out, row)
 	}
 	return out
+}
+
+// A flat-shape entry that names a server key but decodes to nothing must be counted, the way
+// the envelope shapes already count theirs.
+//
+// extractFlat applied looksLikeServerEntry and then dropped the failures in silence, so
+// {"broken":{"command":null},"good":{...}} returned one row and no notice, and a file holding
+// only the broken entry returned nothing at all -- indistinguishable from a file with no MCP
+// servers in it. Metadata siblings must still be ignored, or every config carrying a
+// "$schema" key would grow a spurious "could not be decoded" row.
+func TestFlatShapeCountsEntriesThatNameAServerKey(t *testing.T) {
+	cases := []struct {
+		name, doc      string
+		wantServers    int
+		wantDiagnostic bool
+	}{
+		{"broken beside healthy", `{"broken":{"command":null},"good":{"command":"npx"}}`, 1, true},
+		{"broken alone", `{"broken":{"command":null}}`, 0, true},
+		{"metadata sibling is not a broken entry", `{"note":{"text":"hi"},"good":{"command":"npx"}}`, 1, false},
+		{"healthy only", `{"good":{"command":"npx"}}`, 1, false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			rows, err := extractEnvelopeSimple([]byte(testCase.doc))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			var servers, diagnostics int
+			for _, row := range rows {
+				if row.Warning == "" {
+					servers++
+					continue
+				}
+				diagnostics++
+			}
+			if servers != testCase.wantServers {
+				t.Errorf("servers = %d, want %d (rows %+v)", servers, testCase.wantServers, rows)
+			}
+			if got := diagnostics > 0; got != testCase.wantDiagnostic {
+				t.Errorf("diagnostic present = %v, want %v (rows %+v)", got, testCase.wantDiagnostic, rows)
+			}
+		})
+	}
+}
+
+// A transport the file declares and this table does not recognise is reported as unknown,
+// not replaced with a guess.
+//
+// normalizeTransport returned "" for both "absent" and "unrecognised", and the caller reads
+// "" as permission to infer from the URL or the command. `{"type":"websocket","url":"wss://..."}`
+// was therefore reported as transport=http: a protocol the file does not name, stated with
+// the same confidence as one it does. The next transport MCP adds would arrive disguised as
+// an existing one rather than as something to look at.
+func TestDeclaredUnknownTransportIsNotReplacedByAGuess(t *testing.T) {
+	cases := []struct{ name, doc, want string }{
+		{"unknown type beside a url", `{"mcpServers":{"w":{"type":"websocket","url":"wss://mcp.example.test"}}}`, "unknown"},
+		{"unknown type beside a command", `{"mcpServers":{"w":{"type":"websocket","command":"npx"}}}`, "unknown"},
+		// Absent is still an invitation to infer, which is the whole point of the distinction.
+		{"absent type infers from the url", `{"mcpServers":{"w":{"url":"https://mcp.example.test"}}}`, "http"},
+		{"recognised type is honoured", `{"mcpServers":{"w":{"type":"sse","url":"https://mcp.example.test"}}}`, "sse"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			rows, err := extractEnvelopeSimple([]byte(testCase.doc))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if len(rows) != 1 {
+				t.Fatalf("got %d rows, want 1: %+v", len(rows), rows)
+			}
+			if rows[0].Transport != testCase.want {
+				t.Errorf("transport = %q, want %q", rows[0].Transport, testCase.want)
+			}
+		})
+	}
+}
+
+// A home already scanned for one account is reported for the next one that shares it, even
+// once the walk budget is gone.
+//
+// The budget check ran before the cache lookup, so two accounts sharing a home -- routine on
+// macOS, where /var/root is listed for both root and daemon -- had the second told "walk
+// budget exhausted before this user was scanned" about a home the first had just scanned in
+// full. The claim was false, and it cost that account every row the cache was already
+// holding. Restamping a cached result is not filesystem work and the budget has no say in it.
+func TestASharedHomeIsReportedForBothAccountsAfterTheBudgetIsGone(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "shared")
+	if err := os.MkdirAll(filepath.Join(home, ".cursor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".cursor", "mcp.json"),
+		[]byte(`{"mcpServers":{"seeded":{"command":"npx","args":["pkg"]}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Two accounts, one home, distinct identities.
+	roster := rosterFrom(
+		map[string]string{"uid": "501", "uuid": "", "username": "alice", "directory": home, "shell": "/bin/zsh"},
+		map[string]string{"uid": "502", "uuid": "", "username": "bob", "directory": home, "shell": "/bin/zsh"},
+	)
+	// A tree big enough that the project-local walk outlasts the budget, so the deadline is
+	// gone by the time the second account is considered but the first has already been
+	// scanned and cached. The direct-path pass runs before the walk's deadline check, so
+	// the seeded row above survives the truncation.
+	deep := filepath.Join(home, "code")
+	for i := range 400 {
+		if err := os.MkdirAll(filepath.Join(deep, fmt.Sprintf("p%03d", i), "src", "lib"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv(fsscan.WalkTimeoutEnv, "2ms")
+
+	rows := withoutStandingNotes(DiscoverAll(context.Background(), roster, nil))
+	var exhausted bool
+	for _, row := range rows {
+		if strings.Contains(row.Warning, "budget") || strings.Contains(row.Warning, "truncated") {
+			exhausted = true
+		}
+	}
+	if !exhausted {
+		t.Skip("the walk finished inside the budget on this machine, so the case this test " +
+			"is about -- a second account meeting an exhausted budget -- did not arise")
+	}
+	seen := map[string]bool{}
+	for _, row := range rows {
+		if strings.Contains(row.Warning, "before this user was scanned") {
+			t.Errorf("an account sharing an already-scanned home was told it was never "+
+				"scanned: %+v", row)
+		}
+		if row.Warning == "" {
+			seen[row.User] = true
+		}
+	}
+	for _, user := range []string{"alice", "bob"} {
+		if !seen[user] {
+			t.Errorf("no server row for %q; a shared home has to be reported for every "+
+				"account that shares it", user)
+		}
+	}
 }

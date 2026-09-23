@@ -102,7 +102,8 @@ func TestSnapConfigIsDiscoveredEndToEnd(t *testing.T) {
 	}
 	t.Cleanup(func() { knownDirectSources = original })
 
-	rows := discoverForHome(context.Background(), fsscan.UserHome{Name: "alice", Path: home}, time.Minute)
+	rows := discoverForHome(context.Background(), fsscan.UserHome{Name: "alice", Path: home},
+		time.Now().Add(time.Minute))
 	var found bool
 	for _, row := range rows {
 		if row.Warning != "" {

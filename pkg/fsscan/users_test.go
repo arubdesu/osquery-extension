@@ -40,8 +40,10 @@ func TestHomesFromUsers(t *testing.T) {
 
 	got := homesFromUsers([]map[string]string{
 		row("501", "", "alice", real, "/bin/zsh"),
-		// A daemon: excluded by shell, so no diagnostic either -- there is no person to
-		// tell about.
+		// A daemon: excluded by shell, so no home and no diagnostic row -- there is no
+		// person to tell about. Still reported under NonLogin, because a caller
+		// reconciling a requested name has to tell "deliberately not inspected" from
+		// "the roster never mentioned it".
 		row("1", "", "daemon", real, "/usr/bin/false"),
 		// No shell recorded. Windows populates none, so this must NOT be read as
 		// non-login: doing so would return an empty table on that platform entirely.
@@ -85,6 +87,23 @@ func TestHomesFromUsers(t *testing.T) {
 	// different claim from never having looked.
 	if !reflect.DeepEqual(skipped, []string{"bob", "carol", "dave", "erin"}) {
 		t.Errorf("skipped = %v, want [bob carol dave erin]", skipped)
+	}
+
+	// The non-login account is neither a home nor an omission, and before it was recorded
+	// here it was in neither collection at all -- so a caller asking about it by name was
+	// told no such account is in the roster, about an account the roster did return.
+	var nonLogin []string
+	for _, omission := range got.NonLogin {
+		if omission.Reason == "" {
+			t.Errorf("non-login entry for %q carries no reason", omission.Name)
+		}
+		if omission.ID == "" {
+			t.Errorf("non-login entry for %q carries no identity", omission.Name)
+		}
+		nonLogin = append(nonLogin, omission.Name)
+	}
+	if !reflect.DeepEqual(nonLogin, []string{"daemon"}) {
+		t.Errorf("nonLogin = %v, want [daemon]", nonLogin)
 	}
 }
 

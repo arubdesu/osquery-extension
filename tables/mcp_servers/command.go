@@ -61,7 +61,11 @@ func commandFieldsFor(goos, cmd string, argsPresent bool) (string, []string) {
 		if argsPresent {
 			return quoted, nil
 		}
-		return quoted, strings.Fields(rest)
+		tailArgs, parsed := splitCommandFields(goos, rest)
+		if !parsed {
+			return quoted, nil
+		}
+		return quoted, tailArgs
 	}
 	if !containsWhitespace(cmd) {
 		return cmd, nil
@@ -79,7 +83,14 @@ func commandFieldsFor(goos, cmd string, argsPresent bool) (string, []string) {
 			// arguments themselves.
 			return head, nil
 		}
-		return head, strings.Fields(tail)
+		tailArgs, parsed := splitCommandFields(goos, tail)
+		if !parsed {
+			// Quoting this function cannot resolve. The launcher name is still unambiguous
+			// -- it was settled before the first quote -- so the basename stands, but the
+			// arguments do not, and inference runs on nothing rather than on a guess.
+			return head, nil
+		}
+		return head, tailArgs
 	case shapePath:
 		return cmd, nil
 	default:
@@ -181,6 +192,101 @@ func cutQuoted(field string) (quoted, rest string, ok bool) {
 		return "", "", false
 	}
 	return field[1 : end+1], field[end+2:], true
+}
+
+// splitCommandFields splits an embedded argument tail into arguments, keeping a quoted span
+// together as one argument. ok is false when the quoting cannot be resolved, which is the
+// caller's signal to report no arguments at all.
+//
+// strings.Fields was doing this before, and it splits on whitespace wherever it appears,
+// including inside quotes. Two things went wrong with that, and the first is the reason this
+// exists. `npx --token "opaque secret value" real-package` became
+// ["--token", `"opaque`, "secret", `value"`, "real-package"]: redactArgs redacts the token's
+// value by looking back at the option before it, so it redacted `"opaque` and left `secret`
+// standing as its own argument -- which then passed looksLikePackageSpec and was reported as
+// package_name. A fragment of a credential became the inventory's idea of what was
+// installed. The second is milder and the same shape: `--out "a b c" real-package` reported
+// package_name=b, an interior word of an ordinary option's value.
+//
+// A quoted span becomes one argument, so redactArgs redacts all of it and
+// looksLikePackageSpec rejects it for holding whitespace.
+//
+// Backslash handling is decided by goos, because the same byte means opposite things on the
+// two platforms. On Windows it separates path components -- this field routinely holds
+// `C:\Users\x\tool.exe` -- and treating it as an escape would corrupt every one of them. On
+// POSIX it escapes the next character, and not honouring that did more than lose a row:
+// `npx --token opaque\ secret\ finalPiece real-package` split into four tokens, redactArgs
+// covered only the first, and `finalPiece` -- the tail of a credential -- passed the package
+// grammar and was reported as package_name. Escaped whitespace is the same leak the quoted
+// form had, spelled differently.
+func splitCommandFields(goos, tail string) ([]string, bool) {
+	escapes := goos != "windows"
+	var (
+		out     []string
+		current strings.Builder
+		quote   rune
+		open    bool
+	)
+	escaped := false
+	for _, r := range tail {
+		if escaped {
+			// Inside double quotes POSIX escapes only five characters; before anything
+			// else the backslash is itself literal and both bytes survive. Dropping it
+			// unconditionally turned `"foo\bar"` into `foobar`, which the package grammar
+			// accepts -- so a value a shell would have passed through as `foo\bar`, and
+			// which no grammar would have accepted, was reported as the configured
+			// package. Outside quotes the escape applies to any character, which is what
+			// makes `opaque\ secret` one argument.
+			if quote == '"' && !strings.ContainsRune("$`\"\\\n", r) {
+				current.WriteRune('\\')
+			}
+			current.WriteRune(r)
+			open = true
+			escaped = false
+			continue
+		}
+		switch {
+		case escapes && r == '\\' && quote != '\'':
+			// Inside single quotes a backslash is literal even on POSIX; everywhere else
+			// it introduces the next character.
+			escaped = true
+			open = true
+		case quote != 0:
+			if r == quote {
+				quote = 0
+				continue
+			}
+			current.WriteRune(r)
+		case r == '"' || r == '\'':
+			// A quote starts a span wherever it appears, including mid-argument, so
+			// --flag="a b" is one argument rather than two.
+			quote = r
+			open = true
+		case unicode.IsSpace(r):
+			if open || current.Len() > 0 {
+				out = append(out, current.String())
+				current.Reset()
+				open = false
+			}
+		default:
+			current.WriteRune(r)
+			open = true
+		}
+	}
+	if escaped {
+		// A trailing backslash with nothing to escape. In a shell this continues the line;
+		// here there is no next line, so the field is as unparseable as an open quote.
+		return nil, false
+	}
+	if quote != 0 {
+		// An unterminated quote. Where the argument ends is unknowable, so every boundary
+		// after it is a guess, and a guess here is what puts part of a secret in a column.
+		return nil, false
+	}
+	if open || current.Len() > 0 {
+		out = append(out, current.String())
+	}
+	return out, true
 }
 
 // cutWhitespace splits a field at its first run of whitespace.

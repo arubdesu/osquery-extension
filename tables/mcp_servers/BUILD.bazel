@@ -42,6 +42,7 @@ go_test(
     embed = [":mcp_servers"],
     deps = [
         "//pkg/fsscan",
+        "//pkg/redact",
         "//pkg/utils",
         "@com_github_osquery_osquery_go//plugin/table",
     ],

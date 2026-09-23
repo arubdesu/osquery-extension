@@ -32,9 +32,11 @@ import (
 // rejected. Components separated by OS path separators are walked one at
 // a time.
 //
-// Returns an *os.File ready for reading, or an error. The caller closes
-// the file as usual. The per-component open lives in platform_unix.go; on
-// Windows it reports unsupported and this returns an error.
+// Returns an *os.File ready for reading, or an error. The caller closes the file as usual.
+// The per-component open is platform-specific: platform_unix.go iterates openat(O_NOFOLLOW),
+// platform_windows.go walks a chain of os.Root handles and Lstats each component to refuse a
+// reparse point that stays inside the root, and platform_unsupported.go reports unsupported
+// for everything else.
 func OpenBeneath(baseDir, relPath string) (*os.File, error) {
 	components, err := splitSafeComponents(relPath)
 	if err != nil {
