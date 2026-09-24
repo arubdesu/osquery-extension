@@ -157,15 +157,27 @@ func readShellFolder(root registry.Key, path string) (string, bool) {
 	return value, true
 }
 
-// expandProfileVars expands the two variables Shell Folders values actually use, against
-// this profile rather than against the calling process.
+// expandProfileVars expands the one variable a Shell Folders value can be resolved against
+// for another account, and refuses the rest.
 //
 // os.ExpandEnv is wrong here for the same reason the paths package derives roots from the
 // home directory: %USERPROFILE% in the SYSTEM account's environment names SYSTEM's profile,
-// so expanding with it would point every account at the same directory.
+// so expanding with it would point every account at the same directory. The profile
+// directory is what %USERPROFILE% means for the account being read, so that one substitutes
+// exactly.
+//
+// %HOMEPATH% used to be substituted the same way and that was wrong twice over. It carries
+// no drive -- Windows expands it as \Users\alice, with %HOMEDRIVE% holding C: -- so
+// replacing it with a full profile path produces a string Windows would never produce. Worse,
+// it is not a profile variable at all: on a domain-joined host HOMEDRIVE and HOMEPATH come
+// from the account's directory home-folder attribute and commonly name a network share, so
+// equating them with the local profile silently pointed AppData somewhere the account does
+// not keep it -- and reported the result as confirmed. Resolving them properly needs that
+// account's environment, which is the thing this file cannot read. Left unexpanded, so the
+// guard below reports the location as undetermined.
 func expandProfileVars(raw, profileDir string) string {
 	expanded := raw
-	for _, name := range []string{"%USERPROFILE%", "%HOMEPATH%"} {
+	for _, name := range []string{"%USERPROFILE%"} {
 		if idx := strings.Index(strings.ToUpper(expanded), name); idx >= 0 {
 			expanded = expanded[:idx] + profileDir + expanded[idx+len(name):]
 		}

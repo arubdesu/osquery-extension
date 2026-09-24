@@ -23,6 +23,21 @@ type classification struct {
 //   - `settings.json` is only an MCP file under .gemini/ (would otherwise collide
 //     with VS Code's user settings)
 //   - `.mcp.json` under .claude/ is per-user; at a repo root it's project-local
+//
+// KNOWN GAP: every comparison below is
+// case-sensitive, and Windows path lookup is not. A project-local `repo\.Cursor\mcp.json`
+// is the same file an application opens as `.cursor\mcp.json`, but it misses the `.cursor`
+// case here and is emitted as client=unknown, so it disappears from `WHERE client =
+// 'cursor'`. walkableBasenames has the same problem one step earlier and rejects
+// `MCP.JSON` outright. Application-support recognition and the plugin-catalog exclusions
+// are exposed the same way.
+//
+// Direct fixed-path probes are mostly unaffected, because Windows resolves their spelling
+// itself; files discovered from real directory entries are the route that reaches this.
+//
+// Not fixed here: the remedy is an OS-parameterised comparison applied at roughly twenty
+// call sites in the most security-sensitive classification code in the table, for a benefit
+// that exists only on the platform with no CI job. See docs/upstreaming-followups.md.
 func classifyPath(absPath string) classification {
 	// Comparisons below are against slash-separated literals, so the path is normalised once
 	// rather than each site guessing. Application-support locations come from appSupport*,

@@ -157,9 +157,32 @@ func openNoFollow(path string) (*os.File, error) {
 // are two operations. The post-open identity check closes it -- if the name was swapped in
 // between, the opened file is not the one that was checked and the open is refused.
 func openBeneathComponents(baseDir, relPath string, components []string) (*os.File, error) {
+	// The base is checked here, not merely trusted from whoever supplied it. The roster
+	// Lstats a home before admitting it, but that happens once per query and this runs per
+	// read, so a profile directory swapped for a junction in between would root the handle
+	// -- and every read under it -- at the junction's target. The POSIX backend never had
+	// this gap: O_NOFOLLOW on the base open refuses a swapped base in the same syscall.
+	// os.OpenRoot has no equivalent, so the check and the identity re-check around it are
+	// what close the window.
+	baseBefore, err := os.Lstat(baseDir)
+	if err != nil {
+		return nil, fmt.Errorf("openbeneath: stat base %q: %w", baseDir, err)
+	}
+	if redirectsElsewhere(baseBefore.Mode()) {
+		return nil, fmt.Errorf("openbeneath: %w: base %q", reparsePointRefused, baseDir)
+	}
 	current, err := os.OpenRoot(baseDir)
 	if err != nil {
 		return nil, fmt.Errorf("openbeneath: open base %q: %w", baseDir, err)
+	}
+	baseAfter, err := current.Stat(".")
+	if err != nil || !os.SameFile(baseBefore, baseAfter) {
+		_ = current.Close()
+		if err != nil {
+			return nil, fmt.Errorf("openbeneath: stat base %q: %w", baseDir, err)
+		}
+		return nil, fmt.Errorf("openbeneath: %w: base %q changed between check and open",
+			reparsePointRefused, baseDir)
 	}
 	// Each intermediate root is closed as soon as its child is open; this closes whichever
 	// one is current when the function returns, including on the error paths.

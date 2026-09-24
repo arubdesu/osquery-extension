@@ -805,7 +805,14 @@ func buildWalkRoots(home, appDataRoot string) (roots []string, profileClients ma
 	dev := fsscan.DevSubdirRoots(home)
 	profileClients = make(map[string]string, len(vscodeProfileRoots))
 	out := make([]string, 0, len(dev)+len(clientConfigSubdirs)+len(vscodeProfileRoots))
-	out = append(out, dev...)
+	// Specific roots first, broad ones last. Roots are walked in order and the budget is
+	// shared, so whichever runs out of MaxDirs or clock loses whatever had not been reached
+	// -- and the dev subdirectories are whole source trees while the client dotdirs and
+	// profile directories are small and hold configuration that is certainly live. Walking
+	// ~/Documents before ~/Documents/Code/User/profiles risked spending the allowance on the
+	// former and omitting the latter, with only a truncation row to say so. The order costs
+	// nothing: the result is a set, and root dedup keeps whichever spelling is seen first,
+	// which is now the more specific one.
 	for _, s := range clientConfigSubdirs {
 		out = append(out, filepath.Join(home, s))
 	}
@@ -834,6 +841,7 @@ func buildWalkRoots(home, appDataRoot string) (roots []string, profileClients ma
 		out = append(out, absolute)
 		profileClients[profileRootKey(absolute)] = root.client
 	}
+	out = append(out, dev...)
 	return out, profileClients
 }
 

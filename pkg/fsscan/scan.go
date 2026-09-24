@@ -30,9 +30,13 @@ import (
 	"time"
 )
 
-// rootKey identifies a directory by inode+device so we can dedup walk roots
-// that name the same filesystem object via different paths (case variants on
-// case-insensitive filesystems; overlapping prefixes).
+// rootKey identifies a directory by inode+device so we can dedup walk roots that name the
+// same filesystem object via different paths: case variants on a case-insensitive
+// filesystem, or two spellings of one directory.
+//
+// Not overlapping prefixes, which this used to claim. A parent and a child are different
+// directories with different inodes, so nothing here deduplicates them; see the KNOWN GAP
+// on resolveRoot.
 type rootKey struct {
 	dev uint64
 	ino uint64
@@ -43,10 +47,34 @@ type rootKey struct {
 // A root qualifies when it resolves to an absolute path that is a directory and not a symlink,
 // and when nothing with its device and inode has been seen already. seen is updated in place.
 //
-// Deduplicating on device and inode rather than on the string matters twice over. macOS
-// defaults to case-insensitive APFS, so /Users/x/code and /Users/x/Code are one directory that
-// a string comparison reports as two, and the walker would visit everything under it twice.
-// Callers also pass overlapping roots, so /home and /home/user would both be walked in full.
+// Deduplicating on device and inode rather than on the string is what catches an alias.
+// macOS defaults to case-insensitive APFS, so /Users/x/code and /Users/x/Code are one
+// directory that a string comparison reports as two, and the walker would otherwise visit
+// everything under it twice.
+//
+// KNOWN GAP: it does not catch a parent and a child. /home
+// and /home/user are different directories with different inodes, so both are walked and
+// everything under the child is traversed twice. MaxDirs and the clock are spent twice; the
+// file limit is not, because the duplicate path is dropped by the seen map before MaxFiles
+// is consulted. The output is identical either way, so the wasted work is invisible in the
+// result.
+//
+// Reachable on Windows, contrary to what this comment claimed until a reviewer corrected
+// it. An in-profile AppData redirect puts the VS Code profile roots under the redirected
+// directory, and if that directory is one the dev-subdirectory list already names --
+// Documents is both -- then C:\Users\alice\Documents and
+// C:\Users\alice\Documents\Code\User\profiles are both roots. The claim of
+// unreachability came from probing buildWalkRoots on the host OS only, where the Windows
+// branch never runs.
+//
+// The ordering consequence is handled in buildWalkRoots, which now walks the specific
+// client and profile roots before the broad dev subdirectories, so an exhausted budget
+// loses the broad sweep rather than the profile configuration. The duplicate traversal
+// itself is left: the remedy is to walk nested roots first and skip their exact subtrees
+// while walking an ancestor, which preserves each nested root's own MaxDepth reach --
+// pruning descendant roots outright, or skipping any already-visited directory, would take
+// that reach away. Worth doing deliberately rather than inside this branch.
+// See docs/upstreaming-followups.md.
 //
 
 // descendBlocked reports whether a directory must not be descended: a pruned directory name,
@@ -101,10 +129,8 @@ const (
 // directory both do, and the caller reports them, because an inventory that silently skipped
 // part of the filesystem must not look like a complete one.
 //
-// Deduplicating on device and inode rather than on the string matters twice over. macOS
-// defaults to case-insensitive APFS, so /Users/x/code and /Users/x/Code are one directory that
-// a string comparison reports as two, and the walker would visit everything under it twice.
-// Callers also pass overlapping roots, so /home and /home/user would both be walked in full.
+// Deduplicating on device and inode catches an alias -- two spellings of one directory --
+// but not a parent and a child; see the note on rootKey above.
 func resolveRoot(root, beneath string, seen map[rootKey]struct{}) (string, rootDisposition) {
 	absRoot := root
 	if !filepath.IsAbs(absRoot) {

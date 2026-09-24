@@ -497,7 +497,16 @@ func TestQuotedEmbeddedArgumentIsOneArgument(t *testing.T) {
 	cases := []struct{ name, command, wantSpec string }{
 		{"quoted credential stays whole", `npx --token "opaque ` + secret + ` value" real-package`, "real-package"},
 		{"single quotes too", `npx --token 'opaque ` + secret + ` value' real-package`, "real-package"},
-		{"quoted value of an ordinary option", `npx --out "a b c" real-package`, "real-package"},
+		// The span stays whole, which is this test's subject. Identity is empty because
+		// --out is not a known value option, so `a b c` reads as the first operand and an
+		// operand that is not package-shaped ends the scan. The arity gap used to be
+		// masked here by walking past it to real-package, which was right by luck and is
+		// the same walk that reported a script's argument as an installed package.
+		{"quoted value of an unknown option yields no identity",
+			`npx --out "a b c" real-package`, ""},
+		// The same shape with an option whose arity is known: the value is consumed and the
+		// real package is still reported.
+		{"quoted value of a known value option", `npx --registry "a b c" real-package`, "real-package"},
 		{"quoted launcher and quoted credential",
 			`"/opt/my tool/npx" --token "opaque ` + secret + ` value" real-package`, "real-package"},
 		{"inline quoted value", `npx --flag="a b" real-package`, "real-package"},
@@ -599,7 +608,10 @@ func TestDoubleQuotedBackslashFollowsPOSIXRules(t *testing.T) {
 		{"escape before a backslash", `npx "back\\slash"`, `back\slash`, ""},
 		// Single quotes take no escapes at all, and outside quotes the escape applies to
 		// anything -- which is what makes an escaped space join rather than separate.
-		{"single quotes keep it literal", `npx 'lit\eral' real-package`, `lit\eral`, "real-package"},
+		// Identity is empty, not real-package: `lit\eral` is npx's first operand and is not
+		// package-shaped, so npx was not asked to install a registry package and
+		// real-package is an argument to whatever it was asked to run.
+		{"single quotes keep it literal", `npx 'lit\eral' real-package`, `lit\eral`, ""},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {

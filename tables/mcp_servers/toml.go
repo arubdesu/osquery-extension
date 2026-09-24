@@ -195,7 +195,24 @@ func tomlEnvKeys(entry tomlServerEntry) []string {
 // field sets differ: env_vars, bearer_token_env_var and env_http_headers exist only here.
 func looksLikeTOMLServerEntry(entry tomlServerEntry) bool {
 	return entry.Command != "" || entry.URL != "" || entry.Type != "" || entry.Transport != "" ||
-		len(entry.Args) > 0 || len(entry.Env) > 0 || len(entry.EnvVars) > 0 ||
+		len(entry.Args) > 0 || len(entry.Env) > 0 || namesAnEnvVar(entry.EnvVars) ||
 		entry.BearerTokenEnvVar != "" || len(entry.EnvHTTPHeaders) > 0 ||
 		entry.Enabled != nil || entry.Disabled != nil
+}
+
+// namesAnEnvVar reports whether env_vars holds at least one reference that decoded to a real
+// variable name.
+//
+// Counting the slice length was enough to make an entry a server, and UnmarshalTOML
+// deliberately yields an empty name for a shape it does not recognise rather than failing the
+// file. `env_vars = [123]` therefore declared a server: one element, no name, and a row with a
+// server name, no command, no endpoint and no env keys -- the same phantom the zero-valued
+// JSON entries produced before they were counted as skipped.
+func namesAnEnvVar(references []tomlEnvVar) bool {
+	for _, reference := range references {
+		if reference.Name != "" {
+			return true
+		}
+	}
+	return false
 }

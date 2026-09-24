@@ -138,6 +138,13 @@ func extractEnvelope(raw []byte) (envelopeEntries, int, error) {
 // separate row, so `warning = ”` selects the healthy servers and discards the notice with
 // the rest. Counting here is what makes the notice exist at all; reading it is the
 // operator's second query, and the README says so.
+//
+// KNOWN GAP: no single predicate expresses "complete".
+// Making one work means either propagating the incompleteness onto every server row from
+// the affected file and home -- which returns nothing for a partly walked home, so the
+// partial inventory becomes unreachable through the documented filter -- or adding a
+// scan_complete column, which costs a column and a migration for anyone selecting *.
+// A schema decision rather than a defect; see docs/upstreaming-followups.md.
 func decodeInto(out map[string]rawServerEntry, in map[string]json.RawMessage) int {
 	skipped := 0
 	for name, value := range in {

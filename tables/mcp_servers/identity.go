@@ -241,9 +241,12 @@ func guessRemoteTransport(u string, args []string) string {
 // which do not share a grammar, and no launcher's grammar is modelled completely. Docker is
 // not among them: dockerRunIdentity enumerates the booleans instead and assumes everything
 // else consumes a value, which is the inversion that made its scan stable.
-// An unlisted value option still donates its value to package_name -- `uvx --color always
-// real-server` reported package_name=always before `--color` was added below, and the next
-// unlisted one will do the same. The structural fix is per-launcher arity; the alternative
+// An unlisted value option still costs the identity. `uvx --color always real-server`
+// reported package_name=always before `--color` was added below; now that the scan stops at
+// the first operand, an unlisted option whose value is not package-shaped -- `--config
+// /path/x.json real-pkg` -- yields nothing instead. Both are the same missing arity, and the
+// second is the direction this file prefers: an unlisted option used to be masked by walking
+// past its value, which was right by luck and wrong whenever the operand really was a script. The structural fix is per-launcher arity; the alternative
 // offered in review, treating every unknown option as value-taking, empties the identity of
 // every row carrying an ordinary boolean flag, which trades a narrow wrong answer for a
 // broad missing one. That trade wants a decision rather than a patch.
@@ -264,10 +267,17 @@ var runnerValueFlags = map[string]struct{}{
 	"-P": {}, "--upgrade-group": {}, "--allow-insecure-host": {}, "--trusted-host": {},
 }
 
-// firstPositional returns the first non-flag argument that passes looksLikePackageSpec,
-// skipping any argument consumed as a value by the option before it. Rejected candidates are
-// walked past so a credential URL appearing before the real package (e.g.
-// `--registry https://u:p@h pkg`) does not permanently mask identity inference.
+// firstPositional returns the launcher's first operand, and only if it is package-shaped.
+// Arguments consumed as a value by the option before them are skipped and are not operands.
+//
+// It does not look past that operand. An earlier version did, on the reasoning that a
+// credential URL appearing before the real package should not permanently mask inference --
+// but the example it cited, `--registry https://u:p@h pkg`, is handled by arity: --registry
+// is in runnerValueFlags, so its value is consumed and never reaches the grammar check. What
+// walking past actually did was cross the launcher boundary. `npx ./server.js real-package`
+// reported real-package, which is an argument to the script npx ran, not something npx
+// installed -- the same mistake as reading the launched program's --package, --from or -m.
+// The first operand is the package or there is no package.
 //
 // The launchers that take a subcommand need the same scan starting one token later, so there
 // is one implementation and this names the no-subcommand case. Two byte-identical copies of
@@ -436,11 +446,13 @@ func firstOperandAfter(args []string, subcommand string) string {
 				continue
 			}
 		}
+		// The first operand decides it. Not package-shaped -- a URL, a script path, a
+		// tarball -- means this launcher was not asked to install a registry package,
+		// and everything after it belongs to whatever it was asked to run.
 		if looksLikePackageSpec(argument) {
 			return argument
 		}
-		// Else: not a flag but also not package-spec-shaped (URL, path, tarball, etc.).
-		// Skip and keep looking.
+		return ""
 	}
 	return ""
 }

@@ -3,6 +3,7 @@ package mcp_servers
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -604,5 +605,58 @@ command = 123
 	}
 	if len(names) != 1 || names[0] != "good" {
 		t.Errorf("want only the healthy server, got %v", names)
+	}
+}
+
+// An env_vars list whose entries decoded to nothing does not declare a server.
+//
+// UnmarshalTOML yields an empty name for a shape it does not recognise rather than failing
+// the file -- deliberately, because one bad reference must not hide every other server. But
+// the entry check counted the slice length, so `env_vars = [123]` made a table a server:
+// a row with a name, no command, no endpoint and no env keys, and no warning to say it was
+// nothing. The same phantom the zero-valued JSON entries produced.
+func TestEnvVarsOnlyDeclaresAServerWhenItNamesOne(t *testing.T) {
+	cases := []struct {
+		name, doc string
+		servers   int
+		envKeys   []string
+	}{
+		{"an unrecognised env_vars shape declares nothing",
+			"[mcp_servers.ghost]\nenv_vars = [123]\n", 0, nil},
+		{"a bare string names a variable",
+			"[mcp_servers.real]\nenv_vars = [\"API_TOKEN\"]\n", 1, []string{"API_TOKEN"}},
+		{"the object form names one too",
+			"[mcp_servers.obj]\nenv_vars = [{name = \"API_TOKEN\"}]\n", 1, []string{"API_TOKEN"}},
+		// A real reference beside an unreadable one still declares a server, and the
+		// unreadable one is simply absent from env_keys.
+		{"a real reference beside an unreadable one",
+			"[mcp_servers.mixed]\nenv_vars = [123, \"API_TOKEN\"]\n", 1, []string{"API_TOKEN"}},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			rows, err := extractCodexTOML([]byte(testCase.doc))
+			if testCase.servers == 0 {
+				if err == nil {
+					t.Fatalf("expected no decodable entries, got %+v", rows)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			var servers int
+			for _, row := range rows {
+				if row.Warning != "" {
+					continue
+				}
+				servers++
+				if !reflect.DeepEqual(row.EnvKeys, testCase.envKeys) {
+					t.Errorf("env_keys = %v, want %v", row.EnvKeys, testCase.envKeys)
+				}
+			}
+			if servers != testCase.servers {
+				t.Errorf("got %d server rows, want %d: %+v", servers, testCase.servers, rows)
+			}
+		})
 	}
 }

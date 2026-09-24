@@ -1752,3 +1752,41 @@ func TestPythonCompactOptionForms(t *testing.T) {
 		})
 	}
 }
+
+// A launcher's first operand is the package, or there is no package.
+//
+// The scan used to walk past an operand that failed the package grammar and report a later
+// one instead. That crossed the launcher boundary in the same way reading the launched
+// program's --package or --from did: `npx ./server.js real-package` reported real-package,
+// which is an argument to the script npx ran. The justification on record -- that a
+// credential URL before the package should not mask inference -- was already handled by
+// arity, since --registry consumes its own value.
+func TestFirstOperandDecidesIdentity(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"a script path is not a package and ends the scan",
+			[]string{"./server.js", "real-package"}, ""},
+		{"an absolute script path likewise",
+			[]string{"/abs/path/server.js", "somepkg"}, ""},
+		{"a tarball URL is the operand and is not representable",
+			[]string{"https://example.com/tarball.tgz", "pkg"}, ""},
+		// Arity, not walking past, is what protects these.
+		{"a known value option's value is consumed",
+			[]string{"--registry", "https://u:p@h", "pkg"}, "pkg"},
+		{"a credential-named option's value is skipped",
+			[]string{"--auth-token", "opaquevalue", "real-server"}, "real-server"},
+		{"an ordinary value option", []string{"--python", "3.12", "real-server"}, "real-server"},
+		{"a boolean flag", []string{"-y", "pkg"}, "pkg"},
+		{"the plain case", []string{"pkg"}, "pkg"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := firstPositional(testCase.args); got != testCase.want {
+				t.Errorf("firstPositional(%q) = %q, want %q", testCase.args, got, testCase.want)
+			}
+		})
+	}
+}
