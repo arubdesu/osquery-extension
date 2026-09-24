@@ -731,6 +731,52 @@ func TestFlatShapeCountsEntriesThatNameAServerKey(t *testing.T) {
 // was therefore reported as transport=http: a protocol the file does not name, stated with
 // the same confidence as one it does. The next transport MCP adds would arrive disguised as
 // an existing one rather than as something to look at.
+// A transport is only guessed from an http or https endpoint.
+//
+// Any non-empty URL without an SSE marker became transport=http, so `wss://example.test/mcp`
+// was reported as HTTP and a URL with no recoverable host was reported as HTTP with no
+// endpoint at all. `WHERE transport = 'http'` then returned endpoints that are not HTTP.
+// This is the same answer normalizeTransport gives for a declared transport the table does
+// not support; the scheme deserves it too.
+func TestTransportIsGuessedOnlyFromHTTPSchemes(t *testing.T) {
+	cases := []struct{ name, doc, transport, endpoint string }{
+		{"a websocket endpoint", `{"mcpServers":{"x":{"url":"wss://example.test/mcp"}}}`,
+			"unknown", "wss://example.test"},
+		{"a file URL", `{"mcpServers":{"x":{"url":"file:///etc/passwd"}}}`, "unknown", ""},
+		{"no recoverable host", `{"mcpServers":{"x":{"url":"not a url"}}}`, "unknown", ""},
+		{"an ordinary https endpoint", `{"mcpServers":{"x":{"url":"https://example.test/mcp"}}}`,
+			"http", "https://example.test"},
+		{"sse is still detected", `{"mcpServers":{"x":{"url":"https://example.test/sse"}}}`,
+			"sse", "https://example.test"},
+		{"http with a port", `{"mcpServers":{"x":{"url":"http://localhost:8080/foo"}}}`,
+			"http", "http://localhost:8080"},
+		// A declared transport still wins: the file said sse, so the row says sse whatever
+		// the scheme is.
+		{"an explicit transport overrides the scheme",
+			`{"mcpServers":{"x":{"type":"sse","url":"wss://example.test/mcp"}}}`,
+			"sse", "wss://example.test"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			rows, err := extractEnvelopeSimple([]byte(testCase.doc))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if len(rows) != 1 {
+				t.Fatalf("got %d rows, want 1: %+v", len(rows), rows)
+			}
+			row := rows[0]
+			inferIdentity(&row)
+			if row.Transport != testCase.transport {
+				t.Errorf("transport = %q, want %q", row.Transport, testCase.transport)
+			}
+			if row.URL != testCase.endpoint {
+				t.Errorf("endpoint = %q, want %q", row.URL, testCase.endpoint)
+			}
+		})
+	}
+}
+
 func TestDeclaredUnknownTransportIsNotReplacedByAGuess(t *testing.T) {
 	cases := []struct{ name, doc, want string }{
 		{"unknown type beside a url", `{"mcpServers":{"w":{"type":"websocket","url":"wss://mcp.example.test"}}}`, "unknown"},

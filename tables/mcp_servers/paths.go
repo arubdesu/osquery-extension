@@ -24,7 +24,16 @@ import (
 //
 //	macOS    ~/Library/Application Support
 //	Windows  %APPDATA%          -> ~/AppData/Roaming
-//	Linux    $XDG_CONFIG_HOME   -> ~/.config
+//	Linux    ~/.config, which is $XDG_CONFIG_HOME's *default* and not necessarily its value
+//
+// KNOWN GAP on Linux: XDG_CONFIG_HOME can name any
+// absolute directory, and Electron resolves a VS Code fork's userData under it when it is
+// set, so a native install can keep its active mcp.json somewhere this never looks. Reading
+// the variable is not available -- the environment belongs to the daemon's account, not to
+// the account being scanned, which is the whole reason these roots are derived from the home
+// directory. Resolving it per account needs a source that records it (a login manager or the
+// user's own systemd environment), and until there is one this reports the conventional
+// location only. The snap and flatpak handling below covers redirected sandboxes, not this.
 //
 // Windows Roaming rather than Local is correct for every client here: VS Code, Claude
 // Desktop and the Cline extension all write user configuration to Roaming, reserving Local

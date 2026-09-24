@@ -182,12 +182,28 @@ func plainLauncher(name string) func(*Server, []string) {
 // anywhere classified /sse-notify, /sse2 and even a query string containing /sse as SSE, and
 // that value is emitted as the server's transport.
 func guessRemoteTransport(u string, args []string) string {
-	if parsed, err := url.Parse(u); err == nil {
-		for _, segment := range strings.Split(parsed.Path, "/") {
-			switch strings.ToLower(segment) {
-			case "sse", "events":
-				return "sse"
-			}
+	parsed, err := url.Parse(u)
+	// Only an http or https endpoint may be guessed at. Falling through to "http" for
+	// anything else reported `wss://example.test/mcp` as transport=http, and a URL with no
+	// recoverable host as transport=http with no endpoint at all -- a row claiming a
+	// protocol its own config never named, which is what normalizeTransport was changed to
+	// stop doing for an explicitly declared unknown transport. The same answer is owed when
+	// the scheme rather than the type field is the thing this table does not support.
+	//
+	// "unknown" rather than empty: it is one of the four documented values of the column,
+	// and an empty transport drops out of every query that filters on it.
+	if err != nil || parsed.Host == "" {
+		return "unknown"
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+	default:
+		return "unknown"
+	}
+	for _, segment := range strings.Split(parsed.Path, "/") {
+		switch strings.ToLower(segment) {
+		case "sse", "events":
+			return "sse"
 		}
 	}
 	for _, a := range args {

@@ -138,11 +138,18 @@ func resolveRoot(root, beneath string, seen map[rootKey]struct{}) (string, rootD
 			return "", rootUnreadable
 		}
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		// Never followed: a symlinked root is how a planted link escapes a bounded walk, and
+	if redirectsElsewhere(info.Mode()) {
+		// Never followed: a linked root is how a planted link escapes a bounded walk, and
 		// the walk is bounded precisely so it cannot be pointed somewhere else. But a
 		// developer whose ~/code points at another volume is the ordinary reason this fires,
 		// and their project-local configs are then simply absent from the table.
+		//
+		// Reparse points as well as symlinks, because a Windows junction is neither
+		// reported as a symlink nor, being a reparse point, always reported as a
+		// directory. Testing ModeSymlink alone sent one down the !IsDir path below, where
+		// it was counted as rootNotDirectory: the root's contents went missing and
+		// SymlinkedRoots stayed at zero, so nothing in the result said a root had been
+		// refused.
 		return "", rootSymlink
 	}
 	if !info.IsDir() {
@@ -193,7 +200,13 @@ func checkComponentsBeneath(absRoot, beneath string) rootDisposition {
 				return rootUnreadable
 			}
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
+		// The same two bits as above. This is the more serious of the pair: an
+		// intermediate junction passed the check, the root below it was accepted, and
+		// WalkDir then traversed the junction's target. ReadCandidate still refuses to
+		// read a candidate through it, so nothing was disclosed -- but the walk did I/O it
+		// was bounded not to do, and every candidate under that root failed its reopen as
+		// ordinary absence, leaving a short inventory with no warning attached.
+		if redirectsElsewhere(info.Mode()) {
 			return rootSymlink
 		}
 	}

@@ -163,3 +163,43 @@ func TestAccountIDPrefersTheSIDOnlyWhenThereIsOne(t *testing.T) {
 		}
 	}
 }
+
+// A declared home that is a link to somewhere else is refused whichever shape the platform
+// reports it in.
+//
+// The check tested ModeSymlink alone. On Windows a junction is reported as ModeIrregular,
+// so one was admitted as a usable home -- and a home is the trusted base OpenBeneath roots
+// os.Root at, which means every read for that account resolved under the junction's target
+// rather than the profile the roster named. Creating a junction needs no privilege.
+//
+// Asserted on the mode rather than on a real reparse point because no test on this platform
+// can create one; the production check now reads the same two bits platform_windows.go has
+// always used.
+func TestRedirectsElsewhereCoversBothLinkModes(t *testing.T) {
+	cases := []struct {
+		name   string
+		mode   os.FileMode
+		refuse bool
+	}{
+		{"a plain directory", os.ModeDir | 0o755, false},
+		{"a symlink, as POSIX reports one", os.ModeSymlink | 0o777, true},
+		// ModeIrregular with no ModeDir, which is what Go actually reports for a
+		// junction: os/types_windows.go withholds ModeDir for a name-surrogate reparse
+		// tag on purpose, so that Lstat plus IsDir lets a caller walk directories without
+		// following links. The first version of this case set ModeDir as well and was not
+		// load-bearing -- an implementation requiring *both* bits passed the whole table,
+		// because the case below satisfies it through ModeSymlink, while a real junction
+		// went straight back to being admitted.
+		{"a junction, as Go reports one", os.ModeIrregular | 0o755, true},
+		{"an irregular directory", os.ModeIrregular | os.ModeDir | 0o755, true},
+		{"both bits", os.ModeSymlink | os.ModeIrregular, true},
+		{"a regular file", 0o644, false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := redirectsElsewhere(testCase.mode); got != testCase.refuse {
+				t.Errorf("redirectsElsewhere(%v) = %v, want %v", testCase.mode, got, testCase.refuse)
+			}
+		})
+	}
+}

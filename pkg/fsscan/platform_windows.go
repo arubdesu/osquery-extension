@@ -166,13 +166,31 @@ func openBeneathComponents(baseDir, relPath string, components []string) (*os.Fi
 	defer func() { _ = current.Close() }()
 
 	for i, component := range components[:len(components)-1] {
-		if _, err := lstatNoReparse(current, component, i, relPath); err != nil {
+		before, err := lstatNoReparse(current, component, i, relPath)
+		if err != nil {
 			return nil, err
 		}
 		next, err := current.OpenRoot(component)
 		if err != nil {
 			return nil, fmt.Errorf("openbeneath: open %q (component %d of %q): %w",
 				component, i, relPath, err)
+		}
+		// The check and the open are two calls, so the directory can be replaced between
+		// them. os.Root permits a reparse point that resolves inside its own root, which
+		// is exactly why lstatNoReparse exists -- and it is also what makes the gap
+		// reachable: a junction planted in that window points somewhere else within the
+		// root and os.Root follows it without complaint. The final component has carried
+		// an identity re-check since this was written; the directories leading to it had
+		// none, so a swap one level up went unnoticed.
+		after, statErr := next.Stat(".")
+		if statErr != nil || !os.SameFile(before, after) {
+			_ = next.Close()
+			if statErr != nil {
+				return nil, fmt.Errorf("openbeneath: stat %q (component %d of %q): %w",
+					component, i, relPath, statErr)
+			}
+			return nil, fmt.Errorf("openbeneath: %w: %q changed between check and open "+
+				"(component %d of %q)", reparsePointRefused, component, i, relPath)
 		}
 		_ = current.Close()
 		current = next

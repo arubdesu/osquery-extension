@@ -110,8 +110,12 @@ func TestDiscoverAllReportsSkippedHomesPerAccount(t *testing.T) {
 	// Filtered to exactly the skipped account: the diagnostic must still arrive, since this is
 	// the query that would otherwise return nothing at all.
 	rows := withoutStandingNotes(DiscoverAll(context.Background(), rosterOf(t, root), map[string]struct{}{"alice": {}}))
+	// Fatal, not Error: the identity-contract check below indexes rows[0], so on an empty
+	// result a non-fatal failure fell through into an out-of-range panic. That aborts the
+	// whole test binary, so the real message here was replaced by a stack trace and every
+	// later test in the package went unreported.
 	if len(rows) != 1 || rows[0].User != "alice" || rows[0].Warning == "" {
-		t.Errorf("a query for the skipped account must still explain itself: %+v", rows)
+		t.Fatalf("a query for the skipped account must still explain itself: %+v", rows)
 	}
 	if rows[0].Transport != "unknown" || rows[0].Confidence != "low" {
 		t.Errorf("diagnostic breaks the identity contract: %+v", rows[0])

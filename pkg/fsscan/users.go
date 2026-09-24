@@ -295,12 +295,12 @@ func homesFromUsers(rows []map[string]string) UserHomes {
 				Reason: reason, HomeUnusable: unusable})
 			continue
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
+		if redirectsElsewhere(info.Mode()) {
 			// Refusing to follow is deliberate -- never traverse out of the home reported
 			// for an account -- but the account behind it still goes unrepresented.
 			result.Skipped = append(result.Skipped, Omission{
 				Name: name, ID: accountID(row), Path: home,
-				Reason: "home directory is a symlink, which is not followed"})
+				Reason: "home directory is a symlink or reparse point, which is not followed"})
 			continue
 		}
 		if !info.IsDir() {
@@ -316,6 +316,23 @@ func homesFromUsers(rows []map[string]string) UserHomes {
 		result.Homes = append(result.Homes, UserHome{Name: name, ID: accountID(row), Path: home})
 	}
 	return result
+}
+
+// redirectsElsewhere reports whether a directory entry is a link to somewhere else rather
+// than a directory in its own right. Used for a declared home and for every walk root.
+//
+// ModeIrregular alongside ModeSymlink, because on Windows a junction is the shape that
+// matters and Go does not report it as a symlink. Testing ModeSymlink alone admitted one:
+// the account was accepted, the junction became the trusted base that OpenBeneath roots
+// os.Root at, and every read for that user resolved under the junction's target instead of
+// the profile the roster named. platform_windows.go has used both bits as the reparse
+// signal since it was written; this check is the one place that did not, 180 lines from the
+// code that gets it right.
+//
+// Junctions need no privilege to create, which is what makes this worth refusing rather
+// than resolving.
+func redirectsElsewhere(mode os.FileMode) bool {
+	return mode&(os.ModeSymlink|os.ModeIrregular) != 0
 }
 
 // DevSubdirRoots returns the absolute paths under home that typically contain dev projects.
