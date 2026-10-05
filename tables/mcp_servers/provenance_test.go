@@ -195,6 +195,7 @@ func TestUnreadableApprovalIsUnknown(t *testing.T) {
 		writeTestFile(t, filepath.Join(home, ".claude", "settings.json"), `{ not json`)
 		writeTestFile(t, filepath.Join(home, ".claude", "plugins", "cache", "mp", "p",
 			"1.0.0", ".mcp.json"), `{"mcpServers":{"orphan":{"command":"npx","args":["x"]}}}`)
+		writeInstalledPlugins(t, home, map[string]string{"p@mp": "1.0.0"})
 
 		var got approvalState
 		for _, row := range serversOnly(discoverForTest("alice", home)) {
@@ -214,6 +215,7 @@ func TestUnreadableApprovalIsUnknown(t *testing.T) {
 		home := t.TempDir()
 		writeTestFile(t, filepath.Join(home, ".claude", "plugins", "cache", "mp", "p",
 			"1.0.0", ".mcp.json"), `{"mcpServers":{"never":{"command":"npx","args":["x"]}}}`)
+		writeInstalledPlugins(t, home, map[string]string{"p@mp": "1.0.0"})
 
 		var got approvalState
 		for _, row := range serversOnly(discoverForTest("alice", home)) {
@@ -243,6 +245,7 @@ func TestHomeSettingsLocalIsNotAGlobalOverride(t *testing.T) {
 		`{"enabledPlugins":{"p@mp":false}}`)
 	writeTestFile(t, filepath.Join(home, ".claude", "plugins", "cache", "mp", "p",
 		"1.0.0", ".mcp.json"), `{"mcpServers":{"srv":{"command":"npx","args":["x"]}}}`)
+	writeInstalledPlugins(t, home, map[string]string{"p@mp": "1.0.0"})
 
 	var got approvalState
 	for _, row := range serversOnly(discoverForTest("alice", home)) {

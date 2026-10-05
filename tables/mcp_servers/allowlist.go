@@ -354,6 +354,14 @@ const maxServerNamePlaceholderIndex = 999
 // correlation across a fleet needs a stable pseudonym, and a stable pseudonym is the
 // attackable thing. Recorded as a follow-up rather than split half-way.
 func serverNamePlaceholder(relSourcePath string, index int) string {
+	// No source means no position to name, and `[redacted:]` names a file that was never
+	// read -- a value this table emitted once already, for a different cause, and which is
+	// worse than saying nothing. The marker alone is the honest answer: the name was refused
+	// and nothing locates it. Reachable only when a row is published without having gone
+	// through the discovery pass that assigns ordinals.
+	if relSourcePath == "" {
+		return redact.RedactedMark
+	}
 	if index > maxServerNamePlaceholderIndex {
 		index = maxServerNamePlaceholderIndex
 	}
@@ -367,12 +375,38 @@ func serverNamePlaceholder(relSourcePath string, index int) string {
 // maxServerName bounds the name column.
 const maxServerName = 256
 
+// serverNameRe is the format of a publishable server name.
+//
+// This column was the last free-text one left without a grammar, and it was checked only
+// negatively: empty, the redaction marker alone, a control character, or too long. Everything
+// else passed, so a configuration whose server *key* was `API_KEY=opaqueValue` or
+// `Authorization: Bearer opaqueValue` published that key verbatim with no warning and
+// `scan_complete = 1`. Redaction does not catch those, because every secret pattern it knows
+// needs a leading `-` or a recognised prefix. The same reasoning that narrowed
+// command_basename applies here and was simply not carried across.
+//
+// The shape is deliberately the same as commandBasenameRe: an alphanumeric first character,
+// then alphanumerics, dot, underscore and hyphen. That admits every name a client or
+// marketplace actually uses -- `crystal-mcp`, `google-workspace`, `node_repl`, `1password`,
+// `io.github.example` -- and excludes the two things that make a name a carrier: `=`, which
+// an assignment needs, and whitespace, which separates a header name from its value.
+//
+// Two costs, stated rather than buried. A name containing `@`, `/` or `:` is refused even
+// though a person might reasonably type one, so a server called `foo@v2` loses its name. And
+// a non-ASCII name is refused, for the homoglyph reason that applies to the launcher
+// basename: a Cyrillic er in `nрx` reads as `npx` in any console, and a server name is
+// exactly the string an operator would eyeball. Both losses are reported, never silent: the
+// row gets the positional placeholder and warnServerNameUnrepresentable, so the server is
+// still inventoried and still counted.
+var serverNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
 // serverNameUnrepresentable reports whether a redacted name can be published.
 //
-// Four conditions, each a way a name survives redaction and still should not reach a column:
-// it redacted to nothing, it redacted to the marker alone (so the whole name was a secret),
-// it carries a control character or newline (which breaks a log line and reads as two rows),
-// or it is longer than any name a person types.
+// The empty and marker-only cases are tested explicitly even though the grammar refuses both,
+// because they mean something different: the name was wholly a secret rather than merely the
+// wrong shape, and a reader of this function should not have to derive that from a regex.
+// Control characters and newlines need no separate loop any more -- the grammar excludes
+// them, which is the point of stating a format instead of enumerating ways to fail.
 func serverNameUnrepresentable(redacted string) bool {
 	if redacted == "" || redacted == redact.RedactedMark {
 		return true
@@ -380,12 +414,18 @@ func serverNameUnrepresentable(redacted string) bool {
 	if len(redacted) > maxServerName {
 		return true
 	}
-	for i := 0; i < len(redacted); i++ {
-		if redacted[i] < 0x20 || redacted[i] == 0x7f {
-			return true
-		}
-	}
-	return false
+	// The marker stands in for one name-shaped character before the grammar runs, because a
+	// name that redaction has already cleaned should keep its marker rather than lose the
+	// whole name to a placeholder. `[REDACTED]` contains brackets the grammar refuses, so
+	// matching it directly would send every partially-redacted name down the placeholder
+	// path -- discarding the readable half of `release-[REDACTED]` for no gain, since the
+	// part that needed removing is already gone.
+	//
+	// Substituting rather than stripping is what keeps the check honest: `API_KEY=[REDACTED]`
+	// becomes `API_KEY=x` and is still refused for its `=`, and
+	// `Authorization: Bearer [REDACTED]` is still refused for its spaces. Only the marker
+	// itself is forgiven, not the text around it.
+	return !serverNameRe.MatchString(strings.ReplaceAll(redacted, redact.RedactedMark, "x"))
 }
 
 // validateEnum maps a value onto a closed set, substituting a documented fallback.

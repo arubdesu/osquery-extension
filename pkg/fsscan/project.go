@@ -48,6 +48,14 @@ var (
 	// ErrCloudPlaceholder means the file exists but its content is not local, so reading it
 	// would make the provider download it.
 	ErrCloudPlaceholder = errors.New("fsscan: file content is not local; reading it would download it")
+
+	// ErrUserspaceFilesystem means the file is on a filesystem implemented in userspace, so
+	// a read is serviced by another process that may fetch the content over a network first.
+	// Distinct from ErrCloudPlaceholder because the evidence is different in kind: a
+	// placeholder attribute names *this file* as non-local, while a filesystem type says only
+	// that reads here are not bounded by local I/O. Folding them together would have the row
+	// claim a cloud provider is involved when the mount might be sshfs or gocryptfs.
+	ErrUserspaceFilesystem = errors.New("fsscan: file is on a userspace filesystem; a read may fetch it on demand")
 )
 
 // ContainProjectPath turns a path recorded in a configuration file into a path relative to
@@ -442,6 +450,11 @@ func ReadProjectFile(home, projRel, relFile string, opts ReadOpts) ([]byte, erro
 	// a placeholder, and the read below is the thing that produces a real diagnosis -- so
 	// refusing here would relabel some other failure as the one refusal that tells an
 	// operator their provider is involved.
+	// Before the per-file attribute check, because on the one platform where this fires the
+	// attribute check cannot answer at all, and because it is the cheaper call.
+	if reason := fileOnUserspaceFilesystem(file); reason != nil {
+		return nil, reason
+	}
 	if evicted, attrErr := placeholder(file); attrErr == nil && evicted {
 		return nil, fmt.Errorf("%w: content is not local", ErrCloudPlaceholder)
 	}

@@ -250,3 +250,52 @@ func TestWarningValueIsAClosedSet(t *testing.T) {
 		}
 	}
 }
+
+// Every warning code has a sentence, and the catalogue has no members this test does not know
+// about.
+//
+// The column is assembled from a fixed sentence chosen by code, so a code with no entry in
+// warnSentences publishes an empty warning -- a row that says something was lost without
+// saying what. Three rounds of new codes were checked by hand instead, which is the sort of
+// step that belongs in a test.
+//
+// The count assertion is what makes this self-maintaining: adding a constant without adding it
+// here fails, rather than silently going unchecked.
+func TestEveryWarningCodeHasASentence(t *testing.T) {
+	codes := []warnCode{
+		warnRosterUnreachable, warnRosterQueryFailed, warnRosterAccountUnnamed,
+		warnAccountNotInRoster, warnAccountNonLogin, warnAccountNoHome, warnAccountHomeMissing,
+		warnAccountHomeUnstattable, warnAccountHomeRedirected, warnAccountHomeNotDirectory,
+		warnAccountsHomeUnusable, warnHomeUnreadable, warnBudgetExhaustedPreHome,
+		warnCancelledPreHome, warnBudgetExhaustedOpening, warnBudgetExhaustedInHome,
+		warnCancelledInHome, warnAppDataUndetermined, warnAppDataRedirectedOut,
+		warnProfileListUnreadable, warnProjectListUnreadable, warnProjectListTruncated,
+		warnProjectOutsideHome, warnProjectMalformed, warnProjectRemoteOrigin,
+		warnProjectCloudPlaceholder, warnProjectUserspaceFS, warnProjectRefused,
+		warnProjectUntrusted, warnProjectTrustUnknown, warnApprovalSettingsUnreadable,
+		warnWorkspaceListUnreadable, warnWorkspaceListTruncated, warnWorkspaceRecordUnreadable,
+		warnWorkspaceRecordMalformed, warnPluginListUnreadable, warnPluginListTruncated,
+		warnPluginSettingsUnreadable, warnPluginRecordsUnreadable, warnPluginSuperseded,
+		warnPluginManifestUnreadable, warnPluginManifestUnsupported, warnPluginManifestTruncated,
+		warnPluginManifestMissing, warnPluginManifestInvalid, warnPluginShadowedDecl, warnPluginSelectionUnknown,
+		warnSourceUnreadable, warnSourceTooLarge, warnParseFailed, warnEntriesSkipped,
+		warnCommandBasenameDropped, warnServerNameUnrepresentable, warnSourceContextPathDropped,
+		warnURLEndpointDropped, warnEnvKeyDropped, warnEnvHeaderLiteral, warnIdentityDropped,
+		warnUserIDDropped, warnUnknownLauncherOption,
+	}
+	if len(codes) != len(warnSentences) {
+		t.Fatalf("this test knows %d codes and the catalogue holds %d; a code was added "+
+			"without being accounted for here", len(codes), len(warnSentences))
+	}
+	seen := map[warnCode]bool{}
+	for _, code := range codes {
+		if seen[code] {
+			t.Errorf("%s listed twice", code)
+		}
+		seen[code] = true
+		if rendered := (warning{Code: code}).render(); rendered == "" {
+			t.Errorf("%s renders an empty warning, so a row would report a loss with no "+
+				"statement of what was lost", code)
+		}
+	}
+}

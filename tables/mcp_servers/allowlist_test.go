@@ -2,6 +2,7 @@ package mcp_servers
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -651,7 +652,8 @@ func TestScopeBoundariesDoNotDegradeCompleteness(t *testing.T) {
 	}
 	// In scope and not read: a real loss.
 	for _, code := range []warnCode{
-		warnProjectCloudPlaceholder, warnProjectRefused, warnProjectListUnreadable,
+		warnProjectCloudPlaceholder, warnProjectUserspaceFS, warnProjectRefused,
+		warnProjectListUnreadable,
 		warnProjectListTruncated,
 	} {
 		if !code.degradesCompleteness() {
@@ -792,5 +794,102 @@ func TestEveryProducibleSourceContextIsAllowed(t *testing.T) {
 		if got, dropped := allowedSourceContext(context, "/home/alice"); dropped {
 			t.Errorf("allowedSourceContext(%q) dropped the path, got %q", context, got)
 		}
+	}
+}
+
+// A credential-shaped server *key* must not reach the column.
+//
+// server_name was the last free-text column checked only negatively -- empty, marker-only,
+// control characters, too long -- so anything else passed. A configuration whose key was
+// `API_KEY=opaqueValue` or `Authorization: Bearer opaqueValue` published it verbatim, with no
+// warning and scan_complete = 1, because every secret pattern redaction knows needs a leading
+// `-` or a recognised prefix and a bare assignment has neither.
+//
+// Driven from the parser through row emission rather than against the predicate, because that
+// is the path that was broken: the predicate was reached, it simply said yes.
+func TestServerNameRefusesCredentialShapedKeys(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		key       string
+		published bool
+	}{
+		{"assignment", "API_KEY=opaqueSecretValue123", false},
+		{"authorization header", "Authorization: Bearer opaqueSecretValue123", false},
+		{"bare space", "my server", false},
+		{"shell metacharacter", "srv;rm -rf /", false},
+		{"non-ascii homoglyph", "nрx-server", false},
+		// Legitimate names, which the grammar must not cost. These are the shapes clients
+		// and marketplaces actually produce.
+		{"hyphenated", "crystal-mcp", true},
+		{"underscored", "node_repl", true},
+		{"dotted reverse-dns", "io.github.example", true},
+		{"leading digit", "1password", true},
+		{"plain", "terraform", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := fmt.Sprintf(`{"mcpServers":{%q:{"command":"npx","args":["x"]}}}`, tc.key)
+			rows := finishProcessing("/home/alice", []byte(doc), nil,
+				"/home/alice/.cursor/mcp.json", "alice", "cursor", false, MaxFileSize,
+				extractEnvelopeSimple)
+			if len(rows) != 1 {
+				t.Fatalf("expected one row, got %d", len(rows))
+			}
+			published := serverToRow(rows[0])
+			if tc.published {
+				if published["server_name"] != tc.key {
+					t.Errorf("a legitimate name was refused: server_name = %q, want %q",
+						published["server_name"], tc.key)
+				}
+				return
+			}
+			if published["server_name"] == tc.key {
+				t.Fatalf("the key reached the column verbatim: %q", published["server_name"])
+			}
+			// Refused names are replaced by the positional placeholder, never emptied, so
+			// the server is still inventoried and still counted.
+			if published["server_name"] == "" {
+				t.Error("a refused name emptied the column instead of using a placeholder")
+			}
+			// And the refusal is reported, so the row is not mistaken for a clean one.
+			if published["warning"] == "" {
+				t.Error("a refused name produced no warning")
+			}
+			// Still complete, deliberately. scan_complete means every server declared in
+			// this source was listed, and it was -- the name is positional rather than
+			// missing. A refused column is scope-descriptive for exactly this reason, so
+			// `WHERE scan_complete = 1` keeps selecting rows whose source was fully read.
+			if published["scan_complete"] != "1" {
+				t.Errorf("scan_complete = %q: a refused name does not make the listing "+
+					"incomplete, the server is still inventoried",
+					published["scan_complete"])
+			}
+			// The original is kept internally, because approval lookup and the placeholder
+			// tie-break both key on the name the file spelled.
+			if rows[0].rawName != tc.key {
+				t.Errorf("rawName = %q, want the original %q", rows[0].rawName, tc.key)
+			}
+		})
+	}
+}
+
+// A name redaction has already cleaned keeps its marker rather than losing the readable half.
+func TestPartiallyRedactedServerNameKeepsItsMarker(t *testing.T) {
+	key := "release-ghp_" + strings.Repeat("A", 36)
+	doc := fmt.Sprintf(`{"mcpServers":{%q:{"command":"npx"}}}`, key)
+	rows := finishProcessing("/home/alice", []byte(doc), nil,
+		"/home/alice/.cursor/mcp.json", "alice", "cursor", false, MaxFileSize,
+		extractEnvelopeSimple)
+	if len(rows) != 1 {
+		t.Fatalf("expected one row, got %d", len(rows))
+	}
+	published := serverToRow(rows[0])["server_name"]
+	if !strings.Contains(published, redact.RedactedMark) {
+		t.Errorf("server_name = %q, expected the readable half plus the marker", published)
+	}
+	if strings.Contains(published, "ghp_") {
+		t.Errorf("the credential survived: %q", published)
+	}
+	if strings.HasPrefix(published, "[redacted:") {
+		t.Errorf("a cleaned name was sent down the placeholder path: %q", published)
 	}
 }

@@ -723,6 +723,8 @@ func projectRefusalWarning(err error, maxSize int64) (warning, bool) {
 		return warning{}, false
 	case fsscan.ClassCloudPlaceholder:
 		return warning{Code: warnProjectCloudPlaceholder, Count: 1}, true
+	case fsscan.ClassUserspaceFilesystem:
+		return warning{Code: warnProjectUserspaceFS, Count: 1}, true
 	case fsscan.ClassHardLink, fsscan.ClassForeignOwner:
 		return warning{Code: warnProjectRefused, Class: class}, true
 	case fsscan.ClassTooLarge:

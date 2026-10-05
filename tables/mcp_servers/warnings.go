@@ -73,6 +73,7 @@ const (
 	warnProjectMalformed        warnCode = "project_path_malformed"
 	warnProjectRemoteOrigin     warnCode = "project_remote_origin"
 	warnProjectCloudPlaceholder warnCode = "project_cloud_placeholder"
+	warnProjectUserspaceFS      warnCode = "project_userspace_filesystem"
 	warnProjectRefused          warnCode = "project_read_refused"
 	warnProjectUntrusted        warnCode = "project_untrusted"
 	warnProjectTrustUnknown     warnCode = "project_trust_unknown"
@@ -89,9 +90,18 @@ const (
 
 	// Claude Code plugins, which declare their own servers under
 	// ~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/.mcp.json.
-	warnPluginListUnreadable     warnCode = "plugin_list_unreadable"
-	warnPluginListTruncated      warnCode = "plugin_list_truncated"
-	warnPluginSettingsUnreadable warnCode = "plugin_settings_unreadable"
+	warnPluginListUnreadable      warnCode = "plugin_list_unreadable"
+	warnPluginListTruncated       warnCode = "plugin_list_truncated"
+	warnPluginSettingsUnreadable  warnCode = "plugin_settings_unreadable"
+	warnPluginRecordsUnreadable   warnCode = "plugin_records_unreadable"
+	warnPluginSuperseded          warnCode = "plugin_version_superseded"
+	warnPluginManifestUnreadable  warnCode = "plugin_manifest_unreadable"
+	warnPluginManifestUnsupported warnCode = "plugin_manifest_unsupported"
+	warnPluginManifestTruncated   warnCode = "plugin_manifest_truncated"
+	warnPluginManifestMissing     warnCode = "plugin_manifest_missing_source"
+	warnPluginManifestInvalid     warnCode = "plugin_manifest_invalid_declaration"
+	warnPluginShadowedDecl        warnCode = "plugin_declaration_shadowed"
+	warnPluginSelectionUnknown    warnCode = "plugin_selection_unknown"
 
 	// One source file.
 	warnSourceUnreadable warnCode = "source_unreadable"
@@ -269,6 +279,8 @@ var warnSentences = map[warnCode]string{
 		"filesystem and were not inspected",
 	warnProjectCloudPlaceholder: "recorded projects are held by a cloud storage provider " +
 		"and were not inspected, because reading them would download their contents",
+	warnProjectUserspaceFS: "recorded projects are on a filesystem implemented in " +
+		"userspace, where a read may fetch their contents on demand, and were not inspected",
 	warnProjectRefused: "a project configuration file was refused by a safety check " +
 		"rather than being absent, so it exists and was deliberately not read",
 	warnProjectUntrusted: "recorded projects are marked untrusted by their client, which " +
@@ -296,6 +308,24 @@ var warnSentences = map[warnCode]string{
 		"so servers declared by plugins past the limit are not listed",
 	warnPluginSettingsUnreadable: "the settings recording which plugins are enabled could " +
 		"not be read, so plugin-declared servers are listed with an unknown approval state",
+	warnPluginRecordsUnreadable: "the plugin installation records could not be read, so " +
+		"it is not known which installed version the client would load",
+	warnPluginSuperseded: "a plugin version is present in the cache but is not the " +
+		"installation the client would load, so its servers may be from a superseded release",
+	warnPluginManifestUnreadable: "a plugin manifest exists and could not be read, so any " +
+		"MCP servers it declares are not listed",
+	warnPluginManifestUnsupported: "a plugin manifest declares MCP servers in a bundle or " +
+		"at a URL, which this table does not unpack or fetch, so they are not listed",
+	warnPluginManifestTruncated: "a plugin manifest declares more MCP configuration sources " +
+		"than this table will read, so some of its servers are not listed",
+	warnPluginManifestMissing: "a plugin manifest names an MCP configuration file that " +
+		"could not be read, so any servers it declares are not listed",
+	warnPluginManifestInvalid: "a plugin manifest declares MCP servers with a value of a " +
+		"type the field does not accept, so that declaration was not read",
+	warnPluginShadowedDecl: "a higher-precedence declaration for this server could not be " +
+		"read, so this definition may not be the one the client loads",
+	warnPluginSelectionUnknown: "it could not be established whether this cached plugin " +
+		"version is the installation the client would load",
 
 	warnSourceUnreadable: "this configuration file could not be read, so any servers it " +
 		"declares are not listed",
@@ -360,12 +390,22 @@ func (c warnCode) scope() warnScope {
 		warnBudgetExhaustedOpening, warnBudgetExhaustedInHome, warnCancelledInHome,
 		warnAppDataUndetermined, warnAppDataRedirectedOut, warnProfileListUnreadable,
 		warnProjectListUnreadable, warnProjectListTruncated,
-		warnProjectCloudPlaceholder, warnProjectRefused,
+		warnProjectCloudPlaceholder, warnProjectUserspaceFS, warnProjectRefused,
 		warnWorkspaceListUnreadable, warnWorkspaceListTruncated,
 		warnWorkspaceRecordUnreadable, warnWorkspaceRecordMalformed,
-		warnPluginListUnreadable, warnPluginListTruncated, warnPluginSettingsUnreadable:
+		warnPluginListUnreadable, warnPluginListTruncated, warnPluginSettingsUnreadable,
+		warnPluginRecordsUnreadable, warnPluginManifestUnreadable,
+		warnPluginManifestUnsupported, warnPluginManifestTruncated,
+		warnPluginManifestMissing, warnPluginManifestInvalid:
 		return scopeHome
-	case warnSourceUnreadable, warnSourceTooLarge, warnParseFailed, warnEntriesSkipped:
+	// warnPluginShadowedDecl is source-scoped, not home-scoped. It says this row's own
+	// source may no longer be authoritative because a higher-precedence declaration over it
+	// failed, which is a statement about that file. Home scope made one stale plugin
+	// definition set scan_complete = 0 on every row for the account -- an unrelated Gemini
+	// configuration included -- so `WHERE scan_complete = 1` lost otherwise usable inventory
+	// for the whole host.
+	case warnSourceUnreadable, warnSourceTooLarge, warnParseFailed, warnEntriesSkipped,
+		warnPluginShadowedDecl:
 		return scopeSource
 	// A recorded project this table will not follow. Descriptive rather than degrading,
 	// because these are the definition of what is searched rather than a scan cut short --
@@ -385,7 +425,8 @@ func (c warnCode) scope() warnScope {
 	// a cloud placeholder, a refused file, or a project list that was unreadable or over
 	// cap. Those are losses inside the boundary rather than the boundary itself.
 	case warnProjectOutsideHome, warnProjectRemoteOrigin, warnProjectMalformed,
-		warnProjectUntrusted, warnApprovalSettingsUnreadable:
+		warnProjectUntrusted, warnApprovalSettingsUnreadable,
+		warnPluginSuperseded, warnPluginSelectionUnknown:
 		return scopeDescriptive
 	// Trust that could not be read is a loss rather than a boundary: the project may hold
 	// configuration the client would load, and this scan cannot say.

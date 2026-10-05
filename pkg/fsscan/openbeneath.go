@@ -119,6 +119,10 @@ const (
 	ClassUnsupported ErrClass = "unsupported"
 	// ClassCloudPlaceholder is a file whose content is not local.
 	ClassCloudPlaceholder ErrClass = "cloud_placeholder"
+
+	// ClassUserspaceFilesystem is a file on a filesystem whose reads are serviced by a
+	// userspace process, so a read may fetch content on demand and cannot be bounded.
+	ClassUserspaceFilesystem ErrClass = "userspace_filesystem"
 	// ClassUnsupportedOrigin is a recorded location naming a filesystem that is not this
 	// one: a remote-development URL, a UNC share.
 	ClassUnsupportedOrigin ErrClass = "unsupported_origin"
@@ -155,6 +159,8 @@ func ClassifyError(err error) ErrClass {
 		return ClassNotRegular
 	case errors.Is(err, ErrCloudPlaceholder):
 		return ClassCloudPlaceholder
+	case errors.Is(err, ErrUserspaceFilesystem):
+		return ClassUserspaceFilesystem
 	case errors.Is(err, ErrUnsupportedOrigin):
 		return ClassUnsupportedOrigin
 	case errors.Is(err, ErrNotContained):
