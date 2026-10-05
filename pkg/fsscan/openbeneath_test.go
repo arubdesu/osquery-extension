@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestOpenBeneath_HappyPath(t *testing.T) {
@@ -114,7 +116,7 @@ func TestReadBoundedUnder_HappyPath(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(base, "f.json"), []byte(`hello`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got, err := ReadBoundedUnder(base, "f.json", 1024)
+	got, err := ReadBoundedUnder(base, "f.json", ReadOpts{MaxSize: 1024})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +130,7 @@ func TestReadBoundedUnder_SizeCapEnforced(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(base, "f.json"), []byte("0123456789"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ReadBoundedUnder(base, "f.json", 5); err == nil {
+	if _, err := ReadBoundedUnder(base, "f.json", ReadOpts{MaxSize: 5}); err == nil {
 		t.Fatal("expected size cap error")
 	}
 }
@@ -157,5 +159,82 @@ func TestSplitSafeComponentsRejectsInteriorDotDot(t *testing.T) {
 		if _, err := splitSafeComponents(accepted); err != nil {
 			t.Errorf("splitSafeComponents(%q) = %v, want accepted", accepted, err)
 		}
+	}
+}
+
+// A FIFO planted where a config file is expected must neither be read nor block the reader.
+//
+// O_NONBLOCK on the final component is what makes the open return at all: without it this
+// hangs until something opens the other end, and the thing hanging is a root daemon inside
+// osquery's watchdog timeout. O_NONBLOCK does not reject a FIFO, it only keeps the open from
+// blocking, so the regular-file check is what turns it into a refusal.
+func TestReadBoundedUnder_FIFODoesNotHang(t *testing.T) {
+	base := t.TempDir()
+	if err := syscall.Mkfifo(filepath.Join(base, "f.json"), 0o644); err != nil {
+		t.Skipf("mkfifo unsupported: %v", err)
+	}
+	_, err := ReadBoundedUnder(base, "f.json", ReadOpts{MaxSize: 1024})
+	if !errors.Is(err, ErrNotRegular) {
+		t.Fatalf("a FIFO must be refused as not a regular file, got %v", err)
+	}
+}
+
+// A refused symlink has to classify as benign absence, not as a finding.
+//
+// The refusal is expected whenever another local user plants a trap, and the error text
+// carries the path they chose -- so a caller that reported it instead of skipping would be
+// publishing attacker-supplied bytes into a table column.
+func TestOpenBeneathSymlinkRefusalReadsAsExpectedAbsence(t *testing.T) {
+	base := t.TempDir()
+	if err := os.WriteFile(filepath.Join(base, "t.json"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(base, "t.json"), filepath.Join(base, "l.json")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := ReadBoundedUnder(base, "l.json", ReadOpts{MaxSize: 1024})
+	if err == nil {
+		t.Fatal("expected the symlink to be refused")
+	}
+	if !IsExpectedAbsent(err) {
+		t.Errorf("ELOOP not classified as benign absence: %v", err)
+	}
+	if got := ClassifyError(err); got != ClassRefusedPath {
+		t.Errorf("ClassifyError = %q, want %q", got, ClassRefusedPath)
+	}
+}
+
+// Every descriptor OpenBeneath opens carries FD_CLOEXEC.
+//
+// os.OpenFile sets it because the runtime does that for every fd it owns, but the traversal
+// is built out of unix.Open and unix.Openat, which are raw syscalls and do not. This is one
+// process hosting many tables and several of them shell out, so an fd left inheritable is a
+// handle onto another user's home directory surviving into an unrelated subprocess -- past
+// every check this package makes to obtain it.
+func TestOpenBeneathDescriptorsAreCloseOnExec(t *testing.T) {
+	home := t.TempDir()
+	nested := filepath.Join(home, "Library", "Application Support", "Claude")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(nested, "claude_desktop_config.json")
+	if err := os.WriteFile(target, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := OpenBeneath(home, filepath.Join("Library", "Application Support", "Claude",
+		"claude_desktop_config.json"))
+	if err != nil {
+		t.Fatalf("OpenBeneath: %v", err)
+	}
+	defer func() { _ = file.Close() }()
+
+	flags, err := unix.FcntlInt(file.Fd(), unix.F_GETFD, 0)
+	if err != nil {
+		t.Fatalf("F_GETFD: %v", err)
+	}
+	if flags&unix.FD_CLOEXEC == 0 {
+		t.Error("the returned descriptor is inheritable across exec; a table that shells " +
+			"out would hand this handle to its child")
 	}
 }

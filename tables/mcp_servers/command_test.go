@@ -229,9 +229,12 @@ func TestCommandFieldReachesTheIdentityColumns(t *testing.T) {
 			wantBasename: "npx", wantManager: "npx", wantName: "pkg", wantConfidence: "high",
 		},
 		{
+			// Confidence is medium rather than high because `@latest` is a moving tag
+			// and so pins no version; the package is still identified. See pinsOneVersion.
 			name:         "embedded invocation with no args array still identifies",
 			server:       Server{Command: "/usr/bin/uvx some-pkg@latest"},
-			wantBasename: "uvx", wantManager: "uvx", wantName: "some-pkg", wantConfidence: "high",
+			wantBasename: "uvx", wantManager: "uvx", wantName: "some-pkg",
+			wantConfidence: "medium",
 		},
 		{
 			// An args array says the field is one executable path; the field says
@@ -307,7 +310,7 @@ func TestSpacedPathsAndLauncherCollisionsAreIndistinguishable(t *testing.T) {
 	inferIdentity(&collision)
 
 	if spacedDirectory.PackageManager != "npx" || spacedDirectory.PackageName != "pkg" ||
-		spacedDirectory.Version != "1.2.3" || spacedDirectory.Confidence != "high" {
+		spacedDirectory.PinnedVersion != "1.2.3" || spacedDirectory.Confidence != "high" {
 		t.Errorf("an executable in a spaced directory lost its identity: %+v", spacedDirectory)
 	}
 	for column, pair := range map[string][2]string{
@@ -315,7 +318,7 @@ func TestSpacedPathsAndLauncherCollisionsAreIndistinguishable(t *testing.T) {
 			serverToRow(collision)["command_basename"]},
 		"package_manager": {spacedDirectory.PackageManager, collision.PackageManager},
 		"package_name":    {spacedDirectory.PackageName, collision.PackageName},
-		"version":         {spacedDirectory.Version, collision.Version},
+		"pinned_version":  {spacedDirectory.PinnedVersion, collision.PinnedVersion},
 		"confidence":      {spacedDirectory.Confidence, collision.Confidence},
 	} {
 		if pair[0] != pair[1] {
@@ -328,7 +331,7 @@ func TestSpacedPathsAndLauncherCollisionsAreIndistinguishable(t *testing.T) {
 	// No args array, so nothing to attribute: the collision cannot claim a package.
 	bare := Server{Command: "/opt/bin/mytool bin/npx"}
 	inferIdentity(&bare)
-	if bare.PackageName != "" || bare.Version != "" || bare.Confidence != "low" {
+	if bare.PackageName != "" || bare.PinnedVersion != "" || bare.Confidence != "low" {
 		t.Errorf("a collision with no arguments still produced package identity: %+v", bare)
 	}
 }
@@ -404,8 +407,8 @@ func TestEmbeddedArgumentsAreRedactedLikeDeclaredOnes(t *testing.T) {
 		{"embedded api-key", `{"mcpServers":{"a":{"command":"uvx --api-key ` + secret + ` real-package"}}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rows := finishProcessing([]byte(tc.body), nil, "/p/.mcp.json", "alice", "claude-code",
-				true, extractEnvelopeSimple)
+			rows := finishProcessing("", []byte(tc.body), nil, "/p/.mcp.json", "alice", "claude-code",
+				true, MaxFileSize, extractEnvelopeSimple)
 			if len(rows) != 1 {
 				t.Fatalf("want one row, got %d", len(rows))
 			}
@@ -446,8 +449,7 @@ func TestNonASCIIWhitespaceSplitsLikeASpace(t *testing.T) {
 	}
 	identity := func(raw []byte) map[string]string {
 		t.Helper()
-		rows := finishProcessing(raw, nil, "/p/.mcp.json", "alice", "claude-code",
-			true, extractEnvelopeSimple)
+		rows := finishProcessing("", raw, nil, "/p/.mcp.json", "alice", "claude-code", true, MaxFileSize, extractEnvelopeSimple)
 		if len(rows) != 1 {
 			t.Fatalf("want one row, got %d", len(rows))
 		}
@@ -523,7 +525,7 @@ func TestQuotedEmbeddedArgumentIsOneArgument(t *testing.T) {
 					t.Errorf("a credential fragment survived as an argument: %q", redacted)
 				}
 			}
-			if spec, _ := npxIdentity(redacted); spec != testCase.wantSpec {
+			if spec, _, _ := npxIdentity(redacted); spec != testCase.wantSpec {
 				t.Errorf("identity = %q, want %q (args %q)", spec, testCase.wantSpec, redacted)
 			}
 		})
@@ -560,7 +562,7 @@ func TestEscapedWhitespaceIsPlatformAware(t *testing.T) {
 				t.Errorf("a credential fragment survived: %q", redacted)
 			}
 		}
-		if spec, _ := npxIdentity(redacted); spec != "real-package" {
+		if spec, _, _ := npxIdentity(redacted); spec != "real-package" {
 			t.Errorf("identity = %q, want real-package (args %q)", spec, redacted)
 		}
 	})
@@ -588,7 +590,7 @@ func TestEscapedWhitespaceIsPlatformAware(t *testing.T) {
 				t.Errorf("a credential survived: %q", redacted)
 			}
 		}
-		if spec, _ := npxIdentity(redacted); spec != "real-package" {
+		if spec, _, _ := npxIdentity(redacted); spec != "real-package" {
 			t.Errorf("identity = %q, want real-package", spec)
 		}
 	})
@@ -619,7 +621,7 @@ func TestDoubleQuotedBackslashFollowsPOSIXRules(t *testing.T) {
 			if len(args) == 0 || args[0] != testCase.wantArg {
 				t.Errorf("args = %q, want first %q", args, testCase.wantArg)
 			}
-			if spec, _ := npxIdentity(redactArgs(args)); spec != testCase.wantSpec {
+			if spec, _, _ := npxIdentity(redactArgs(args)); spec != testCase.wantSpec {
 				t.Errorf("identity = %q, want %q", spec, testCase.wantSpec)
 			}
 		})

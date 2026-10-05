@@ -51,10 +51,10 @@ func TestServerToRowCoversExactlyTheDeclaredColumns(t *testing.T) {
 // emitted, only counted).
 func TestServerToRowStripsCredentialBearingValues(t *testing.T) {
 	row := serverToRow(Server{
-		Command:    "/opt/homebrew/bin/npx --api-key=" + fakeToken,
-		Args:       []string{"--token", fakeToken, "server"},
-		ServerName: "svc-" + fakeToken,
-		Version:    fakeToken,
+		Command:       "/opt/homebrew/bin/npx --api-key=" + fakeToken,
+		Args:          []string{"--token", fakeToken, "server"},
+		ServerName:    "svc-" + fakeToken,
+		PinnedVersion: fakeToken,
 	})
 	if row["command_basename"] != "npx" {
 		t.Errorf("command_basename = %q, want the bare executable name", row["command_basename"])
@@ -62,7 +62,7 @@ func TestServerToRowStripsCredentialBearingValues(t *testing.T) {
 	if row["args_count"] != "3" {
 		t.Errorf("args_count = %q, want 3", row["args_count"])
 	}
-	for _, column := range []string{"server_name", "version"} {
+	for _, column := range []string{"server_name", "pinned_version"} {
 		if strings.Contains(row[column], fakeToken) {
 			t.Errorf("%s = %q, want the token redacted", column, row[column])
 		}
@@ -291,22 +291,67 @@ func TestServerToRowRedactsDelimitedAssignmentsInEveryColumnAUserControls(t *tes
 		URL:           "https://host/--token=" + secret,
 		PackageName:   "pkg/--token=" + secret,
 		RequestedSpec: "pkg@--token=" + secret,
-		Version:       "1.0.0-\u00a0--token=" + secret,
+		PinnedVersion: "1.0.0-\u00a0--token=" + secret,
 		EnvKeys:       []string{"A=--token=" + secret},
-		Warning:       "could not read /Users/alice/--token=" + secret + "/x: denied",
+		Home:          "/Users/alice",
+		Warning:       warning{Code: warnSourceUnreadable, Class: fsscan.ClassDenied},
 	})
 	for column, value := range row {
 		if strings.Contains(value, secret) {
 			t.Errorf("%s leaked a credential-named assignment: %q", column, value)
 		}
 	}
-	// Over-redaction is the intended direction to fail, but a column that lost everything
-	// would be a different bug: the marker has to be there, so a reader can tell a redacted
-	// value from an empty one.
-	for _, column := range []string{"source_path", "source_context", "server_name", "warning"} {
-		if !strings.Contains(row[column], redact.RedactedMark) {
-			t.Errorf("%s = %q, expected the redaction marker", column, row[column])
+	// Each column is now either dropped by its allowlist or redacted, and which of the two
+	// is itself the assertion.
+	//
+	// The original version of this test required the redaction marker in every column, on
+	// the reasoning that a column which lost everything would be a different bug -- a reader
+	// could not tell a redacted value from an empty one. That was right while redaction was
+	// the only defence. It is the wrong assertion now: a value that fails its column's
+	// format is *supposed* to be dropped whole, and the row says why in `warning` rather
+	// than by leaving a marker behind. So the columns split in two.
+	//
+	// command_basename needs no drop here and that is worth being explicit about: the
+	// secret is in a *directory* component, and reducing the field to its basename removes
+	// every directory component by construction. `/opt/--dd-key=<secret>/bin/tool` arrives
+	// as `tool`. The allowlist is the second line of defence for this column, not the
+	// first, and it fires on a secret in the filename itself -- `API_KEY=xyz npx -y pkg`,
+	// which cannot be a filename because of the `=`.
+	if row["command_basename"] != "tool" {
+		t.Errorf("command_basename = %q, want \"tool\": reducing to a basename drops the "+
+			"directory components the secret was in", row["command_basename"])
+	}
+	// Dropped, because the value does not match the column's format: a package name cannot
+	// contain `/--token`, an env key must be a C identifier, an endpoint's host must be
+	// hostname-shaped.
+	for _, column := range []string{
+		"package_name", "requested_spec", "pinned_version", "url_endpoint",
+	} {
+		if row[column] != "" {
+			t.Errorf("%s = %q, expected the allowlist to drop it entirely", column, row[column])
 		}
+	}
+	if row["env_keys"] != "[]" {
+		t.Errorf("env_keys = %q, expected the non-identifier key to be dropped", row["env_keys"])
+	}
+	// Reduced to the part that is not user-controlled. source_context keeps which *section*
+	// declared the server and drops the path, because the path failed containment.
+	if row["source_context"] != "projects" {
+		t.Errorf("source_context = %q, expected the bare section token", row["source_context"])
+	}
+	// Redacted rather than dropped, because there is no format available: a path's
+	// directory names are the user's to choose.
+	if !strings.Contains(row["source_path"], redact.RedactedMark) {
+		t.Errorf("source_path = %q, expected the redaction marker", row["source_path"])
+	}
+	// server_name keeps redaction, so a name that is partly a credential survives with the
+	// marker rather than becoming a placeholder.
+	if !strings.Contains(row["server_name"], redact.RedactedMark) {
+		t.Errorf("server_name = %q, expected the redaction marker", row["server_name"])
+	}
+	// And the warning is built from the catalogue, so it never held the value at all.
+	if row["warning"] == "" {
+		t.Error("warning = empty; the row must still explain itself")
 	}
 }
 
@@ -342,15 +387,21 @@ func TestServerToRowRedactsAnAssignmentCarryingANewline(t *testing.T) {
 	// even though the identically-shaped server name above does not.
 	built := serverToRow(Server{
 		SourcePath: "/Users/alice/--token=\n" + secret + "/.mcp.json",
-		Warning:    "could not read --token=\n" + secret,
+		Home:       "/Users/alice",
+		Warning:    warning{Code: warnSourceUnreadable, Class: fsscan.ClassDenied},
 	})
-	for _, column := range []string{"source_path", "warning"} {
-		if strings.Contains(built[column], secret) {
-			t.Errorf("%s leaked a credential across a newline: %q", column, built[column])
-		}
-		if !strings.Contains(built[column], redact.RedactedMark) {
-			t.Errorf("%s = %q, expected the redaction marker", column, built[column])
-		}
+	if strings.Contains(built["source_path"], secret) {
+		t.Errorf("source_path leaked a credential across a newline: %q", built["source_path"])
+	}
+	if !strings.Contains(built["source_path"], redact.RedactedMark) {
+		t.Errorf("source_path = %q, expected the redaction marker", built["source_path"])
+	}
+	// warning is no longer assembled from an error message, so there is nothing for a
+	// newline to hide inside: the column is a sentence chosen by code, plus integers and
+	// closed-enum spellings. Asserted as the absence of the whole secret rather than as the
+	// presence of a marker, because the value never entered the column to be marked.
+	if strings.Contains(built["warning"], secret) {
+		t.Errorf("warning carried a credential: %q", built["warning"])
 	}
 }
 
@@ -372,7 +423,7 @@ func TestDiagnosticRowsSatisfyTheIdentityColumnContract(t *testing.T) {
 		t.Helper()
 		var diagnostics int
 		for _, row := range rows {
-			if row.Warning == "" {
+			if row.Warning.empty() {
 				continue
 			}
 			diagnostics++
@@ -400,15 +451,15 @@ func TestDiagnosticRowsSatisfyTheIdentityColumnContract(t *testing.T) {
 	// that fails to connect is the honest stand-in for that.
 	inspect("osquery unreachable", DiscoverAll(context.Background(), failingClienter{}, nil))
 
-	inspect("parse failure", finishProcessing([]byte(`{not json`), nil,
-		"/p/mcp.json", "alice", "cursor", false, extractEnvelopeSimple))
-	inspect("unterminated comment", finishProcessing([]byte(`{"a":1} /*`), nil,
-		"/p/mcp.json", "alice", "cursor", true, extractEnvelopeSimple))
-	inspect("read failure", finishProcessing(nil, errors.New("boom"),
-		"/p/mcp.json", "alice", "cursor", false, extractEnvelopeSimple))
-	inspect("skipped entries", finishProcessing(
+	inspect("parse failure", finishProcessing("", []byte(`{not json`), nil,
+		"/p/mcp.json", "alice", "cursor", false, MaxFileSize, extractEnvelopeSimple))
+	inspect("unterminated comment", finishProcessing("", []byte(`{"a":1} /*`), nil,
+		"/p/mcp.json", "alice", "cursor", true, MaxFileSize, extractEnvelopeSimple))
+	inspect("read failure", finishProcessing("", nil, errors.New("boom"),
+		"/p/mcp.json", "alice", "cursor", false, MaxFileSize, extractEnvelopeSimple))
+	inspect("skipped entries", finishProcessing("",
 		[]byte(`{"mcpServers":{"ok":{"command":"npx"},"bad":{"command":1}}}`), nil,
-		"/p/mcp.json", "alice", "cursor", false, extractEnvelopeSimple))
+		"/p/mcp.json", "alice", "cursor", false, MaxFileSize, extractEnvelopeSimple))
 }
 
 // TestRosterFailureNamesEachRequestedUser pins the roster-unreachable path against the
@@ -422,7 +473,7 @@ func TestRosterFailureNamesEachRequestedUser(t *testing.T) {
 		})
 		var users []string
 		for _, row := range rows {
-			if row.Warning == "" {
+			if row.Warning.empty() {
 				t.Errorf("every row on this path must carry a warning; got %+v", row)
 			}
 			users = append(users, row.User)
@@ -470,7 +521,7 @@ func TestQueryForANameTheRosterDoesNotHaveSaysSo(t *testing.T) {
 			t.Errorf("a query for one name returned a row for %q: %+v", row.User, row)
 			continue
 		}
-		if row.Warning == "" {
+		if row.Warning.empty() {
 			t.Errorf("no account of this name exists, so any row for it must explain "+
 				"itself: %+v", row)
 			continue
@@ -486,7 +537,7 @@ func TestQueryForANameTheRosterDoesNotHaveSaysSo(t *testing.T) {
 	// ordinary constrained query carries a warning that is not true of it.
 	for _, row := range DiscoverAll(context.Background(), rosterOf(t, root),
 		map[string]struct{}{"alice": {}}) {
-		if strings.Contains(row.Warning, "no account of this name") {
+		if row.Warning.Code == warnAccountNotInRoster {
 			t.Errorf("an account that exists was reported as missing: %+v", row)
 		}
 	}
@@ -497,7 +548,7 @@ func TestQueryForANameTheRosterDoesNotHaveSaysSo(t *testing.T) {
 	t.Setenv(fsscan.WalkTimeoutEnv, "1ns")
 	for _, row := range DiscoverAll(context.Background(), rosterOf(t, root),
 		map[string]struct{}{"alice": {}}) {
-		if strings.Contains(row.Warning, "no account of this name") {
+		if row.Warning.Code == warnAccountNotInRoster {
 			t.Errorf("an account the budget never reached was reported as missing: %+v", row)
 		}
 	}
@@ -529,7 +580,7 @@ func TestQueryForANonLoginAccountIsNotToldItIsAbsent(t *testing.T) {
 			"as the account having no MCP servers")
 	}
 	for _, row := range rows {
-		if strings.Contains(row.Warning, "no account of this name") {
+		if row.Warning.Code == warnAccountNotInRoster {
 			t.Errorf("a rostered account was reported as absent from the roster: %+v", row)
 		}
 		if row.User != "daemon" {
@@ -544,71 +595,77 @@ func TestQueryForANonLoginAccountIsNotToldItIsAbsent(t *testing.T) {
 	// of service accounts and a row each would drown the inventory.
 	unconstrained := withoutStandingNotes(DiscoverAll(context.Background(), roster, nil))
 	for _, row := range unconstrained {
-		if strings.Contains(row.Warning, "cannot log in") {
+		if row.Warning.Code == warnAccountNonLogin {
 			t.Errorf("an unconstrained inventory reported a service account: %+v", row)
 		}
 	}
 }
 
-// The missing-name diagnostic used to close with "a roster-level warning alongside this row
-// says which" whatever the roster had done. On a complete roster no such row is emitted, so
-// the sentence sent an operator looking for something that is not there.
+// The missing-name diagnostic must only claim a companion warning exists when one does.
+//
+// It used to close with "a roster-level warning alongside this row says which" whatever the
+// roster had done, so on a complete roster the sentence sent an operator looking for a row
+// that is not there. The fix was two near-identical paragraphs differing in one clause, which
+// the warning catalogue does not admit -- one sentence per code -- so the distinction is now
+// carried as a count on the code instead, and the sentence says neither thing.
+//
+// What has to hold is the same property, asserted structurally: Count is set exactly when a
+// roster-level row was also emitted.
 func TestMissingNameDiagnosticOnlyPromisesAWarningThatExists(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "alice"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	const pointer = "warning alongside this row"
 
-	// A roster that reported no limits of its own. Any row promising a companion warning
-	// has to be backed by one actually present in the same result.
+	// A roster that reported no limits of its own. There is no companion row, so the
+	// diagnostic must not claim one.
+	//
+	// This case changed with the removal of the always-on Linux note: that note made every
+	// Linux run roster-uncertain, so the claim was truthful there and false everywhere else,
+	// which is why the old test had a platform-dependent branch. With the note gone, a
+	// healthy roster is uncertain on no platform and the assertion is the same everywhere.
 	rows := DiscoverAll(context.Background(), rosterOf(t, root),
 		map[string]struct{}{"nosuchuser": {}})
 	var missing *Server
+	rosterLevel := 0
 	for i, row := range rows {
-		if strings.Contains(row.Warning, "no account of this name") {
+		if row.Warning.Code == warnAccountNotInRoster {
 			missing = &rows[i]
+			continue
+		}
+		// The missing-name row carries the users root as its path too, having no home to
+		// name, so it would otherwise count as its own corroboration.
+		if !row.Warning.empty() && row.SourcePath == fsscan.UsersRoot {
+			rosterLevel++
 		}
 	}
 	if missing == nil {
 		t.Fatal("no missing-name diagnostic was emitted")
 	}
-	if strings.Contains(missing.Warning, pointer) {
-		// Linux always carries the local-accounts-only roster note, so the pointer is
-		// truthful there; anywhere else it is not.
-		var rosterLevel int
-		for _, row := range rows {
-			// The missing-name row carries the users root as its path too, having no home
-			// to name, so it would otherwise count as its own corroboration.
-			if strings.Contains(row.Warning, "no account of this name") {
-				continue
-			}
-			if row.Warning != "" && row.SourcePath == fsscan.UsersRoot {
-				rosterLevel++
-			}
-		}
-		if rosterLevel == 0 {
-			t.Errorf("the diagnostic points at a roster-level warning, but none was "+
-				"emitted: %q", missing.Warning)
-		}
+	if rosterLevel != 0 {
+		t.Fatalf("a healthy roster emitted %d roster-level warnings; the fixture is wrong",
+			rosterLevel)
+	}
+	if missing.Warning.Count != 0 {
+		t.Errorf("the diagnostic claims a companion roster-level warning, but none was "+
+			"emitted: %+v", missing.Warning)
 	}
 
-	// And a roster that was short must still point at the row explaining why, or the one
-	// case the pointer exists for loses it.
+	// And a roster that was short must flag it, or the one case the distinction exists for
+	// loses it.
 	short := rosterFrom(map[string]string{
 		"uid": "", "uuid": "", "username": "", "directory": "", "shell": "/bin/zsh",
 	})
 	var pointed bool
 	for _, row := range DiscoverAll(context.Background(), short,
 		map[string]struct{}{"nosuchuser": {}}) {
-		if strings.Contains(row.Warning, "no account of this name") &&
-			strings.Contains(row.Warning, pointer) {
+		if row.Warning.Code == warnAccountNotInRoster && row.Warning.Count > 0 {
 			pointed = true
 		}
 	}
 	if !pointed {
 		t.Error("with roster-level uncertainty reported, the missing-name diagnostic no " +
-			"longer points at the row that explains it")
+			"longer flags that a companion row explains it")
 	}
 }
 
@@ -672,7 +729,7 @@ func serverRowsOnly(rows []map[string]string) []map[string]string {
 		if row["warning"] != "" && row["source_path"] == fsscan.UsersRoot {
 			continue
 		}
-		if row["warning"] == roamingUndeterminedNote {
+		if row["warning"] == (warning{Code: warnAppDataUndetermined}).render() {
 			continue
 		}
 		out = append(out, row)
@@ -707,7 +764,7 @@ func TestFlatShapeCountsEntriesThatNameAServerKey(t *testing.T) {
 			}
 			var servers, diagnostics int
 			for _, row := range rows {
-				if row.Warning == "" {
+				if row.Warning.empty() {
 					servers++
 					continue
 				}
@@ -824,36 +881,84 @@ func TestASharedHomeIsReportedForBothAccountsAfterTheBudgetIsGone(t *testing.T) 
 		map[string]string{"uid": "501", "uuid": "", "username": "alice", "directory": home, "shell": "/bin/zsh"},
 		map[string]string{"uid": "502", "uuid": "", "username": "bob", "directory": home, "shell": "/bin/zsh"},
 	)
-	// A tree big enough that the project-local walk outlasts the budget, so the deadline is
+	// Enough recorded projects that probing them outlasts the budget, so the deadline is
 	// gone by the time the second account is considered but the first has already been
-	// scanned and cached. The direct-path pass runs before the walk's deadline check, so
-	// the seeded row above survives the truncation.
-	deep := filepath.Join(home, "code")
-	for i := range 400 {
-		if err := os.MkdirAll(filepath.Join(deep, fmt.Sprintf("p%03d", i), "src", "lib"), 0o755); err != nil {
+	// scanned and cached. The home-rooted pass runs before the project pass, so the seeded
+	// row above survives the truncation.
+	//
+	// A long project list rather than a deep directory tree, which is what the old version
+	// built. That is the same substitution the discovery change made everywhere: what makes
+	// one home expensive is no longer how much source code is under it -- nothing walks --
+	// but how many projects its clients have recorded, because each one costs a probe per
+	// known filename.
+	projects := make(map[string]any, maxProjects)
+	for i := range maxProjects {
+		rel := filepath.Join("code", fmt.Sprintf("p%03d", i))
+		if err := os.MkdirAll(filepath.Join(home, rel), 0o755); err != nil {
 			t.Fatal(err)
 		}
+		projects[filepath.Join(home, rel)] = map[string]any{}
 	}
-	t.Setenv(fsscan.WalkTimeoutEnv, "2ms")
+	recorded, err := json.Marshal(map[string]any{"projects": projects})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), recorded, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Sized so the cheap pass fits and the expensive one does not: pass 1 is about thirty
+	// probes of which all but one are missing, and the project pass is 200 projects times
+	// four filenames. The ratio between them is what this depends on, not the absolute
+	// number, which is why both preconditions are checked below rather than assumed.
+	t.Setenv(fsscan.WalkTimeoutEnv, "25ms")
 
 	rows := withoutStandingNotes(DiscoverAll(context.Background(), roster, nil))
-	var exhausted bool
+	// Equality on codes rather than substring matches on "budget" and "truncated", which
+	// matched any sentence containing either word and would have gone on passing if the
+	// cause changed underneath them.
+	budgetCodes := map[warnCode]struct{}{
+		warnBudgetExhaustedPreHome: {}, warnBudgetExhaustedOpening: {},
+		warnBudgetExhaustedInHome: {}, warnCancelledInHome: {},
+	}
+	// Two preconditions, both checked, because this test can only observe the behaviour it
+	// is about when the budget runs out in a particular window: after the first account's
+	// home was scanned in full and before the second account is considered. Whether that
+	// window is hit depends on machine speed, and `-race` moves it -- the first version of
+	// this test asserted on the result unconditionally and failed under the race detector
+	// because the budget expired during pass 1, so the seeded row the assertions need was
+	// never produced.
+	//
+	// Skipping is the honest outcome when the window is missed. The alternative -- tuning
+	// the budget until it passes on one machine -- produces a test that asserts nothing
+	// anywhere else and fails in CI.
+	var exhausted, scannedFirstHome bool
 	for _, row := range rows {
-		if strings.Contains(row.Warning, "budget") || strings.Contains(row.Warning, "truncated") {
+		if _, isBudget := budgetCodes[row.Warning.Code]; isBudget {
 			exhausted = true
 		}
+		if row.ServerName == "seeded" {
+			scannedFirstHome = true
+		}
 	}
-	if !exhausted {
-		t.Skip("the walk finished inside the budget on this machine, so the case this test " +
+	switch {
+	case !exhausted:
+		t.Skip("the scan finished inside the budget on this machine, so the case this test " +
 			"is about -- a second account meeting an exhausted budget -- did not arise")
+	case !scannedFirstHome:
+		t.Skip("the budget ran out before the first account's home-rooted pass completed, " +
+			"so nothing was cached and the case this test is about did not arise")
 	}
 	seen := map[string]bool{}
 	for _, row := range rows {
-		if strings.Contains(row.Warning, "before this user was scanned") {
+		// The one statement that must never be made about an account whose home was
+		// already scanned: the cache lookup has to come before the budget check, or the
+		// second account is told nothing was looked at while the rows sit in hand.
+		if row.Warning.Code == warnBudgetExhaustedPreHome ||
+			row.Warning.Code == warnCancelledPreHome {
 			t.Errorf("an account sharing an already-scanned home was told it was never "+
 				"scanned: %+v", row)
 		}
-		if row.Warning == "" {
+		if row.Warning.empty() {
 			seen[row.User] = true
 		}
 	}

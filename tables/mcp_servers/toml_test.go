@@ -562,7 +562,7 @@ command = "node"
 	var healthy, diagnostics int
 	for _, server := range servers {
 		switch {
-		case server.Warning != "":
+		case server.Warning.empty() == false:
 			diagnostics++
 		case server.ServerName == "real":
 			healthy++
@@ -599,7 +599,7 @@ command = 123
 	}
 	var names []string
 	for _, server := range servers {
-		if server.Warning == "" {
+		if server.Warning.empty() {
 			names = append(names, server.ServerName)
 		}
 	}
@@ -646,7 +646,7 @@ func TestEnvVarsOnlyDeclaresAServerWhenItNamesOne(t *testing.T) {
 			}
 			var servers int
 			for _, row := range rows {
-				if row.Warning != "" {
+				if row.Warning.empty() == false {
 					continue
 				}
 				servers++
@@ -658,5 +658,114 @@ func TestEnvVarsOnlyDeclaresAServerWhenItNamesOne(t *testing.T) {
 				t.Errorf("got %d server rows, want %d: %+v", servers, testCase.servers, rows)
 			}
 		})
+	}
+}
+
+// Every environment variable name an entry supplies is reported when this table refuses to
+// publish it, and the count is the real one.
+//
+// tomlEnvKeys discarded a rejected name silently, so an invalid key in env, in env_vars or in
+// bearer_token_env_var left no trace in the row at all, while materialize() reported the
+// identical JSON configuration as a drop count. Visibility depended on which file format the
+// user's client happened to write.
+func TestCodexEnvKeyDropsAreCountedAcrossEverySource(t *testing.T) {
+	servers, err := extractCodexTOML([]byte(`
+[mcp_servers.messy]
+command = "server"
+env_vars = ["GOOD_ONE", "bad-name"]
+bearer_token_env_var = "9NOT_AN_IDENTIFIER"
+
+[mcp_servers.messy.env]
+GOOD_TWO = "never read"
+"not a name" = "never read"
+`))
+	if err != nil || len(servers) != 1 {
+		t.Fatalf("n=%d err=%v", len(servers), err)
+	}
+	server := servers[0]
+	if server.Warning.Code != warnEnvKeyDropped {
+		t.Fatalf("warning = %+v, want %s", server.Warning, warnEnvKeyDropped)
+	}
+	// One from each source: the quoted env key, the dashed env_vars entry, and the bearer
+	// token variable that starts with a digit.
+	if server.Warning.Count != 3 {
+		t.Errorf("Count = %d, want 3: one rejected name per source", server.Warning.Count)
+	}
+	sort.Strings(server.EnvKeys)
+	if !reflect.DeepEqual(server.EnvKeys, []string{"GOOD_ONE", "GOOD_TWO"}) {
+		t.Errorf("env_keys = %v, want the two publishable names", server.EnvKeys)
+	}
+}
+
+// A literal header value means the configuration file itself holds the credential, so the
+// count is how many credentials are sitting in the file. It was hardcoded to 1 however many
+// there were, which understates exactly the finding an operator has to act on.
+func TestCodexLiteralHeadersAreCountedIndividually(t *testing.T) {
+	servers, err := extractCodexTOML([]byte(`
+[mcp_servers.remote]
+url = "https://example.test/mcp"
+
+[mcp_servers.remote.env_http_headers]
+Authorization = "Bearer literal-value-one"
+X-Other-Auth = "literal value two"
+`))
+	if err != nil || len(servers) != 1 {
+		t.Fatalf("n=%d err=%v", len(servers), err)
+	}
+	if code := servers[0].Warning.Code; code != warnEnvHeaderLiteral {
+		t.Fatalf("warning = %+v, want %s", servers[0].Warning, warnEnvHeaderLiteral)
+	}
+	if count := servers[0].Warning.Count; count != 2 {
+		t.Errorf("Count = %d, want 2: both headers hold a value rather than a name", count)
+	}
+	if len(servers[0].EnvKeys) != 0 {
+		t.Errorf("env_keys = %v, want empty: neither value names a variable",
+			servers[0].EnvKeys)
+	}
+}
+
+// When an entry does both things the row reports the literal header, because a credential in
+// the file outranks a name this column could not publish, and a row carries one warning.
+func TestCodexLiteralHeaderOutranksADroppedKey(t *testing.T) {
+	servers, err := extractCodexTOML([]byte(`
+[mcp_servers.both]
+url = "https://example.test/mcp"
+env_vars = ["bad-name"]
+
+[mcp_servers.both.env_http_headers]
+Authorization = "Bearer literal-value"
+`))
+	if err != nil || len(servers) != 1 {
+		t.Fatalf("n=%d err=%v", len(servers), err)
+	}
+	if servers[0].Warning.Code != warnEnvHeaderLiteral || servers[0].Warning.Count != 1 {
+		t.Errorf("warning = %+v, want %s with Count 1",
+			servers[0].Warning, warnEnvHeaderLiteral)
+	}
+}
+
+// And an entry whose names are all publishable reports neither code, so the two warnings stay
+// evidence of something rather than noise every Codex row carries.
+func TestCodexCleanEnvReferencesRaiseNoWarning(t *testing.T) {
+	servers, err := extractCodexTOML([]byte(`
+[mcp_servers.clean]
+command = "server"
+env_vars = ["FROM_ENV_VARS"]
+bearer_token_env_var = "FROM_BEARER"
+
+[mcp_servers.clean.env]
+FROM_ENV = "never read"
+
+[mcp_servers.clean.env_http_headers]
+X-Api-Key = "FROM_HEADER_VAR"
+`))
+	if err != nil || len(servers) != 1 {
+		t.Fatalf("n=%d err=%v", len(servers), err)
+	}
+	if !servers[0].Warning.empty() {
+		t.Errorf("warning = %+v, want none", servers[0].Warning)
+	}
+	if len(servers[0].EnvKeys) != 4 {
+		t.Errorf("env_keys = %v, want all four references", servers[0].EnvKeys)
 	}
 }

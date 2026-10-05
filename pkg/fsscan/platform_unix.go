@@ -7,30 +7,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"syscall"
 
 	"golang.org/x/sys/unix"
 )
-
-// rootKeyOf identifies a directory by device and inode, so two paths naming the same
-// directory dedup to one walk root. The path is unused here: a POSIX stat already carries
-// the identity. Windows has to reopen by path to get it, which is why it is in the signature.
-func rootKeyOf(_ string, info os.FileInfo) (rootKey, bool) {
-	sys, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return rootKey{}, false
-	}
-	// Dev is int32 on darwin and uint64 on linux, so the conversion is load-bearing on one
-	// of the two and a no-op on the other.
-	return rootKey{dev: uint64(sys.Dev), ino: sys.Ino}, true
-}
-
-// openNoFollow opens path with O_NOFOLLOW so the kernel refuses a symlink, and O_NONBLOCK so
-// opening a FIFO cannot hang. Callers still have to check that the result is a regular file:
-// O_NONBLOCK makes a FIFO open return rather than block, it does not reject it.
-func openNoFollow(path string) (*os.File, error) {
-	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-}
 
 // openBeneathComponents walks components one at a time from baseDir, opening each with
 // O_NOFOLLOW so a symlink substituted at any intermediate fails with ELOOP. This is
@@ -87,4 +68,40 @@ func isRefusedOrNotDirectory(err error) bool {
 		return errors.Is(pathErr.Err, syscall.ELOOP) || errors.Is(pathErr.Err, syscall.ENOTDIR)
 	}
 	return false
+}
+
+// checkDescriptor applies ReadOpts' link-count and owner refusals to an already-open file.
+//
+// Both answers come from the fstat the caller already performed, so this costs no extra
+// syscall and -- more to the point -- no second path lookup. A stat by name here would be a
+// different question than "what did I open", and the gap between the two is exactly what the
+// component-wise open exists to close.
+func checkDescriptor(_ *os.File, info os.FileInfo, opts ReadOpts) error {
+	if !opts.RefuseHardLinks && opts.OwnerUID == "" {
+		return nil
+	}
+	sys, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		// No POSIX stat behind this FileInfo, so neither check can be answered. Refusing is
+		// the direction to fail: the caller asked for a guarantee and this cannot supply it,
+		// and silently reading anyway would report the file as having passed a check that
+		// never ran.
+		return fmt.Errorf("%w: link count and owner are unavailable for this file", ErrNotRegular)
+	}
+	// Nlink is uint16 on darwin and uint64 on linux, so the comparison is written against
+	// the value rather than against a fixed-width type.
+	if opts.RefuseHardLinks && sys.Nlink > 1 {
+		return fmt.Errorf("%w: %d links", ErrHardLink, sys.Nlink)
+	}
+	if opts.OwnerUID != "" {
+		owner := strconv.FormatUint(uint64(sys.Uid), 10)
+		if owner != opts.OwnerUID {
+			// Neither uid appears in the error. The expected one came from the roster and
+			// the found one from the filesystem, and both are numbers a caller could
+			// publish safely -- but the caller classifies this rather than printing it, so
+			// there is nothing for them to be in.
+			return ErrForeignOwner
+		}
+	}
+	return nil
 }

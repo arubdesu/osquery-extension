@@ -30,7 +30,13 @@ func inferIdentity(s *Server) {
 	if s.Transport != "stdio" {
 		if s.URL != "" {
 			s.PackageManager = "mcp-remote"
-			s.RequestedSpec = s.URL // s.URL has already been sanitized by materialize()
+			// From the *validated* endpoint, not from the sanitized string. sanitizeRemoteURL
+			// drops everything but scheme and host, which is why s.URL was considered safe
+			// here -- but a host is user-controlled through DNS, so `aws.AKIA....example.com`
+			// satisfied it, and requested_spec inherited no grammar of its own. Routing both
+			// columns through validatedEndpoint means url_endpoint's grammar covers this one
+			// too, rather than two columns carrying the same value under different rules.
+			s.RequestedSpec = validatedEndpoint(s.URL)
 			s.Confidence = "high"
 		} else {
 			// A remote transport with no endpoint, e.g. {"type": "http"} and nothing else.
@@ -71,18 +77,41 @@ func inferIdentity(s *Server) {
 	if shellVarRe.MatchString(s.RequestedSpec) || shellVarRe.MatchString(s.PackageName) {
 		s.RequestedSpec = ""
 		s.PackageName = ""
-		s.Version = ""
+		s.PinnedVersion = ""
 		s.Confidence = "low"
 		return
 	}
 
 	switch {
-	case s.PackageName != "" && s.Version != "":
+	case s.PackageName != "" && s.PinnedVersion != "":
 		s.Confidence = "high"
 	case s.PackageName != "":
 		s.Confidence = "medium"
 	default:
 		s.Confidence = "low"
+	}
+}
+
+// noteWarning records a finding without displacing one already present.
+//
+// Identity inference runs last, after the file has been parsed and the row materialized, so
+// anything already here came from a stage that knew more about the entry than this one can:
+// an environment variable name that is not an identifier, or an HTTP header holding the
+// credential itself rather than the name of the variable that holds it. Those name something
+// in the file an administrator has to go and change. Both sites below assigned over them
+// unconditionally, replacing that with warnUnknownLauncherOption -- which says only that this
+// table could not read a command line -- and the remediation went with it.
+//
+// The row also stops describing itself. scan_complete is computed from the warning one
+// statement before inference runs, so the flag reflects the warning that was erased while the
+// column reports the one that replaced it; every code reachable here today is descriptive, so
+// that inconsistency is latent rather than observed, and it is latent only by coincidence.
+//
+// A row carries one warning, so the choice is which of the two survives, and it is the
+// earlier and more specific one.
+func (s *Server) noteWarning(w warning) {
+	if s.Warning.empty() {
+		s.Warning = w
 	}
 }
 
@@ -98,28 +127,35 @@ func inferIdentity(s *Server) {
 var launcherIdentity = map[string]func(s *Server, args []string){
 	"npx": func(s *Server, args []string) {
 		s.PackageManager = "npx"
-		cand, ver := npxIdentity(args)
+		cand, ver, unknown := npxIdentity(args)
+		if unknown {
+			s.noteWarning(warning{Code: warnUnknownLauncherOption})
+		}
 		if looksLikePackageSpec(cand) {
 			s.RequestedSpec = cand
 			s.PackageName, _ = splitNPMSpec(cand)
-			s.Version = ver
+			s.PinnedVersion = ver
 		}
 	},
 	"bunx": func(s *Server, args []string) {
 		s.PackageManager = "bunx"
-		assignIfClean(s, firstPositional(args), splitNPMSpec)
+		candidate, unknown := firstPositional(args)
+		assignIfClean(s, candidate, unknown, splitNPMSpec)
 	},
 	"uvx": func(s *Server, args []string) {
 		s.PackageManager = "uvx"
-		assignIfClean(s, uvxIdentity(args), splitPyPISpec)
+		candidate, unknown := uvxIdentity(args)
+		assignIfClean(s, candidate, unknown, splitPyPISpec)
 	},
 	"uv": func(s *Server, args []string) {
 		s.PackageManager = "uv"
-		assignIfClean(s, uvRunIdentity(args), splitPyPISpec)
+		candidate, unknown := uvRunIdentity(args)
+		assignIfClean(s, candidate, unknown, splitPyPISpec)
 	},
 	"pipx": func(s *Server, args []string) {
 		s.PackageManager = "pipx"
-		assignIfClean(s, pipxIdentity(args), splitPyPISpec)
+		candidate, unknown := pipxIdentity(args)
+		assignIfClean(s, candidate, unknown, splitPyPISpec)
 	},
 	"docker": dockerIdentity,
 	"podman": dockerIdentity,
@@ -138,14 +174,21 @@ var launcherIdentity = map[string]func(s *Server, args []string){
 // otherwise we'd leak URL credentials, file paths, etc. that the launcher happens to accept
 // as positional args. PackageName is set from the split result, which already rejects bad
 // shapes.
-func assignIfClean(s *Server, cand string, splitter func(string) (string, string)) {
+// unknown is threaded in rather than inferred, because the two reasons an identity comes out
+// empty are indistinguishable from the result: a candidate that is not package-shaped means
+// the launcher was not asked to install a registry package, which is ordinary, and an
+// unrecognised option means this table could not tell, which is a finding.
+func assignIfClean(s *Server, cand string, unknown bool, splitter func(string) (string, string)) {
+	if unknown {
+		s.noteWarning(warning{Code: warnUnknownLauncherOption})
+	}
 	if !looksLikePackageSpec(cand) {
 		return
 	}
 	s.RequestedSpec = cand
 	name, ver := splitter(cand)
 	s.PackageName = name
-	s.Version = ver
+	s.PinnedVersion = ver
 }
 
 func dockerIdentity(s *Server, args []string) {
@@ -158,7 +201,7 @@ func dockerIdentity(s *Server, args []string) {
 	// requested_spec and package_name.
 	if ref := dockerRunIdentity(args); dockerRefRe.MatchString(ref) {
 		s.RequestedSpec = ref
-		s.PackageName, s.Version = splitDockerRef(ref)
+		s.PackageName, s.PinnedVersion = splitDockerRef(ref)
 	}
 }
 
@@ -241,15 +284,25 @@ func guessRemoteTransport(u string, args []string) string {
 // which do not share a grammar, and no launcher's grammar is modelled completely. Docker is
 // not among them: dockerRunIdentity enumerates the booleans instead and assumes everything
 // else consumes a value, which is the inversion that made its scan stable.
-// An unlisted value option still costs the identity. `uvx --color always real-server`
-// reported package_name=always before `--color` was added below; now that the scan stops at
-// the first operand, an unlisted option whose value is not package-shaped -- `--config
-// /path/x.json real-pkg` -- yields nothing instead. Both are the same missing arity, and the
-// second is the direction this file prefers: an unlisted option used to be masked by walking
-// past its value, which was right by luck and wrong whenever the operand really was a script. The structural fix is per-launcher arity; the alternative
-// offered in review, treating every unknown option as value-taking, empties the identity of
-// every row carrying an ordinary boolean flag, which trades a narrow wrong answer for a
-// broad missing one. That trade wants a decision rather than a patch.
+// The decision this used to defer has been made: an unrecognised option fails closed.
+//
+// The gap was that all three scanners treated an unlisted flag as taking no value, so
+// `npx -y --pat <secret> pkg` made the secret the first operand and copied it into
+// package_name and requested_spec. An opaque credential is exactly what the final redactor
+// cannot recognise, so it reached the row intact. The two ways out were per-launcher arity --
+// correct, large, and permanently behind whatever options npm and uv added last month -- or
+// treating an unrecognised option as disqualifying.
+//
+// The second is now what happens: sawUnknownOption is set, the scan returns "", and the row
+// reports confidence=low with an empty identity triple and warnUnknownLauncherOption saying
+// why. The cost is real and is the point of recording it here: a legitimate unlisted boolean
+// -- some new `--quiet` -- now empties the identity for that row rather than being walked
+// past. That is a missing answer where the alternative is a confidently wrong one, and for a
+// column that may be a credential the missing answer is the only acceptable direction.
+//
+// dockerRunIdentity is unaffected and needed no change. It already inverts this, enumerating
+// the booleans and assuming everything else consumes a value, which is why its scan was the
+// stable one.
 var runnerValueFlags = map[string]struct{}{
 	"--python": {}, "-p": {}, "--with": {}, "--index": {}, "--index-url": {},
 	"--extra-index-url": {}, "--find-links": {}, "--constraint": {}, "-c": {},
@@ -265,6 +318,14 @@ var runnerValueFlags = map[string]struct{}{
 	"--config-settings": {}, "-C": {}, "--no-binary-package": {},
 	"--prerelease-package": {}, "--reinstall-package": {}, "--upgrade-package": {},
 	"-P": {}, "--upgrade-group": {}, "--allow-insecure-host": {}, "--trusted-host": {},
+	// pipx. This was in launcherBooleanFlags, so every scanner assumed it consumed nothing
+	// and read the arguments meant for pip as the launcher's first operand:
+	// `pipx run --pip-args <value> real-package` reported the value whenever it was
+	// name-shaped, which an opaque credential is. pipx documents --pip-args as taking the
+	// arguments to hand to pip, and those arguments are where an authenticated index URL or
+	// a token is passed, so the one token this option is most likely to carry is the one the
+	// final redactor cannot recognise. It reached package_name and requested_spec verbatim.
+	"--pip-args": {},
 }
 
 // firstPositional returns the launcher's first operand, and only if it is package-shaped.
@@ -283,11 +344,11 @@ var runnerValueFlags = map[string]struct{}{
 // is one implementation and this names the no-subcommand case. Two byte-identical copies of
 // the loop lived here before, which is one copy too many for a scan that decides what lands
 // in package_name: a guard added to either would have protected only its own callers.
-func firstPositional(args []string) string {
+func firstPositional(args []string) (string, bool) {
 	return firstOperandAfter(args, "")
 }
 
-func npxIdentity(args []string) (spec, ver string) {
+func npxIdentity(args []string) (spec, ver string, unknown bool) {
 	// Honor `--package <name>` and `--package=<name>` explicitly when present.
 	//
 	// The scan covers every argument including the last. Only the two-token form has to look
@@ -306,7 +367,7 @@ func npxIdentity(args []string) (spec, ver string) {
 	}
 	// The full list, not the option prefix: the package npx runs *is* the first positional,
 	// so the fallback has to see past where the option walk stops.
-	spec = firstPositional(args)
+	spec, unknown = firstPositional(args)
 	_, ver = splitNPMSpec(spec)
 	return
 }
@@ -323,9 +384,9 @@ func npxIdentity(args []string) (spec, ver string) {
 //
 // When --from is present it *is* the identity. If its value cannot be represented, the
 // identity is empty: assignIfClean rejects it and nothing after it is consulted.
-func uvxIdentity(args []string) string {
+func uvxIdentity(args []string) (string, bool) {
 	if value, found := launcherOptionValue(args, uvGrammar, uvFromFlag); found {
-		return value
+		return value, false
 	}
 	return firstPositional(args)
 }
@@ -338,13 +399,19 @@ func uvxIdentity(args []string) string {
 // found the pair inside the launched command's own arguments and reported fake-package. The
 // other direction was broken too -- subcommands were recognised only at argument zero, so
 // `uv --color always run --from real-package command` lost the identity to a global option.
-func uvRunIdentity(args []string) string {
+func uvRunIdentity(args []string) (string, bool) {
 	rest, toolRun, found := uvSubcommandArgs(args)
 	if !found {
-		return ""
+		// Either there is no run subcommand, or an unrecognised global option before it
+		// may have consumed the subcommand word. uvSubcommandArgs collapses those into one
+		// answer, and the second is a refusal rather than an absence -- reported as such,
+		// because the whole point of the fail-closed change is that an undecidable scan
+		// says so instead of returning a confident nothing.
+		_, unknown := skipLeadingOptions(args, uvGrammar)
+		return "", unknown
 	}
 	if value, ok := launcherOptionValue(rest, uvGrammar, uvFromFlag); ok {
-		return value
+		return value, false
 	}
 	if toolRun {
 		// `uv tool run <pkg>`: the package is the first operand of the subcommand.
@@ -353,7 +420,7 @@ func uvRunIdentity(args []string) string {
 	// Plain `uv run <cmd>` runs a command from the project environment. That names no
 	// package, and reporting the command as one is the confusion this function exists to
 	// avoid.
-	return ""
+	return "", false
 }
 
 // uvSubcommandArgs skips uv's global options and the one top-level subcommand path,
@@ -361,7 +428,14 @@ func uvRunIdentity(args []string) string {
 // before the first operand, so a later occurrence among the launched command's arguments is
 // never mistaken for the subcommand.
 func uvSubcommandArgs(args []string) (rest []string, toolRun, found bool) {
-	index := skipLeadingOptions(args, uvGrammar)
+	index, unknown := skipLeadingOptions(args, uvGrammar)
+	if unknown {
+		// An unrecognised global option before the subcommand may have consumed the
+		// subcommand word itself, so `run` appearing at this index proves nothing. Reporting
+		// not-found empties the identity, which is the fail-closed direction the KNOWN GAP
+		// above now resolves to.
+		return nil, false, false
+	}
 	switch {
 	case index+1 < len(args) && args[index] == "tool" && args[index+1] == "run":
 		return args[index+2:], true, true
@@ -373,15 +447,19 @@ func uvSubcommandArgs(args []string) (rest []string, toolRun, found bool) {
 
 // skipLeadingOptions returns the index of the first argument that is not one of the
 // launcher's own options, consuming the value of any option that takes one.
-func skipLeadingOptions(args []string, grammar launcherGrammar) int {
-	index := 0
+//
+// unknown reports that an option this table does not recognise was seen, which makes the
+// operand that follows unreliable: an unrecognised option may or may not consume it.
+func skipLeadingOptions(args []string, grammar launcherGrammar) (index int, unknown bool) {
 	for index < len(args) {
 		argument := args[index]
 		if argument == "--" || !strings.HasPrefix(argument, "-") {
-			return index
+			return index, unknown
 		}
 		name, _, hasInline := strings.Cut(argument, "=")
 		if hasInline {
+			// The inline form carries its own value and consumes nothing, so an
+			// unrecognised one is harmless: whatever follows is still an operand.
 			index++
 			continue
 		}
@@ -393,15 +471,103 @@ func skipLeadingOptions(args []string, grammar launcherGrammar) int {
 			index += 2
 			continue
 		}
+		if !knownLauncherOption(name) {
+			unknown = true
+		}
 		index++
 	}
-	return index
+	return index, unknown
 }
 
-func pipxIdentity(args []string) string {
+// knownLauncherOption reports whether this table knows what a separated option does with the
+// token after it. An option it does not know is what makes the scan fail closed.
+//
+// Four sources, and each is a different kind of knowledge:
+//
+//   - launcherBooleanFlags: takes no value, so the next token is an operand.
+//   - runnerValueFlags: takes a value, so the next token is not.
+//   - launcherPackageFlags: takes a value and that value IS the package, which is why these
+//     must not be in runnerValueFlags -- consuming `--from httpx` would report the command
+//     `httpx-cli` as the package instead of the package `httpx`.
+//   - isSecretFlagName: the option's own name announces that it carries a value. Arity is
+//     known here without a list, which is the point: runnerValueFlags can never be complete,
+//     and a credential-named option is exactly the one whose value must not be read as an
+//     operand. firstOperandAfter and launcherOptionValue both consume those values; this
+//     stops the same options being counted as unknown and emptying the identity they were
+//     about to protect.
+//
+// Being explicit about all four matters because the fail-closed behaviour fires on anything
+// absent from them, and an option like `-y` appears in essentially every real MCP config for
+// a scoped package. Leaving one out makes the refusal fire on the common case rather than on
+// the unusual one.
+func knownLauncherOption(name string) bool {
+	if _, ok := launcherBooleanFlags[name]; ok {
+		return true
+	}
+	if _, ok := runnerValueFlags[name]; ok {
+		return true
+	}
+	if _, ok := launcherPackageFlags[name]; ok {
+		return true
+	}
+	return isSecretFlagName(name)
+}
+
+// launcherPackageFlags are the options whose value names the package to install.
+//
+// The union of the three per-launcher sets below, which exist separately because each
+// scanner asks for its own. This set answers a different question -- "is this option known
+// at all" -- and keeping it derived from the same names means a new one cannot be known to
+// one and unknown to the other.
+var launcherPackageFlags = map[string]struct{}{
+	"--package": {}, "-p": {}, "--from": {}, "--spec": {},
+}
+
+// launcherBooleanFlags are the value-less options of npx, uvx, uv and pipx.
+//
+// Shared the same way runnerValueFlags is, and with the same caveat: these launchers do not
+// share a grammar, and an option that is boolean for one and value-taking for another would
+// be wrong here. What this comment used to claim is that the direction of error is the safe
+// one. It is the opposite: a value-taking option listed here does not empty the identity, it
+// hands the option's value to the operand scan and publishes it as the package. --pip-args
+// was listed and pipx documents it as taking a value, which is the defect that moved it to
+// runnerValueFlags.
+//
+// Every remaining entry was re-checked against its own launcher's reference for the same
+// class of error. npm's -y, --yes, --no, --no-install, the cache-preference switches and -q
+// take nothing -- -q is a --loglevel shorthand, so it carries its own value rather than
+// consuming the next token. uv's entries are counters and negations, and where uv has a
+// value-taking relative it is a separately spelled option rather than the same name with an
+// argument: --refresh against --refresh-package, --no-binary against --no-binary-package,
+// --no-build against --no-build-package, --no-cache against --cache-dir. pipx leaves
+// --force, --include-deps, --system-site-packages and --no-cache-dir, none of which takes a
+// value.
+//
+// An option whose arity is not certain belongs in runnerValueFlags rather than here, because
+// consuming one token too many yields an empty identity and a warning, while consuming one
+// too few can publish a credential as a package name.
+var launcherBooleanFlags = map[string]struct{}{
+	// npx
+	"-y": {}, "--yes": {}, "--no": {}, "--no-install": {}, "--prefer-online": {},
+	"--prefer-offline": {}, "--offline": {}, "--ignore-existing": {}, "-q": {},
+	// uv / uvx
+	"--quiet": {}, "--verbose": {}, "-v": {}, "--native-tls": {}, "--no-cache": {},
+	"-n": {}, "--no-progress": {}, "--offline-mode": {}, "--isolated": {},
+	"--no-config": {}, "--preview": {}, "--system": {}, "--no-managed-python": {},
+	"--no-python-downloads": {}, "--help": {}, "-h": {}, "--version": {}, "-V": {},
+	"--frozen": {}, "--locked": {}, "--no-sync": {}, "--refresh": {}, "--upgrade": {},
+	"-U": {}, "--reinstall": {}, "--compile-bytecode": {}, "--no-build": {},
+	"--no-binary": {}, "--no-build-isolation": {}, "--no-sources": {}, "--no-dev": {},
+	"--all-extras": {}, "--no-editable": {}, "--exact": {}, "--inexact": {},
+	// pipx
+	"--force": {}, "--include-deps": {}, "--system-site-packages": {},
+	"--no-cache-dir": {},
+}
+
+func pipxIdentity(args []string) (string, bool) {
 	// Bounded like the others: `pipx run server --spec evil` names the server's option.
 	if value, found := launcherOptionValue(args, pipxGrammar, pipxSpecFlag); found {
-		return value
+		return value, false
 	}
 	// `pipx run --python 3.12 actual-server` returned 3.12: the scan skipped flags but not
 	// the values they consume, and 3.12 is name-shaped so no grammar rejects it either.
@@ -417,8 +583,14 @@ func pipxIdentity(args []string) string {
 // run+2. Arity comes from runnerValueFlags, which they share. Docker went the other way and
 // kept its own parser -- a hand-written list of value-taking options needed an addition every
 // time one produced a wrong image, so dockerRunIdentity enumerates the booleans instead.
-func firstOperandAfter(args []string, subcommand string) string {
+// unknown reports that the scan declined because an option this table does not recognise
+// appeared before the operand, as distinct from declining because the operand was not
+// package-shaped. The two look identical in the result -- an empty identity -- and call for
+// different rows: one says "this launcher was not asked to install a package", which is
+// ordinary, and the other says "this table could not tell", which is a finding.
+func firstOperandAfter(args []string, subcommand string) (operand string, unknown bool) {
 	started := subcommand == ""
+	sawUnknownOption := false
 	for i, argument := range args {
 		if !started {
 			if argument == subcommand {
@@ -427,6 +599,19 @@ func firstOperandAfter(args []string, subcommand string) string {
 			continue
 		}
 		if strings.HasPrefix(argument, "-") {
+			// An option this table does not recognise, in the separated form, may consume
+			// the token after it. That token is then not an operand, and reading it as one
+			// is how `npx -y --pat <secret> pkg` reported the secret as the package. Noted
+			// rather than acted on here, because the loop has to reach the operand before
+			// there is anything to refuse.
+			name, _, hasInline := strings.Cut(argument, "=")
+			if !hasInline && argument != "--" {
+				if _, takesValue := runnerValueFlags[name]; !takesValue {
+					if !knownLauncherOption(name) {
+						sawUnknownOption = true
+					}
+				}
+			}
 			continue
 		}
 		if i > 0 {
@@ -446,15 +631,23 @@ func firstOperandAfter(args []string, subcommand string) string {
 				continue
 			}
 		}
+		// An unrecognised option was seen before this token, so whether this is an operand
+		// or that option's value cannot be decided. Fail closed: an empty identity at low
+		// confidence is honest, and a credential reported as a package name is not.
+		if sawUnknownOption {
+			return "", true
+		}
 		// The first operand decides it. Not package-shaped -- a URL, a script path, a
 		// tarball -- means this launcher was not asked to install a registry package,
 		// and everything after it belongs to whatever it was asked to run.
 		if looksLikePackageSpec(argument) {
-			return argument
+			return argument, false
 		}
-		return ""
+		return "", false
 	}
-	return ""
+	// Ran out of arguments without reaching an operand. If an unrecognised option was seen
+	// on the way, that is still why nothing was identified.
+	return "", sawUnknownOption
 }
 
 // dockerRunIdentity returns the image reference from a `docker run` invocation.
@@ -680,6 +873,31 @@ func launcherOptionValue(args []string, grammar launcherGrammar, want map[string
 				index += 2
 				continue
 			}
+			// A credential-named option announces its own arity, so its value is consumed
+			// with it. This read `index++`, treating the option as value-less, and the value
+			// then reached the default branch below as a bare positional -- which ends the
+			// walk, because a positional is where the launched program begins. So any such
+			// option *before* the wanted one hid it completely:
+			// `npx --auth-token <secret> --package real-pkg` never reached --package, and the
+			// operand fallback skipped the real package as a consumed value, so the row came
+			// back with no identity at all.
+			//
+			// Not a leak in either direction, since a value is not an option name and could
+			// never have been returned as one -- but a lost identity, and inconsistent with
+			// firstOperandAfter, which does skip these values. knownLauncherOption already
+			// documents the arity as known from the name; this was the scanner not honouring
+			// it.
+			if isSecretFlagName(name) {
+				index += 2
+				continue
+			}
+			if !knownLauncherOption(name) {
+				// An unrecognised separated option. The wanted option may lie past the
+				// token it might consume, so the scan cannot be trusted to have reached
+				// it -- and an option named like a credential is exactly the case where a
+				// wrong answer is a leak. Stop rather than guess.
+				return "", false
+			}
 			index++
 		default:
 			// A positional that is not a subcommand: the launched program begins here.
@@ -837,8 +1055,79 @@ func pythonModule(args []string) string {
 	return ""
 }
 
+// pinsOneVersion reports whether a version selector names exactly one release.
+//
+// `pinned_version` is what the configuration pins, so a selector that chooses a *set* does
+// not belong in it however concrete it looks. Two shapes were reaching the column:
+//
+//	npx real-package@latest    reported pinned_version=latest  -- a dist-tag, which npm
+//	                           re-points whenever the maintainer publishes
+//	uvx real-package==1.*      reported pinned_version=1.*     -- wildcard equality, a range
+//
+// Both got high confidence too, since confidence is derived from having a name and a version.
+// An operator correlating the column against a vulnerability feed reads either as the version
+// in use, and neither is.
+//
+// The rule is that a pin starts with a digit, optionally after a `v`, and contains no
+// wildcard. A dist-tag is a name and starts with a letter; `latest`, `next` and `canary` are
+// the common ones and npm does not publish a closed list, so matching the shape of a version
+// is the only check that does not need one. The selector is still reported verbatim in
+// requested_spec, so nothing is lost -- it moves from a column asserting a pin to one
+// describing the request.
+func pinsOneVersion(ver string) bool {
+	if ver == "" {
+		return false
+	}
+	if strings.ContainsAny(ver, "*") {
+		return false
+	}
+	digits := strings.TrimPrefix(ver, "v")
+	if digits == "" || digits[0] < '0' || digits[0] > '9' {
+		return false
+	}
+	// A component that is `x` or `X` is npm's other wildcard spelling: 1.x and 1.2.X each
+	// select a range while looking like an ordinary version.
+	for _, component := range strings.Split(digits, ".") {
+		if component == "x" || component == "X" {
+			return false
+		}
+	}
+	return true
+}
+
+// npmExactVersionRe is a complete semver version: all three components present, with the
+// optional prerelease and build metadata semver allows.
+//
+// npm's X-ranges make a *missing* component a wildcard, so `1` means `1.x.x` and `1.2` means
+// `1.2.x` -- ranges that select whatever the maintainer publishes next within them. Sharing
+// pinsOneVersion with Python left both reported as exact pins at high confidence, because
+// neither contains a wildcard character to notice. The rule has to be npm's own: a pin names
+// all three components.
+//
+// Python is deliberately not held to this. PEP 440 `==1.0` is exact against the release it
+// names, so requiring three components there would discard a real pin -- which is why the two
+// ecosystems now have separate recognisers rather than one heuristic.
+var npmExactVersionRe = regexp.MustCompile(
+	`^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$`)
+
+// pinsOneNPMVersion reports whether an npm selector names exactly one published version.
+func pinsOneNPMVersion(ver string) bool {
+	return ver != "" && npmExactVersionRe.MatchString(ver)
+}
+
+// npmPinnedOrEmpty passes an npm selector through only when it names one version.
+func npmPinnedOrEmpty(ver string) string {
+	if pinsOneNPMVersion(ver) {
+		return ver
+	}
+	return ""
+}
+
 // splitNPMSpec splits e.g. "@scope/pkg@1.0.0" into ("@scope/pkg", "1.0.0").
 // Unscoped: "pkg@1" → ("pkg", "1"). No version: returns spec, "".
+//
+// A selector that is not a single complete version yields the name and an empty version; see
+// pinsOneNPMVersion, which applies npm's own rule rather than the shared heuristic.
 func splitNPMSpec(spec string) (name, ver string) {
 	if spec == "" {
 		return "", ""
@@ -857,36 +1146,103 @@ func splitNPMSpec(spec string) (name, ver string) {
 		if at < 0 {
 			return spec, ""
 		}
-		return spec[:slash+at], spec[slash+at+1:]
+		return spec[:slash+at], npmPinnedOrEmpty(spec[slash+at+1:])
 	}
 	if at := strings.IndexByte(spec, '@'); at >= 0 {
-		return spec[:at], spec[at+1:]
+		return spec[:at], npmPinnedOrEmpty(spec[at+1:])
 	}
 	return spec, ""
 }
 
+// pinnedOrEmpty passes a selector through only when it names one version.
+func pinnedOrEmpty(ver string) string {
+	if pinsOneVersion(ver) {
+		return ver
+	}
+	return ""
+}
+
+// splitPyPISpec splits a PyPI requirement into its name and, only where the requirement
+// actually pins one, its version.
+//
+// `==` is the only comparison that pins. Every other PEP 440 operator states a range or an
+// exclusion, and the column is `pinned_version` -- what the configuration pins, which is the
+// distinction the rename from `version` existed to draw. Returning the number beside the
+// operator made the table assert a version the config never chose, and at *high* confidence,
+// because confidence is derived from having both a name and a version:
+//
+//	pkg>=1.0   reported pinned_version=1.0  -- the floor of a range, not the pin
+//	pkg~=1.4   reported pinned_version=1.4  -- a compatible-release range
+//	pkg!=1.5   reported pinned_version=1.5  -- an *exclusion*: the one version ruled out
+//
+// The last is the clearest case for the change. An operator correlating this column against a
+// vulnerability feed would read `pinned_version = 1.5` as the version in use, when the
+// configuration says specifically not to use it.
+//
+// So a range yields the name and no version, which leaves confidence at medium: the package
+// is known and the version is not. That is the honest reading of a range, and it is what the
+// column already means for a requirement with no operator at all.
+//
+// PEP 440's `===` arbitrary-equality operator is deliberately not handled. It pins exactly,
+// so it belongs with `==` on the semantics -- but packageSpecRe requires an alphanumeric
+// immediately after the operator, so `pkg===1.2.3` fails looksLikePackageSpec and cannot
+// reach this function. A branch for it would be unreachable, and the grammar is the place to
+// change if `===` is ever worth admitting.
 func splitPyPISpec(spec string) (name, ver string) {
 	if spec == "" || !looksLikePackageSpec(spec) {
 		return "", ""
 	}
-	for _, sep := range []string{"==", ">=", "<=", "~=", "!=", ">", "<"} {
-		if i := strings.Index(spec, sep); i > 0 {
-			return spec[:i], spec[i+len(sep):]
-		}
+	// Checked before the range operators, because `==` contains `=` and a scan for the
+	// range set would otherwise cut an exact pin in the wrong place.
+	if i := strings.Index(spec, "=="); i > 0 {
+		// Exact equality, unless the operand is a wildcard: `==1.*` is equality against a
+		// set, which PEP 440 permits and which pins nothing.
+		return spec[:i], pinnedOrEmpty(spec[i+2:])
 	}
-	// uv/uvx also accepts npm-style pinning "tool@version" (and "tool@latest").
+	// Any remaining comparison character starts a range or an exclusion. Matched as a
+	// character class rather than as the operator list, so the name is cut at the first one
+	// whichever spelling follows -- `>=` and `>` need no separate cases when the version is
+	// discarded either way.
+	if i := strings.IndexAny(spec, "<>~!="); i > 0 {
+		return spec[:i], ""
+	}
+	// uv and uvx also accept npm-style selection, "tool@version" and "tool@latest". The
+	// operator pins when its operand is one version; `@latest` is a moving tag and yields
+	// the name with no version, the same as a range.
 	if i := strings.IndexByte(spec, '@'); i > 0 {
-		return spec[:i], spec[i+1:]
+		return spec[:i], pinnedOrEmpty(spec[i+1:])
 	}
 	return spec, ""
 }
 
 // splitDockerRef separates an image reference into (name, version-or-digest).
 // Handles registry-port colons: localhost:5000/repo/img:tag → name=localhost:5000/repo/img, ver=tag.
+//
+// Both halves are validated after the split, which they were not before. dockerIdentity
+// checks the whole reference against dockerRefRe and then hands it here, and the split is
+// string surgery on a colon -- so a reference that satisfies the grammar as a whole can still
+// produce halves that satisfy nothing. The name and the version are separate columns, and a
+// column's value has to satisfy that column's rule rather than inheriting one from a string
+// it was cut out of.
 func splitDockerRef(ref string) (name, ver string) {
 	if ref == "" {
 		return "", ""
 	}
+	defer func() {
+		// Checked here so every return path is covered, including the two early ones. A
+		// guard at each return was the alternative and is how one gets missed.
+		if name != "" && !dockerNameRe.MatchString(name) {
+			name, ver = "", ""
+			return
+		}
+		if ver != "" && !pinnedVersionRe.MatchString(ver) {
+			// The whole triple goes, not just the version. A name with a version this
+			// table refused to publish is a partial identity, and a partial identity reads
+			// as a complete one: `package_name = x` with an empty version is what an
+			// unpinned package looks like.
+			name, ver = "", ""
+		}
+	}()
 	// Digest reference: name@sha256:...
 	if i := strings.Index(ref, "@sha256:"); i > 0 {
 		return ref[:i], ref[i+1:]

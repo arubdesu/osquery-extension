@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 )
 
 // rawServerEntry is the union of fields any MCP client uses per-server. Env values are
@@ -139,12 +138,15 @@ func extractEnvelope(raw []byte) (envelopeEntries, int, error) {
 // the rest. Counting here is what makes the notice exist at all; reading it is the
 // operator's second query, and the README says so.
 //
-// KNOWN GAP: no single predicate expresses "complete".
-// Making one work means either propagating the incompleteness onto every server row from
-// the affected file and home -- which returns nothing for a partly walked home, so the
-// partial inventory becomes unreachable through the documented filter -- or adding a
-// scan_complete column, which costs a column and a migration for anyone selecting *.
-// A schema decision rather than a defect; see docs/upstreaming-followups.md.
+// The skip count is now also what makes scan_complete answerable for this file.
+//
+// This carried a KNOWN GAP saying no single predicate expressed "complete": `warning = ”`
+// selects the healthy servers and discards the notice along with them, so a short list was
+// indistinguishable from a full one. The two ways out were propagating incompleteness onto
+// every row -- which makes a partly read home unreachable through the documented filter --
+// or adding a column. The column was added, scoped: warnEntriesSkipped is source-scope, so
+// it marks the rows of this file and not the rest of the account, which is what makes
+// `WHERE scan_complete = 1` select a usable partial inventory rather than nothing.
 func decodeInto(out map[string]rawServerEntry, in map[string]json.RawMessage) int {
 	skipped := 0
 	for name, value := range in {
@@ -168,6 +170,13 @@ func decodeInto(out map[string]rawServerEntry, in map[string]json.RawMessage) in
 
 // skippedEntryWarning renders the diagnostic row that accompanies healthy rows when some
 // entries in the same file could not be decoded.
+//
+// The one funnel of the four that was already safe: a count is an integer. It is now a code
+// plus that count, which buys something the sentence did not -- warnEntriesSkipped is
+// source-scope, so finishProcessing marks every row from this file as an incomplete listing
+// of it. That is what closes the gap recorded below: `warning = ”` selects the healthy
+// servers and discards this notice with the rest, so before scan_complete existed there was
+// no single predicate for "this file was read in full".
 func skippedEntryWarning(skipped int) []Server {
 	if skipped == 0 {
 		return nil
@@ -175,9 +184,8 @@ func skippedEntryWarning(skipped int) []Server {
 	// User, SourcePath and Client are stamped by finishProcessing, which also runs
 	// inferIdentity over these rows; the identity columns are set here regardless so the row
 	// satisfies the contract even if a future caller returns it without that pass.
-	return []Server{diagnosticRow("", "", "", fmt.Sprintf(
-		"parse: %d server entry/entries in this file could not be decoded and are not listed",
-		skipped))}
+	return []Server{diagnosticRow("", "", "",
+		warning{Code: warnEntriesSkipped, Count: skipped})}
 }
 
 // extractFlat parses a flat shape: {"<name>": {<entry>}, ...}. Used by project-local

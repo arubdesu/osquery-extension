@@ -16,12 +16,12 @@ import (
 //
 // The constraint is not only about os.Symlink needing privilege off-POSIX. On any platform
 // where fsscan reports unsupported, ReadBoundedUnder returns errUnsupported before touching
-// the filesystem, so processOne yields a diagnostic row rather than the silent refusal these
+// the filesystem, so the read yields a diagnostic rather than the silent refusal these
 // assert. The tests would fail for a reason that has nothing to do with what they check.
 
 func TestDiscoverForHome_SymlinkAttack_RefusedSilently(t *testing.T) {
 	// Attacker scenario: home contains a symlink at .cursor/mcp.json pointing to /etc/passwd.
-	// fsscan.ReadBounded refuses the symlink at the kernel level (O_NOFOLLOW). No leak.
+	// The component-wise open refuses the symlink at the kernel level. No leak.
 	home := t.TempDir()
 	cursorDir := filepath.Join(home, ".cursor")
 	if err := os.MkdirAll(cursorDir, 0o755); err != nil {
@@ -38,17 +38,21 @@ func TestDiscoverForHome_SymlinkAttack_RefusedSilently(t *testing.T) {
 	}
 }
 
-// A path the walker produced must be opened relative to the user home with O_NOFOLLOW on
-// every component, not just the last.
+// A project path recorded in a config file must be opened relative to the home with symlinks
+// refused at every component, not just the last.
 //
-// This exercises the read step directly rather than going through discoverForHome, because the
-// real defect is a TOCTOU: filepath.WalkDir never descends a symlink, so the walk is safe, but
-// the user owns the directory and can swap it for a symlink after discovery and before the
-// open. A single-threaded test cannot sit inside that window, and planting the symlink up
-// front instead just means the walk never yields the path at all -- which is why the first
-// version of this test passed with the bug present. Calling processOne with an already-swapped
-// parent reproduces exactly the state the race would create.
-func TestProcessOneRefusesASymlinkedParentDirectory(t *testing.T) {
+// The invariant is the one the deleted walker version asserted and it now matters more, not
+// less. Containment runs once, when the project list is read, and the read happens afterwards
+// -- so the user owns the directory and can swap it for a symlink in between. That is a
+// genuine TOCTOU and a single-threaded test cannot sit inside the window, which is why this
+// calls the read step directly with an already-swapped parent: that reproduces exactly the
+// state the race would create.
+//
+// It is the reason ReadProjectFile never opens projectRef.Abs. Containment establishes a
+// relative path and the read re-walks it from the home down, so a component replaced after
+// the check fails the open rather than redirecting it. A string comparison performed earlier
+// would have been satisfied by the path below and read the victim's file.
+func TestProjectFileReadRefusesASymlinkedParentDirectory(t *testing.T) {
 	root := t.TempDir()
 	home := filepath.Join(root, "alice")
 	victimDir := filepath.Join(root, "victim", "repo")
@@ -62,20 +66,26 @@ func TestProcessOneRefusesASymlinkedParentDirectory(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(home, "code"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// code/repo is a symlink out of the home, as it would be mid-race.
+	// code/repo is a symlink out of the home, as it would be mid-race. Containment was
+	// satisfied before the swap: "code/repo" is relative to the home and carries no "..".
 	if err := os.Symlink(victimDir, filepath.Join(home, "code", "repo")); err != nil {
 		t.Fatal(err)
 	}
 
-	// The scan result carries the base it was contained to, which is what ReadCandidate uses.
-	scan := fsscan.ScanResult{Beneath: home}
-	rows := processOne(scan, filepath.Join(home, "code", "repo", ".mcp.json"),
-		"alice", "claude_code", true, extractEnvelopeSimple)
-	for _, row := range rows {
-		if row.ServerName == "victim-secret" {
-			t.Errorf("read through a symlinked parent into another user's config: %+v", row)
-		}
+	data, err := fsscan.ReadProjectFile(home, filepath.Join("code", "repo"), ".mcp.json",
+		probeReadOpts(MaxFileSize))
+	if err == nil {
+		t.Fatalf("read through a symlinked parent into another user's config: %q", data)
 	}
+	// Silent, not a diagnostic. A planted symlink is an expected absence by this package's
+	// contract, and emitting a warning row for it would publish the attacker's path.
+	if !fsscan.IsExpectedAbsent(err) {
+		t.Errorf("a refused symlink must read as expected absence, got %v", err)
+	}
+
+	// And the row-level consequence: the project probe produces nothing at all.
+	rows := finishProcessing(home, data, err, filepath.Join(home, "code", "repo", ".mcp.json"),
+		"alice", "claude_code", true, MaxFileSize, extractEnvelopeSimple)
 	if len(rows) != 0 {
 		t.Errorf("a refused read should be silent, got %+v", rows)
 	}
@@ -99,7 +109,7 @@ func TestDiscoverAllReportsSkippedHomesPerAccount(t *testing.T) {
 	// Unfiltered: the skipped account is named.
 	var found bool
 	for _, row := range withoutStandingNotes(DiscoverAll(context.Background(), rosterOf(t, root), nil)) {
-		if row.User == "alice" && row.Warning != "" {
+		if row.User == "alice" && row.Warning.empty() == false {
 			found = true
 		}
 	}
@@ -114,7 +124,7 @@ func TestDiscoverAllReportsSkippedHomesPerAccount(t *testing.T) {
 	// result a non-fatal failure fell through into an out-of-range panic. That aborts the
 	// whole test binary, so the real message here was replaced by a stack trace and every
 	// later test in the package went unreported.
-	if len(rows) != 1 || rows[0].User != "alice" || rows[0].Warning == "" {
+	if len(rows) != 1 || rows[0].User != "alice" || rows[0].Warning.empty() {
 		t.Fatalf("a query for the skipped account must still explain itself: %+v", rows)
 	}
 	if rows[0].Transport != "unknown" || rows[0].Confidence != "low" {

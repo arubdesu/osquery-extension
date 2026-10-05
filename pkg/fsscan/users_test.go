@@ -38,7 +38,7 @@ func TestHomesFromUsers(t *testing.T) {
 			"directory": home, "shell": shell}
 	}
 
-	got := homesFromUsers([]map[string]string{
+	rows := []map[string]string{
 		row("501", "", "alice", real, "/bin/zsh"),
 		// A daemon: excluded by shell, so no home and no diagnostic row -- there is no
 		// person to tell about. Still reported under NonLogin, because a caller
@@ -60,7 +60,8 @@ func TestHomesFromUsers(t *testing.T) {
 		// A home that does not exist holds nothing, and warning about every such account
 		// would bury the ones that matter.
 		row("505", "", "erin", filepath.Join(dir, "gone"), "/bin/bash"),
-	})
+	}
+	got := homesFromUsers(rows, nil, os.Lstat)
 
 	var homes []string
 	for _, home := range got.Homes {
@@ -125,8 +126,8 @@ func TestSharedHomesKeepEveryAccount(t *testing.T) {
 	// Also pins that the input is not reordered underneath the caller: the sort runs on a
 	// copy, and sorting in place would rearrange a slice the caller still owns.
 	input := []map[string]string{b, a}
-	first := homesFromUsers([]map[string]string{a, b})
-	second := homesFromUsers(input)
+	first := homesFromUsers([]map[string]string{a, b}, nil, os.Lstat)
+	second := homesFromUsers(input, nil, os.Lstat)
 	if input[0]["username"] != "other" || input[1]["username"] != "root" {
 		t.Errorf("the caller's slice was reordered: %v", []string{
 			input[0]["username"], input[1]["username"]})
@@ -201,5 +202,69 @@ func TestRedirectsElsewhereCoversBothLinkModes(t *testing.T) {
 				t.Errorf("redirectsElsewhere(%v) = %v, want %v", testCase.mode, got, testCase.refuse)
 			}
 		})
+	}
+}
+
+// The filter has to run before the first filesystem call, and the only way to assert that is
+// to watch the call.
+//
+// Asserting on the returned roster cannot distinguish "alice was filtered out" from "alice
+// was stat'd and then filtered out", and those differ by every blocking syscall the change
+// exists to avoid: an Lstat on a dead automount or an offline network home can consume the
+// query's whole budget, and before this it did so for accounts nobody asked about. The
+// recorder makes the ordering observable rather than asserted in a comment.
+func TestHomesFromUsersFiltersBeforeStatting(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"alice", "bob"} {
+		if err := os.MkdirAll(filepath.Join(dir, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var statted []string
+	recorder := func(path string) (os.FileInfo, error) {
+		statted = append(statted, filepath.Base(path))
+		return os.Lstat(path)
+	}
+	rows := []map[string]string{
+		{"uid": "501", "username": "alice", "directory": filepath.Join(dir, "alice"), "shell": "/bin/zsh"},
+		{"uid": "502", "username": "bob", "directory": filepath.Join(dir, "bob"), "shell": "/bin/zsh"},
+	}
+
+	got := homesFromUsers(rows, map[string]struct{}{"alice": {}}, recorder)
+
+	if !reflect.DeepEqual(statted, []string{"alice"}) {
+		t.Errorf("stat was called for %v; only the requested account's home may be touched", statted)
+	}
+	if len(got.Homes) != 1 || got.Homes[0].Name != "alice" {
+		t.Errorf("homes = %+v, want alice alone", got.Homes)
+	}
+}
+
+// The one account the filter must never exclude.
+//
+// A row with no username is not a statement about any particular account: it is the roster
+// failing to represent one, and the caller repeats that fact under every name a query asked
+// about so SQLite cannot discard it. Filtering it by name is impossible -- it has none -- so
+// filtering it out at all would mean a query for alice is told alice is simply absent, when
+// what happened is that the roster returned an account it could not name and alice may have
+// been it.
+func TestHomesFromUsersKeepsNamelessRowsThroughTheFilter(t *testing.T) {
+	rows := []map[string]string{
+		{"uid": "777", "username": "", "directory": "/somewhere", "shell": "/bin/zsh"},
+		{"uid": "502", "username": "bob", "directory": "/elsewhere", "shell": "/bin/zsh"},
+	}
+	var statted []string
+	recorder := func(path string) (os.FileInfo, error) {
+		statted = append(statted, path)
+		return nil, os.ErrNotExist
+	}
+
+	got := homesFromUsers(rows, map[string]struct{}{"alice": {}}, recorder)
+
+	if len(statted) != 0 {
+		t.Errorf("stat was called for %v; neither row is a requested account with a usable home", statted)
+	}
+	if len(got.Skipped) != 1 || got.Skipped[0].Name != "" || got.Skipped[0].ID != "777" {
+		t.Fatalf("skipped = %+v, want the nameless account alone", got.Skipped)
 	}
 }

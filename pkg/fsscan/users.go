@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -22,8 +21,16 @@ import (
 // that defaults to 0, so accounts served only by LDAP, SSSD or another NSS backend are
 // absent unless it is set. Enumerating a whole remote directory is expensive enough that
 // osquery makes it opt-in, and doing it unasked on every scheduled query is not a trade this
-// table should make silently -- so the local roster is used and its incompleteness is
-// reported rather than hidden. See linuxRemoteAccountsWarning.
+// table should make silently, so the local roster is used.
+//
+// That limit is documented rather than emitted. It used to produce a warning row on every
+// Linux run, which made the warning column non-empty on every Linux host whether or not
+// anything was wrong -- so the one predicate an operator would write to find real problems
+// matched every host in the fleet, and the note itself became the thing they filtered out.
+// A condition that is true of every run unconditionally is a property of the table, and the
+// place to state a property of the table is its documentation. What survives is the
+// per-account reporting: a name the roster never mentioned still gets a row saying so, which
+// is what actually distinguishes a directory-served account from an absent one.
 //
 // An earlier version of this file enumerated /Users and /home directly and grew a parser
 // for /etc/passwd, a reader for /etc/shells, an nsswitch.conf policy check, a uid heuristic,
@@ -74,6 +81,36 @@ type UserHome struct {
 	Path string
 }
 
+// OmissionReason is the closed set of reasons an account's home was not inspected.
+//
+// Carried alongside Reason rather than instead of it, because the two have different
+// consumers. Reason is a sentence, which is what this package renders for a caller that
+// simply wants to print it. Code is what a caller emitting a virtual table column needs: the
+// sentence interpolates the account's shell, and a column that must be assembled only from
+// bytes its own package chose cannot include a value read out of the account database. The
+// distinction is small here and load-bearing for the caller -- see the mcp_servers warning
+// catalogue, which is built on the rule that no byte it did not choose reaches the column.
+type OmissionReason string
+
+const (
+	// OmittedNoUsername is a roster row carrying an identity and a home but no name.
+	OmittedNoUsername OmissionReason = "no_username"
+	// OmittedNonLoginShell is an account whose shell cannot log in.
+	OmittedNonLoginShell OmissionReason = "non_login_shell"
+	// OmittedNoHomeDeclared is an account record with no home directory at all.
+	OmittedNoHomeDeclared OmissionReason = "no_home_declared"
+	// OmittedHomeMissing is a declared home that does not exist, which is
+	// indistinguishable from one that is offline.
+	OmittedHomeMissing OmissionReason = "home_missing"
+	// OmittedHomeUnstattable is a declared home that could not be stat'd for some other
+	// reason, typically a permission failure on a parent.
+	OmittedHomeUnstattable OmissionReason = "home_unstattable"
+	// OmittedHomeRedirected is a declared home that is a symlink or a reparse point.
+	OmittedHomeRedirected OmissionReason = "home_redirected"
+	// OmittedHomeNotDirectory is a declared home that exists and is not a directory.
+	OmittedHomeNotDirectory OmissionReason = "home_not_directory"
+)
+
 // Omission is one account that exists on the host but whose home was not inspected.
 //
 // Structured rather than a bare name because the fields answer different questions. Name is
@@ -86,6 +123,7 @@ type Omission struct {
 	ID     string
 	Path   string
 	Reason string
+	Code   OmissionReason
 
 	// HomeUnusable marks the omissions that are usually uninteresting and occasionally
 	// critical: the account has no usable home to inspect, because none is declared,
@@ -124,10 +162,6 @@ type UserHomes struct {
 	// query there is, so if that account was the skipped one the caller saw a clean empty
 	// result.
 	Skipped []Omission
-
-	// Truncated is set when the roster itself was short, as opposed to individual accounts
-	// failing. There is no list of who is missing in that case, so it cannot be an Omission.
-	Truncated string
 
 	// NonLogin holds the rostered accounts that cannot log in and so were not inspected.
 	//
@@ -169,21 +203,6 @@ var nonLoginShells = map[string]struct{}{
 var errEmptyRoster = errors.New("the osquery users table returned no accounts, so the " +
 	"roster is unavailable rather than empty")
 
-// linuxRemoteAccountsWarning states the limit of the default roster on Linux.
-//
-// osquery's users table hides an include_remote column defaulting to 0, so directory-served
-// accounts are absent. Their homes are usually the ones carrying the configuration this
-// table looks for, so presenting the local-only roster as complete would be the largest
-// silent omission available. Setting include_remote would enumerate an entire directory on
-// every scheduled query, which osquery itself warns can be extremely expensive.
-func linuxRemoteAccountsWarning() string {
-	if runtime.GOOS != "linux" {
-		return ""
-	}
-	return "the account roster covers local accounts only; accounts served by LDAP, SSSD " +
-		"or another directory are not enumerated, so their configuration is not listed"
-}
-
 // accountID picks the identity that actually identifies the account on this host.
 //
 // osquery reports both a uid and a uuid, and which one is the identity depends on the
@@ -202,7 +221,15 @@ func accountID(row map[string]string) string {
 
 // ListUserHomes returns one entry per real user home on the host, asking osquery for the
 // account list and then checking each home is something this package can safely inspect.
-func ListUserHomes(client utils.OsqueryClient) (UserHomes, error) {
+//
+// filter, when non-nil, restricts the result to those usernames. It is applied before any
+// filesystem call, which is the whole reason it is a parameter rather than something the
+// caller does afterwards. The check on each home is an Lstat, and an Lstat is not free: on a
+// host with network or automounted homes it can block for the mount timeout, per account.
+// Filtering afterwards meant `WHERE user = 'alice'` still stat'd every home on the box --
+// so one dead mount belonging to an account nobody asked about delayed, or killed, a query
+// scoped to a single local user.
+func ListUserHomes(client utils.OsqueryClient, filter map[string]struct{}) (UserHomes, error) {
 	// KNOWN GAP: this does not observe cancellation or
 	// the caller's budget. osquery-go does provide QueryRowsContext -- the pinned revision
 	// has it -- but utils.OsqueryClient does not name it, so no caller can reach it. An
@@ -219,14 +246,19 @@ func ListUserHomes(client utils.OsqueryClient) (UserHomes, error) {
 	if len(rows) == 0 {
 		return UserHomes{}, errEmptyRoster
 	}
-	result := homesFromUsers(rows)
-	result.Truncated = linuxRemoteAccountsWarning()
-	return result, nil
+	return homesFromUsers(rows, filter, os.Lstat), nil
 }
 
 // homesFromUsers turns osquery's user rows into a roster. Separated from the query so it is
 // testable with the mock client the rest of this repository already uses.
-func homesFromUsers(rows []map[string]string) UserHomes {
+//
+// stat is injected for one reason: it is the only way to assert that the filter above runs
+// before the filesystem is touched. Asserting on the *result* cannot distinguish "alice was
+// filtered out" from "alice was stat'd and then filtered out", and those differ by every
+// blocking syscall this change exists to avoid. A recorder stat in the test makes the
+// ordering an observable fact instead of a claim in a comment.
+func homesFromUsers(rows []map[string]string, filter map[string]struct{},
+	stat func(string) (os.FileInfo, error)) UserHomes {
 	var result UserHomes
 	// Ordered before anything is decided. Accounts share a home directory -- on macOS
 	// /var/root is listed for both root and daemon, and /var/empty for seventy-nine service
@@ -250,14 +282,25 @@ func homesFromUsers(rows []map[string]string) UserHomes {
 			// aggregating it for an unconstrained query and repeating it under each
 			// requested username for a constrained one, so SQLite cannot discard it.
 			result.Skipped = append(result.Skipped, Omission{
-				ID: accountID(row), Path: home,
+				ID: accountID(row), Path: home, Code: OmittedNoUsername,
 				Reason: "the roster returned an account with no username, so it could not " +
 					"be attributed or inspected"})
 			continue
 		}
+		// Narrowed here, between the nameless check above and the first filesystem call
+		// below. Above it on purpose: a row with no username always passes, because its
+		// absence of a name is roster-level uncertainty rather than a statement about any
+		// particular account, and the caller repeats it under every requested name. Below
+		// the shell and home checks would defeat the point -- those are cheap, but the stat
+		// after them is not, and this has to sit in front of the expensive one.
+		if filter != nil {
+			if _, requested := filter[name]; !requested {
+				continue
+			}
+		}
 		if _, nonLogin := nonLoginShells[row["shell"]]; nonLogin {
 			result.NonLogin = append(result.NonLogin, Omission{
-				Name: name, ID: accountID(row), Path: home,
+				Name: name, ID: accountID(row), Path: home, Code: OmittedNonLoginShell,
 				Reason: "this account cannot log in, its shell being " + row["shell"] +
 					", so it keeps no editor or agent configuration"})
 			continue
@@ -267,7 +310,7 @@ func homesFromUsers(rows []map[string]string) UserHomes {
 			// configuration. On Windows and on directory-managed hosts an account record
 			// routinely exists before a profile has been created.
 			result.Skipped = append(result.Skipped, Omission{
-				Name: name, ID: accountID(row),
+				Name: name, ID: accountID(row), Code: OmittedNoHomeDeclared,
 				Reason:       "this account declares no home directory, so there was nowhere to look",
 				HomeUnusable: true})
 			continue
@@ -278,7 +321,7 @@ func homesFromUsers(rows []map[string]string) UserHomes {
 		// and the result was indistinguishable from Bob having no configuration. Avoiding
 		// the duplicate filesystem work is the caller's job, and it can do it after
 		// filtering; see the scan cache in DiscoverAll.
-		info, err := os.Lstat(home)
+		info, err := stat(home)
 		if err != nil {
 			// Reported either way, including ENOENT. An absent home is indistinguishable
 			// from an automounted or network home that is offline right now, and those are
@@ -286,12 +329,14 @@ func homesFromUsers(rows []map[string]string) UserHomes {
 			// moment. Skipping them silently turned a transient outage into a confident
 			// empty answer for a specifically requested user.
 			reason, unusable := "home directory could not be stat'd", os.IsNotExist(err)
+			code := OmittedHomeUnstattable
 			if unusable {
 				reason = "the home directory this account declares does not exist, which " +
 					"may mean it is offline rather than absent"
+				code = OmittedHomeMissing
 			}
 			result.Skipped = append(result.Skipped, Omission{
-				Name: name, ID: accountID(row), Path: home,
+				Name: name, ID: accountID(row), Path: home, Code: code,
 				Reason: reason, HomeUnusable: unusable})
 			continue
 		}
@@ -299,7 +344,7 @@ func homesFromUsers(rows []map[string]string) UserHomes {
 			// Refusing to follow is deliberate -- never traverse out of the home reported
 			// for an account -- but the account behind it still goes unrepresented.
 			result.Skipped = append(result.Skipped, Omission{
-				Name: name, ID: accountID(row), Path: home,
+				Name: name, ID: accountID(row), Path: home, Code: OmittedHomeRedirected,
 				Reason: "home directory is a symlink or reparse point, which is not followed"})
 			continue
 		}
@@ -308,7 +353,7 @@ func homesFromUsers(rows []map[string]string) UserHomes {
 			// can be read from it, and silently dropping the account reported it as having
 			// none rather than as never having been looked at.
 			result.Skipped = append(result.Skipped, Omission{
-				Name: name, ID: accountID(row), Path: home,
+				Name: name, ID: accountID(row), Path: home, Code: OmittedHomeNotDirectory,
 				Reason:       "the home directory this account declares is not a directory",
 				HomeUnusable: true})
 			continue
@@ -319,7 +364,8 @@ func homesFromUsers(rows []map[string]string) UserHomes {
 }
 
 // redirectsElsewhere reports whether a directory entry is a link to somewhere else rather
-// than a directory in its own right. Used for a declared home and for every walk root.
+// than a directory in its own right. Used for a declared home, and on Windows for the base
+// every read is anchored to.
 //
 // ModeIrregular alongside ModeSymlink, because on Windows a junction is the shape that
 // matters and Go does not report it as a symlink. Testing ModeSymlink alone admitted one:
@@ -333,16 +379,4 @@ func homesFromUsers(rows []map[string]string) UserHomes {
 // than resolving.
 func redirectsElsewhere(mode os.FileMode) bool {
 	return mode&(os.ModeSymlink|os.ModeIrregular) != 0
-}
-
-// DevSubdirRoots returns the absolute paths under home that typically contain dev projects.
-// Each ecosystem's discovery uses this as a starting set of walk roots; ecosystem-specific
-// roots (e.g. MCP's .claude/.codex dotdirs) can be appended.
-func DevSubdirRoots(home string) []string {
-	subs := DefaultDevSubdirs()
-	out := make([]string, 0, len(subs))
-	for _, s := range subs {
-		out = append(out, filepath.Join(home, s))
-	}
-	return out
 }

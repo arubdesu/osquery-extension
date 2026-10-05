@@ -3,10 +3,9 @@
 package fsscan
 
 // PARTIALLY VERIFIED. Exercised on a real Windows host: ordinary bounded reads of
-// configuration under a user profile, root enumeration and dedup during the walk, and the
-// case this file exists for -- a junction planted at a probed configuration path was
-// refused rather than followed, producing no row and no warning, which is the designed
-// silent-absence result.
+// configuration under a user profile, and the case this file exists for -- a junction
+// planted at a probed configuration path was refused rather than followed, producing no row
+// and no warning, which is the designed silent-absence result.
 //
 // KNOWN GAP: not continuously exercised. There is no Windows CI job, so `go vet` and
 // cross-compilation are the only automated checks that ever see this file, and the
@@ -40,10 +39,9 @@ import (
 //
 // os.Root on its own would still differ from the POSIX path: it *follows* a symlink whose
 // target stays inside the root, where O_NOFOLLOW refuses every symlink regardless. The
-// per-component Lstat closes that difference for openBeneathComponents, which checks every
-// component and not just the last, so a walked path gets the same answer on all three
-// platforms. openNoFollow checks only its final component, which is the same limit the POSIX
-// version documents, and both are for trusted-parent callers only.
+// per-component Lstat closes that difference, because openBeneathComponents checks every
+// component and not just the last, so the same probed path gets the same answer on all
+// three platforms.
 //
 // Creating a symlink on Windows normally requires SeCreateSymbolicLinkPrivilege, which an
 // unprivileged user does not hold unless Developer Mode is enabled. Directory junctions need
@@ -55,89 +53,6 @@ import (
 // of ELOOP from an O_NOFOLLOW open.
 var reparsePointRefused = errors.New("fsscan: path component is a reparse point")
 
-// rootKeyOf identifies a directory by volume serial number and file index, the Windows
-// equivalent of device and inode, so two paths naming the same directory dedup to one walk
-// root.
-//
-// Unlike POSIX this needs the path, not just the FileInfo: os.FileInfo.Sys() on Windows is a
-// *syscall.Win32FileAttributeData, which carries timestamps and attributes but no identity
-// fields. The identity lives in BY_HANDLE_FILE_INFORMATION and requires an open handle.
-//
-// Getting this right matters more here than it would on POSIX. Windows filesystems are
-// case-insensitive by default, so the walk roots `code` and `Code` are two distinct strings
-// naming one directory. ScanContext's own dedup is by exact path and cannot collapse them, so
-// without this every file beneath such a pair would be discovered, read and emitted twice.
-func rootKeyOf(path string, _ os.FileInfo) (rootKey, bool) {
-	namePtr, err := windows.UTF16PtrFromString(path)
-	if err != nil {
-		return rootKey{}, false
-	}
-	// FILE_FLAG_BACKUP_SEMANTICS is required to obtain a handle to a directory at all.
-	// FILE_FLAG_OPEN_REPARSE_POINT means a root that is itself a reparse point is identified
-	// as the link rather than as its target; resolveRoot has already refused those, so this
-	// only keeps the handle from wandering.
-	handle, err := windows.CreateFile(
-		namePtr,
-		0, // querying metadata needs no access rights
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-		nil,
-		windows.OPEN_EXISTING,
-		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT,
-		0,
-	)
-	if err != nil {
-		return rootKey{}, false
-	}
-	defer func() { _ = windows.CloseHandle(handle) }()
-
-	var info windows.ByHandleFileInformation
-	if err := windows.GetFileInformationByHandle(handle, &info); err != nil {
-		return rootKey{}, false
-	}
-	return rootKey{
-		dev: uint64(info.VolumeSerialNumber),
-		ino: uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow),
-	}, true
-}
-
-// openNoFollow opens path for reading, refusing a reparse point in the final component.
-//
-// Only safe when the entire parent chain is trusted, exactly as on POSIX: this checks the
-// last component and nothing above it. Anything a walk produced goes through
-// openBeneathComponents instead.
-//
-// There is no O_NONBLOCK here and none is needed. The POSIX path carries it so that opening a
-// FIFO cannot hang the root daemon; Windows named pipes live in their own namespace
-// (\\.\pipe\...) and cannot be planted in a directory as a filesystem entry, so an open of a
-// path under a user home cannot block on one. Callers still check for a regular file, which
-// is what rejects the remaining non-regular cases.
-func openNoFollow(path string) (*os.File, error) {
-	before, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	if before.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
-		return nil, fmt.Errorf("%w: %s", reparsePointRefused, path)
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	// The window between the Lstat above and the open is where a hostile user swaps the path
-	// for something else. POSIX closes it with O_NOFOLLOW in the open itself; here it is
-	// closed after the fact, by confirming the thing now held open is the thing that was
-	// checked. os.SameFile compares volume serial and file index on Windows.
-	after, err := file.Stat()
-	if err != nil || !os.SameFile(before, after) {
-		_ = file.Close()
-		if err != nil {
-			return nil, err
-		}
-		return nil, fmt.Errorf("%w: %s changed between check and open", reparsePointRefused, path)
-	}
-	return file, nil
-}
-
 // openBeneathComponents opens relPath under baseDir without letting any component escape
 // baseDir.
 //
@@ -145,13 +60,12 @@ func openNoFollow(path string) (*os.File, error) {
 // every lookup is a single component resolved against its immediate parent's handle. That is
 // the same shape as the POSIX iterated openat(O_NOFOLLOW) loop, and it matters for the same
 // reason -- the parent a component is resolved against is one this function already opened
-// and is holding, not a path re-walked from the top on each step, so the prefix cannot be
+// and is holding, not a path re-resolved from the top on each step, so the prefix cannot be
 // swapped underneath the traversal after it has been checked.
 //
 // os.Root refuses any component resolving outside its root. The per-component Lstat adds
 // what os.Root does not do: refusing a reparse point that stays inside the root, so the
-// Windows result matches the POSIX one for every case a walk can produce rather than only
-// for escapes.
+// Windows result matches the POSIX one for every probed path rather than only for escapes.
 //
 // One window remains, on the final component only: it is Lstat-ed and then opened, and those
 // are two operations. The post-open identity check closes it -- if the name was swapped in
@@ -289,4 +203,73 @@ func isRefusedOrNotDirectory(err error) bool {
 		}
 	}
 	return false
+}
+
+// checkDescriptor applies ReadOpts' link-count refusal to an already-open file.
+//
+// The link count comes from GetFileInformationByHandle, which answers about the handle
+// rather than about a path, so a replacement between the open and the check cannot change
+// the answer. That is the same property the unix implementation relies on for its fstat.
+//
+// The owner check is deliberately not implemented here, and OwnerUID is refused rather than
+// silently treated as satisfied. Comparing an NTFS owner means GetSecurityInfo, a SID
+// conversion and a comparison against the roster's SID string, none of which has a CI job
+// that would ever execute it; shipping it unexercised in the function whose whole purpose is
+// a security guarantee is worse than declining the guarantee out loud. Refusing is what stops
+// a caller believing a check ran that did not -- a successful read would otherwise look like
+// an owner-verified one. Hard links are the vector that matters here and
+// GetFileInformationByHandle does answer them, so the useful half is covered. Implementing
+// the rest wants a Windows CI job first.
+func checkDescriptor(f *os.File, _ os.FileInfo, opts ReadOpts) error {
+	if opts.OwnerUID != "" {
+		// Refused rather than passed. A caller that asked for an owner check and got a
+		// successful read would believe the file was owner-verified, which is precisely the
+		// half-applied guarantee this must not create.
+		return fmt.Errorf("%w: owner verification is not implemented on this platform",
+			ErrForeignOwner)
+	}
+	if !opts.RefuseHardLinks {
+		return nil
+	}
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &info); err != nil {
+		return fmt.Errorf("%w: link count is unavailable for this file: %w", ErrNotRegular, err)
+	}
+	if info.NumberOfLinks > 1 {
+		return fmt.Errorf("%w: %d links", ErrHardLink, info.NumberOfLinks)
+	}
+	return nil
+}
+
+// cloudPlaceholderFlags are the attributes that mark a file whose content is not local.
+//
+// RECALL_ON_OPEN and RECALL_ON_DATA_ACCESS are what OneDrive's Files On-Demand sets, the
+// first for a fully dehydrated file and the second for a partially hydrated one. OFFLINE is
+// the older HSM attribute and is included because a provider that sets only it would
+// otherwise be read, and reading is the operation with the cost.
+const cloudPlaceholderFlags = windows.FILE_ATTRIBUTE_RECALL_ON_OPEN |
+	windows.FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | windows.FILE_ATTRIBUTE_OFFLINE
+
+// IsCloudPlaceholder reports whether the open file's content would have to be downloaded to
+// read it.
+//
+// GetFileInformationByHandle rather than GetFileAttributesEx on a path. Both return the same
+// FileAttributes word, but the path form resolves every component on the way, including any
+// reparse point the scanned user planted -- so the question could be answered about a file,
+// or a UNC share, outside the profile the descriptor came from, and the lookup itself would
+// be the thing that went there. A handle cannot be redirected after it is held. The link
+// count in checkDescriptor is read from the same call for the same reason.
+//
+// KNOWN GAP: inspecting a handle means the file is already open, and
+// FILE_ATTRIBUTE_RECALL_ON_OPEN is by definition the attribute whose provider starts
+// fetching at CreateFile. os.Root exposes no way to pass FILE_FLAG_OPEN_NO_RECALL, so that
+// one attribute is now detected after the cost it exists to avoid has been incurred;
+// RECALL_ON_DATA_ACCESS and OFFLINE are still caught before any byte is read. See the
+// ordering note in ReadProjectFile.
+func IsCloudPlaceholder(file *os.File) (bool, error) {
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(windows.Handle(file.Fd()), &info); err != nil {
+		return false, err
+	}
+	return info.FileAttributes&cloudPlaceholderFlags != 0, nil
 }

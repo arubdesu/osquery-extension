@@ -1,18 +1,22 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
-# srcs stays a flat list: rules_go applies the Go build constraints on platform_unix.go and
-# platform_unsupported.go itself when compiling. deps is the part that has to be conditional, so
-# that a Windows build does not require golang.org/x/sys. Both forms are gazelle's own output.
+# srcs stays a flat list: rules_go applies the Go build constraints on the per-platform files
+# itself when compiling. deps is the part that has to be conditional, so that a Windows build
+# does not require golang.org/x/sys. Both forms are gazelle's own output.
 go_library(
     name = "fsscan",
     srcs = [
         "appdata_other.go",
         "appdata_windows.go",
+        "cloudfile_darwin.go",
+        "cloudfile_other.go",
+        "doc.go",
         "openbeneath.go",
         "platform_unix.go",
         "platform_unsupported.go",
         "platform_windows.go",
-        "scan.go",
+        "project.go",
+        "timeout.go",
         "users.go",
     ],
     importpath = "github.com/macadmins/osquery-extension/pkg/fsscan",
@@ -66,11 +70,11 @@ go_test(
     srcs = [
         "appdata_other_test.go",
         "components_test.go",
-        "dedup_test.go",
+        "descriptorguard_unix_test.go",
+        "errclass_test.go",
         "openbeneath_test.go",
-        "readcandidate_test.go",
-        "scan_test.go",
-        "scan_unix_test.go",
+        "project_symlink_unix_test.go",
+        "project_test.go",
         "timeout_test.go",
         "users_test.go",
     ],

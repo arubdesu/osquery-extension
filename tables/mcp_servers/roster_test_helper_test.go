@@ -73,11 +73,11 @@ func itoa(n int) string {
 //
 // Two of them, one per platform, and neither is a defect:
 //
-// On Linux, a roster-level note. osquery's users table omits directory-served accounts unless
-// an expensive option is set, and the table says so. Because a constrained query repeats that
-// note under each requested username, it inflates filtered counts as well as unfiltered ones.
-// Identified structurally rather than by matching the message: a roster-level row is the one
-// whose source path is the users root, because there is no single home it belongs to.
+// One of them now, where there were two. The Linux roster-level note is gone: it fired on
+// every single run, which made the warning column non-empty on every Linux host whether or
+// not anything was wrong, so it is documentation rather than a row. The structural filter for
+// a roster-level row -- source path equal to the users root -- is kept, because the genuine
+// roster failures still use that shape.
 //
 // On Windows, one roaming-application-data note per account. Resolving that location reads
 // the account's registry hive, and a fixture home is a temp directory with no hive and no
@@ -91,10 +91,10 @@ func itoa(n int) string {
 func withoutStandingNotes(rows []Server) []Server {
 	out := make([]Server, 0, len(rows))
 	for _, row := range rows {
-		if row.Warning != "" && row.SourcePath == fsscan.UsersRoot {
+		if row.Warning.empty() == false && row.SourcePath == fsscan.UsersRoot {
 			continue
 		}
-		if row.Warning == roamingUndeterminedNote {
+		if row.Warning.Code == warnAppDataUndetermined {
 			continue
 		}
 		out = append(out, row)

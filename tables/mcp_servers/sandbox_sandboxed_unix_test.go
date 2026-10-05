@@ -96,18 +96,18 @@ func TestSnapConfigIsDiscoveredEndToEnd(t *testing.T) {
 	// either one directly cannot see it. The source list is host-OS-specific, so the snap
 	// entry is substituted for the duration rather than relying on macOS to produce one.
 	rel := filepath.Join("snap", "code", "current", ".config", "Code", "User", "mcp.json")
-	original := knownDirectSources
-	knownDirectSources = []directSource{
+	original := homeProbes
+	homeProbes = []probe{
 		{relPath: rel, client: "vscode", jsonc: true, extract: extractEnvelopeSimple},
 	}
-	t.Cleanup(func() { knownDirectSources = original })
+	t.Cleanup(func() { homeProbes = original })
 
 	rows := discoverForHome(context.Background(), fsscan.UserHome{Name: "alice", Path: home},
 		time.Now().Add(time.Minute))
 	var found bool
 	for _, row := range rows {
-		if row.Warning != "" {
-			t.Errorf("unexpected warning: %s", row.Warning)
+		if row.Warning.empty() == false {
+			t.Errorf("unexpected warning: %s", row.Warning.render())
 		}
 		if row.ServerName == "snap-server" {
 			found = true
@@ -122,34 +122,65 @@ func TestSnapConfigIsDiscoveredEndToEnd(t *testing.T) {
 	}
 }
 
-// TestFlatpakPathIsRecognisedAsApplicationSupport pins the second half of the gap.
+// The flatpak half of the same gap, asserted against the probe list that now carries it.
 //
 // A flatpak keeps configuration at ~/.var/app/<id>/config/..., which is not the platform's
-// application-support root, so matching only that root meant a flatpak-scoped mcp.json was
-// walked, reached classification, matched nothing and was dropped without a diagnostic.
+// application-support root. The old design walked to the file and then worked backwards from
+// its path to a client, so matching only the conventional root meant a flatpak-scoped
+// mcp.json was found, matched no classification case, and was dropped with no diagnostic.
+// That recogniser -- isAppSupportPathFor -- is gone along with the classifier it served.
 //
-// Asserted through the OS-parameterised form: the runtime.GOOS branch is unreachable from a
-// macOS test host, which is precisely how the gap survived being "tested" the first time.
-func TestFlatpakPathIsRecognisedAsApplicationSupport(t *testing.T) {
-	const flatpak = "/home/alice/.var/app/com.visualstudio.code/config/Code/User/profiles/abc/mcp.json"
-	const native = "/home/alice/.config/Code/User/mcp.json"
-	const macNative = "/Users/alice/Library/Application Support/Code/User/mcp.json"
-
+// What replaces it is better and is what this now asserts: appSupportForkFor generates the
+// sandbox location as an explicit path to probe, so the file is looked for where it lives
+// rather than recognised after being stumbled upon. A path that is never generated is never
+// read, which removes the failure mode entirely instead of fixing one instance of it.
+//
+// Asserted through the OS-parameterised form, because the Linux branch is unreachable from a
+// macOS test host -- which is precisely how the gap survived being "tested" the first time.
+func TestSandboxConfigLocationsAreGeneratedAsProbePaths(t *testing.T) {
 	for _, tc := range []struct {
-		goos, path string
-		want       bool
+		goos, fork string
+		wantAny    []string
 	}{
-		{"linux", flatpak, true},
-		{"linux", native, true},
-		{"darwin", macNative, true},
-		// A flatpak layout is a Linux concept; it must not start matching elsewhere.
-		{"darwin", flatpak, false},
-		{"windows", flatpak, false},
-		// ~/.var/app without a config segment is not a configuration path.
-		{"linux", "/home/alice/.var/app/com.example.app/data/thing.json", false},
+		// Linux generates the native root plus both sandbox roots for the forks that have
+		// an official sandboxed channel.
+		{"linux", "Code", []string{
+			".config/Code/User/mcp.json",
+			"snap/code/current/.config/Code/User/mcp.json",
+			".var/app/com.visualstudio.code/config/Code/User/mcp.json",
+		}},
+		{"linux", "VSCodium", []string{
+			".config/VSCodium/User/mcp.json",
+			"snap/codium/current/.config/VSCodium/User/mcp.json",
+			".var/app/com.vscodium.codium/config/VSCodium/User/mcp.json",
+		}},
+		// Cursor ships as AppImage and .deb, which write to ~/.config like a native
+		// install, so it has no sandbox roots and must not grow probes that cannot match.
+		{"linux", "Cursor", []string{".config/Cursor/User/mcp.json"}},
+		// Elsewhere there is exactly one root and no sandbox concept.
+		{"darwin", "Code", []string{"Library/Application Support/Code/User/mcp.json"}},
+		{"windows", "Code", []string{"AppData/Roaming/Code/User/mcp.json"}},
 	} {
-		if got := isAppSupportPathFor(tc.goos, tc.path); got != tc.want {
-			t.Errorf("isAppSupportPathFor(%q, %q) = %v, want %v", tc.goos, tc.path, got, tc.want)
+		got := appSupportForkFor(tc.goos, tc.fork, "User", "mcp.json")
+		var slashed []string
+		for _, path := range got {
+			slashed = append(slashed, filepath.ToSlash(path))
+		}
+		if len(slashed) != len(tc.wantAny) {
+			t.Errorf("%s/%s generated %v, want %v", tc.goos, tc.fork, slashed, tc.wantAny)
+			continue
+		}
+		for _, want := range tc.wantAny {
+			var found bool
+			for _, have := range slashed {
+				if have == want {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("%s/%s is missing the probe path %q; got %v",
+					tc.goos, tc.fork, want, slashed)
+			}
 		}
 	}
 }

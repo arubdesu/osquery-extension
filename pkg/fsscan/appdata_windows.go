@@ -5,22 +5,31 @@ package fsscan
 // PARTIALLY VERIFIED. Exercised on a real Windows host: resolution for the logged-on
 // account through the already-mounted HKU\<SID> hive, redirection detected and reported
 // when Roaming points outside the profile, and the account-scoped warning raised when the
-// location cannot be determined.
+// location cannot be determined. There is no Windows CI job, so nothing here is
+// continuously exercised; `go vet` and cross-compilation are the only automated checks
+// that see this file.
 //
-// KNOWN GAP: the logged-off path has never run. RegLoadAppKey is only reached for an
-// account that has a real profile directory and is not currently logged on, and a
-// single-user machine has no such account -- so the load, the read through the returned
-// private handle, and the NTUSER.DAT pre-check that stops the API creating an empty hive
-// are all unproven. There is no Windows CI job, so nothing here is continuously exercised
-// either; `go vet` and cross-compilation are the only automated checks that see this file.
+// Only a mounted hive is read. A logged-off account's NTUSER.DAT is not loaded, and that is
+// a decision rather than a gap: an inventory query should not mount a registry hive.
+//
+// The previous version did, through RegLoadAppKey. That API is the right one for the job on
+// paper -- private handle, no privilege, nothing published under HKEY_USERS -- but the job
+// itself is wrong for a table that runs on a schedule. It opens a file another account owns,
+// in a format whose parser is the kernel's, and it creates that file when it is absent, so
+// the pre-check that stopped a read from writing was load-bearing. Against that, the thing
+// it bought is one column for accounts that are not logged on, on the platform with no CI,
+// via a path a single-user machine can never execute -- so it shipped unexercised and
+// stayed that way.
+//
+// An account whose hive is not mounted now falls to the caller's existing "location could
+// not be determined" diagnostic, which already says the right thing: this account's
+// application-support configuration was not inspected. A missing row that announces itself
+// is a better trade than a hive mount that works in theory.
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
-	"unsafe"
 
-	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
 
@@ -33,17 +42,9 @@ import (
 // accounts as having no MCP servers at all.
 //
 // The redirected location is recorded per user in their own registry hive, under
-// Shell Folders. Reading another account's hive means loading it, because it is only mounted
-// under HKEY_USERS while that user is logged on:
-//
-//   - a logged-on account's hive is already at HKU\<SID>, so it is read directly;
-//   - a logged-off account's hive is the file NTUSER.DAT inside its profile, which this
-//     loads read-only under a temporary key and unloads immediately.
-//
-// Reading a logged-off account's hive goes through RegLoadAppKey, which needs no special
-// privilege and mounts nothing host-wide -- see the comment on that call. It still requires
-// read access to the profile directory, so an unelevated run reports "could not determine"
-// for other accounts rather than assuming the default.
+// Shell Folders. A hive is mounted under HKEY_USERS only while that user is logged on, so
+// this resolves the location for logged-on accounts and reports it as undetermined for the
+// rest. See the header for why the alternative was removed rather than kept.
 //
 // The distinction that matters for correctness: failing to read the value is not the same as
 // the value being absent. An unreadable hive means the Roaming location is unknown, and
@@ -56,7 +57,6 @@ import (
 const (
 	shellFoldersKey    = `Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders`
 	shellFoldersValue  = "AppData"
-	ntUserDatFilename  = "NTUSER.DAT"
 	defaultRoamingPath = `AppData\Roaming`
 )
 
@@ -66,14 +66,14 @@ const (
 // from it being the default: the caller turns that into a diagnostic rather than silently
 // scanning the conventional path and calling the result complete.
 func roamingAppData(sid, profileDir string) (path string, ok bool) {
-	// Without a SID there is no hive to name. Both lookups below would fail anyway, but the
-	// second would first attempt RegLoadKey against a mount point built from an empty
-	// string, which is a hive mount performed for no reason -- and mounting hives is the
-	// one operation here with a consequence worse than a missing row.
+	// Without a SID there is no hive to name, and HKU\<empty> is not a key that can be
+	// opened. Checked rather than left to fail, because the empty string is what an account
+	// with no identity in the roster supplies, and that is a routine case rather than an
+	// error.
 	if sid == "" {
 		return "", false
 	}
-	if raw, found := shellFolderValue(sid, profileDir); found {
+	if raw, found := shellFolderValue(sid); found {
 		expanded := expandProfileVars(raw, profileDir)
 		if expanded == "" {
 			return "", false
@@ -83,64 +83,13 @@ func roamingAppData(sid, profileDir string) (path string, ok bool) {
 	return "", false
 }
 
-// shellFolderValue reads the AppData entry from a profile's Shell Folders.
+// shellFolderValue reads the AppData entry from an account's mounted Shell Folders.
 //
-// Two routes, neither of which publishes anything host-wide. A logged-on account's hive is
-// already mounted at HKU\<SID> and is read directly. A logged-off account's hive is opened
-// with RegLoadAppKey, which returns a private handle and mounts nothing under HKEY_USERS.
-func shellFolderValue(sid, profileDir string) (string, bool) {
-	if value, ok := readShellFolder(registry.USERS, sid+`\`+shellFoldersKey); ok {
-		return value, true
-	}
-	hive := filepath.Join(profileDir, ntUserDatFilename)
-	// Checked before the call, because RegLoadAppKey *creates* the file when it is absent.
-	// An inventory query that writes a new registry hive into a user's profile would be a
-	// far worse bug than the missing row it was trying to avoid.
-	info, err := os.Lstat(hive)
-	if err != nil || !info.Mode().IsRegular() {
-		return "", false
-	}
-	key, err := loadAppKey(hive)
-	if err != nil {
-		return "", false
-	}
-	defer func() { _ = key.Close() }()
-	return readShellFolder(key, shellFoldersKey)
-}
-
-// RegLoadAppKey is used in place of RegLoadKey, which was the wrong tool for a read-only
-// query in four separate ways:
-//
-//   - it publishes the hive at HKEY_USERS\<name>, visible to the whole machine, so two
-//     concurrent queries for one SID collide on the mount name;
-//   - a crash between load and unload leaves it mounted, which holds the profile open and
-//     blocks that account from logging in;
-//   - it requires SeRestorePrivilege and SeBackupPrivilege, and enabling those on the
-//     process token left them enabled for the extension's remaining lifetime;
-//   - it creates the hive file if it is missing, so a read could write.
-//
-// RegLoadAppKey has none of those properties: the handle is private to this process, needs
-// no privileges, and the hive is released when the handle closes. It is the API Microsoft
-// documents for reading a hive file, as opposed to attaching one to the running system.
-var (
-	advapi32          = windows.NewLazySystemDLL("advapi32.dll")
-	procRegLoadAppKey = advapi32.NewProc("RegLoadAppKeyW")
-)
-
-// loadAppKey opens a hive file for reading and returns a private key handle.
-func loadAppKey(hiveFile string) (registry.Key, error) {
-	var handle windows.Handle
-	rc, _, _ := procRegLoadAppKey.Call(
-		uintptr(unsafe.Pointer(windows.StringToUTF16Ptr(hiveFile))),
-		uintptr(unsafe.Pointer(&handle)),
-		uintptr(registry.QUERY_VALUE|registry.ENUMERATE_SUB_KEYS),
-		0, // dwOptions: no REG_PROCESS_APPKEY, so the file is not locked exclusively
-		0, // Reserved
-	)
-	if rc != 0 {
-		return 0, windows.Errno(rc)
-	}
-	return registry.Key(handle), nil
+// One route, and it publishes nothing: HKU\<SID> is already mounted for a logged-on account,
+// so this is an ordinary read of a key that exists independently of this process. An
+// account whose hive is not mounted reports false, which the caller turns into a diagnostic.
+func shellFolderValue(sid string) (string, bool) {
+	return readShellFolder(registry.USERS, sid+`\`+shellFoldersKey)
 }
 
 // readShellFolder reads the AppData value from an already-mounted hive path.

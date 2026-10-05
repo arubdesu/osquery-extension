@@ -9,11 +9,12 @@ import (
 // Codex stores its MCP configuration in ~/.codex/config.toml under [mcp_servers.<name>]
 // sections rather than in JSON, which is what this file reads.
 //
-// The dependency is carried rather than hand-rolled because upcoming Python dependency tables
-// need TOML anyway for pyproject.toml and uv.lock, and because a real parser is correct on the
-// whole grammar rather than on the subset someone anticipated. A no-dependency comparison
-// implementation lives in toml_test.go and is diffed against this one over a corpus, so the
-// option of dropping the dependency stays open and is decided on evidence.
+// The dependency is carried rather than hand-rolled because a real parser is correct on the
+// whole grammar rather than on the subset someone anticipated, and Codex's config exercises
+// more of it than a reader would guess -- inline tables, heterogeneous arrays, quoted keys. A
+// no-dependency comparison implementation lives in toml_test.go and is diffed against this one
+// over a corpus, so the option of dropping the dependency stays open and is decided on
+// evidence.
 
 // tomlServerEntry is the TOML projection of a server entry. Separate from rawServerEntry so
 // the two formats' key names stay independent: TOML uses snake_case where the JSON configs use
@@ -104,6 +105,8 @@ func materializeTOML(in map[string]tomlServerEntry) []Server {
 			// The TOML section these came from, so source_context describes a real location
 			// here the same way mcpServers and servers do for the JSON shapes.
 			SourceContext: "mcp_servers",
+			rawName:       name,
+			rawContext:    "mcp_servers",
 			ServerName:    redactSecret(name),
 			Command:       redactSecret(entry.Command),
 			Args:          redactArgs(entry.Args),
@@ -117,7 +120,22 @@ func materializeTOML(in map[string]tomlServerEntry) []Server {
 		case entry.Disabled != nil:
 			server.Disabled = *entry.Disabled
 		}
-		server.EnvKeys = tomlEnvKeys(entry)
+		keys, droppedKeys, literalHeaders := tomlEnvKeys(entry)
+		server.EnvKeys = keys
+		// A row carries one warning, so when an entry does both things the more serious one
+		// is reported: a header written as a literal value means the configuration file on
+		// disk holds the credential, while a dropped name means this column could not
+		// publish an identifier. The counts were wrong in both directions before -- the
+		// dropped names were not reported at all, and a literal header was reported as
+		// Count: 1 however many of them the entry had -- which left the TOML path quieter
+		// than the JSON one on identical configurations, since materialize() has always
+		// reported a real dropped count.
+		switch {
+		case literalHeaders > 0:
+			server.Warning = warning{Code: warnEnvHeaderLiteral, Count: literalHeaders}
+		case droppedKeys > 0:
+			server.Warning = warning{Code: warnEnvKeyDropped, Count: droppedKeys}
+		}
 		out = append(out, server)
 	}
 	return out
@@ -155,18 +173,41 @@ func (v *tomlEnvVar) UnmarshalTOML(data any) error {
 // tomlEnvKeys collects every environment variable name an entry references, from all four
 // places Codex can name one. Values are never read: env holds them inline and is deliberately
 // consulted for its keys only, while the other three name variables by design.
-func tomlEnvKeys(entry tomlServerEntry) []string {
+//
+// droppedKeys counts the names envKeyAllowed refused, and literalHeaders the env_http_headers
+// values that were not variable names at all. Counting them is the whole point of gating here
+// rather than only at the row boundary: the add closure used to discard a rejected name
+// silently, so an invalid key in env, in env_vars or in bearer_token_env_var left no trace in
+// the row while the JSON path reported the identical configuration as a real drop count. A
+// name this table refuses to publish is still evidence of how the server is configured, and a
+// column that goes quiet is indistinguishable from a server that references nothing.
+//
+// A name that is absent rather than rejected is not counted, which is why the two reference
+// sources test for it first: UnmarshalTOML deliberately yields an empty name for an env_vars
+// element whose shape it does not recognise, and bearer_token_env_var is simply unset on most
+// entries. Neither is a key the file asked this table to publish. An empty key in the env
+// table itself is left to envKeyAllowed, which rejects it, so that source counts exactly what
+// materialize() counts for the JSON shapes.
+func tomlEnvKeys(entry tomlServerEntry) (keys []string, droppedKeys, literalHeaders int) {
 	total := len(entry.Env) + len(entry.EnvVars) + len(entry.EnvHTTPHeaders)
 	if entry.BearerTokenEnvVar != "" {
 		total++
 	}
 	if total == 0 {
-		return nil
+		return nil, 0, 0
 	}
 	seen := make(map[string]struct{}, total)
 	out := make([]string, 0, total)
+	// Gated here as well as at the row boundary. Two gates in series, and this is the one
+	// that can say *which* source the rejected name came from -- the boundary gate sees a
+	// flat list and can only report a count.
+	//
+	// Rejections are counted per occurrence rather than per distinct name, so two sources
+	// naming the same invalid variable count twice. That matches what the count means: how
+	// many of the names the entry supplied could not be published.
 	add := func(name string) {
-		if name == "" {
+		if !envKeyAllowed(name) {
+			droppedKeys++
 			return
 		}
 		if _, duplicate := seen[name]; duplicate {
@@ -179,15 +220,42 @@ func tomlEnvKeys(entry tomlServerEntry) []string {
 		add(key)
 	}
 	for _, reference := range entry.EnvVars {
+		if reference.Name == "" {
+			continue
+		}
 		add(reference.Name)
 	}
 	// env_http_headers maps a header name to the *name* of the variable holding its value,
 	// so the variable names are the values here rather than the keys.
+	//
+	// A value that is not a variable name means the user wrote the credential into the
+	// configuration file instead of naming where it lives -- `Authorization = "Bearer abc"`
+	// rather than `Authorization = "MY_TOKEN"`. That is reported with its own code rather
+	// than folded into a generic drop count, because the two call for different responses:
+	// a dropped malformed name is a note, and a credential sitting in a config file is the
+	// thing a security inventory exists to surface.
+	//
+	// Codex also supports a literal `http_headers` table. No reader is added for it
+	// deliberately: its values are credentials by design, so there is nothing this table
+	// could usefully publish from it.
 	for _, variable := range entry.EnvHTTPHeaders {
+		if variable == "" {
+			// A header mapped to nothing names no variable and holds no credential.
+			continue
+		}
+		if !envKeyAllowed(variable) {
+			// Counted separately from the dropped names, and per header rather than once
+			// per entry: an operator told that one header holds a literal value has to be
+			// told when three do, because each is a credential to move out of the file.
+			literalHeaders++
+			continue
+		}
 		add(variable)
 	}
-	add(entry.BearerTokenEnvVar)
-	return out
+	if entry.BearerTokenEnvVar != "" {
+		add(entry.BearerTokenEnvVar)
+	}
+	return out, droppedKeys, literalHeaders
 }
 
 // looksLikeTOMLServerEntry reports whether a decoded entry declares anything that identifies a

@@ -188,8 +188,13 @@ func TestInferIdentity_NPX(t *testing.T) {
 	if s.PackageName != "@playwright/mcp" {
 		t.Errorf("name: %q", s.PackageName)
 	}
-	if s.Version != "latest" {
-		t.Errorf("ver: %q", s.Version)
+	// `@latest` selects whatever the maintainer published most recently, so it pins no
+	// version and the column is empty. The selector is still reported in requested_spec.
+	if s.PinnedVersion != "" {
+		t.Errorf("ver: %q, want empty for a moving tag", s.PinnedVersion)
+	}
+	if s.RequestedSpec != "@playwright/mcp@latest" {
+		t.Errorf("requested_spec: %q, want the selector verbatim", s.RequestedSpec)
 	}
 	if s.Transport != "stdio" {
 		t.Errorf("transport: %q", s.Transport)
@@ -208,8 +213,8 @@ func TestInferIdentity_Docker(t *testing.T) {
 	if s.PackageName != "hashicorp/terraform-mcp-server" {
 		t.Errorf("name: %q", s.PackageName)
 	}
-	if s.Version != "0.4.0" {
-		t.Errorf("ver: %q", s.Version)
+	if s.PinnedVersion != "0.4.0" {
+		t.Errorf("ver: %q", s.PinnedVersion)
 	}
 }
 
@@ -219,8 +224,8 @@ func TestInferIdentity_DockerWithRegistryPort(t *testing.T) {
 	if s.PackageName != "localhost:5000/myrepo/server" {
 		t.Errorf("name: %q", s.PackageName)
 	}
-	if s.Version != "dev" {
-		t.Errorf("ver: %q", s.Version)
+	if s.PinnedVersion != "dev" {
+		t.Errorf("ver: %q", s.PinnedVersion)
 	}
 }
 
@@ -495,8 +500,18 @@ func TestSplitNPMSpec(t *testing.T) {
 	cases := []struct{ in, name, ver string }{
 		{"@scope/pkg@1.0.0", "@scope/pkg", "1.0.0"},
 		{"@scope/pkg", "@scope/pkg", ""},
-		{"pkg@1", "pkg", "1"},
+		// `pkg@1` is an npm X-range, equivalent to `1.x.x`: a missing component is a
+		// wildcard, so it selects whatever is published next within the major. This
+		// expected "1" and reported it as an exact pin at high confidence.
+		{"pkg@1", "pkg", ""},
+		{"pkg@1.2", "pkg", ""},
 		{"pkg", "pkg", ""},
+		// A complete version, including the prerelease and build forms semver allows.
+		{"pkg@1.2.3", "pkg", "1.2.3"},
+		{"pkg@1.2.3-beta.1", "pkg", "1.2.3-beta.1"},
+		{"pkg@v1.2.3", "pkg", "v1.2.3"},
+		{"@scope/pkg@1", "@scope/pkg", ""},
+		{"@scope/pkg@2.0.0", "@scope/pkg", "2.0.0"},
 		{"https://example.com/pkg.tgz", "", ""},
 	}
 	for _, c := range cases {
@@ -588,7 +603,7 @@ func TestSecretInArgsRedacted_EndToEnd(t *testing.T) {
 func TestExtractFlatKeepsServersAlongsideNonObjectSiblings(t *testing.T) {
 	rows, err := extractEnvelopeSimple([]byte(`{
 		"$schema": "https://modelcontextprotocol.io/schema.json",
-		"version": 3,
+		"pinned_version": 3,
 		"enabled": true,
 		"real-server": {"command": "npx", "args": ["-y", "real-mcp@1.0.0"]}
 	}`))
@@ -615,7 +630,7 @@ func TestExtractFlatKeepsHealthyEntriesAndReportsSkippedOnes(t *testing.T) {
 	var healthy, diagnostics int
 	for _, row := range rows {
 		switch {
-		case row.Warning != "":
+		case row.Warning.empty() == false:
 			diagnostics++
 		case row.ServerName == "good":
 			healthy++
@@ -638,8 +653,8 @@ func TestExtractFlatDoesNotCountMetadataSiblingsAsSkipped(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	for _, row := range rows {
-		if row.Warning != "" {
-			t.Errorf("a metadata sibling should not produce a diagnostic: %q", row.Warning)
+		if row.Warning.empty() == false {
+			t.Errorf("a metadata sibling should not produce a diagnostic: %q", row.Warning.render())
 		}
 	}
 }
@@ -679,16 +694,16 @@ func TestInferIdentityAlwaysSetsConfidence(t *testing.T) {
 // The inline form carries its value in the same token, so it is valid as the final argument.
 // Bounding the scan at len(args)-1 to protect the two-token lookahead skipped it there.
 func TestNpxIdentityFindsInlinePackageInFinalPosition(t *testing.T) {
-	spec, version := npxIdentity([]string{"-y", "--package=some-mcp@1.2.3"})
+	spec, version, _ := npxIdentity([]string{"-y", "--package=some-mcp@1.2.3"})
 	if spec != "some-mcp@1.2.3" || version != "1.2.3" {
 		t.Errorf("inline in final position: spec=%q version=%q", spec, version)
 	}
 	// The two-token form must still work, and must not read past the end when the flag is
 	// itself the last argument.
-	if spec, _ := npxIdentity([]string{"--package", "other-mcp@2.0.0"}); spec != "other-mcp@2.0.0" {
+	if spec, _, _ := npxIdentity([]string{"--package", "other-mcp@2.0.0"}); spec != "other-mcp@2.0.0" {
 		t.Errorf("two-token form regressed: %q", spec)
 	}
-	if spec, _ := npxIdentity([]string{"-y", "--package"}); spec != "" {
+	if spec, _, _ := npxIdentity([]string{"-y", "--package"}); spec != "" {
 		t.Errorf("dangling --package should yield nothing, got %q", spec)
 	}
 }
@@ -740,7 +755,7 @@ func TestEnvelopeKeepsHealthyEntriesAndReportsSkippedOnes(t *testing.T) {
 	var healthy, diagnostics int
 	for _, row := range rows {
 		switch {
-		case row.Warning != "":
+		case row.Warning.empty() == false:
 			diagnostics++
 		case row.ServerName == "good":
 			healthy++
@@ -1062,7 +1077,7 @@ func TestEnvelopeStates(t *testing.T) {
 			var names []string
 			warnings := 0
 			for _, row := range rows {
-				if row.Warning != "" {
+				if row.Warning.empty() == false {
 					warnings++
 					continue
 				}
@@ -1115,7 +1130,7 @@ func TestCredentialBearingFormsNeverReachIdentityColumns(t *testing.T) {
 			for column, value := range map[string]string{
 				"package_name":   server.PackageName,
 				"requested_spec": server.RequestedSpec,
-				"version":        server.Version,
+				"pinned_version": server.PinnedVersion,
 			} {
 				if strings.Contains(value, "password") || strings.Contains(value, "secret") ||
 					strings.Contains(value, "pw@") || strings.Contains(value, ":b@") {
@@ -1150,7 +1165,7 @@ func TestZeroValuedEntriesAreNotEmittedAsServers(t *testing.T) {
 	var names []string
 	diagnostics := 0
 	for _, row := range rows {
-		if row.Warning != "" {
+		if row.Warning.empty() == false {
 			diagnostics++
 			continue
 		}
@@ -1181,7 +1196,7 @@ func TestOneMalformedClaudeProjectKeepsTheRest(t *testing.T) {
 	found := map[string]bool{}
 	diagnostics := 0
 	for _, row := range rows {
-		if row.Warning != "" {
+		if row.Warning.empty() == false {
 			diagnostics++
 			continue
 		}
@@ -1269,7 +1284,7 @@ func TestClaudeCodeSectionsFailIndependently(t *testing.T) {
 			var gotServers []string
 			gotWarnings := 0
 			for _, row := range rows {
-				if row.Warning != "" {
+				if row.Warning.empty() == false {
 					gotWarnings++
 					continue
 				}
@@ -1357,7 +1372,7 @@ func TestEnvelopeCollisionUsesDeclaredNamesNotDecodedOnes(t *testing.T) {
 			}
 			var got []string
 			for _, row := range rows {
-				if row.Warning != "" {
+				if row.Warning.empty() == false {
 					continue
 				}
 				got = append(got, row.ServerName)
@@ -1414,12 +1429,12 @@ func TestByteOrderMarkedConfigsParse(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rows := finishProcessing(append(bom, []byte(tc.body)...), nil,
-				"/p/mcp.json", "alice", "cursor", tc.jsonc, tc.extract)
+			rows := finishProcessing("", append(bom, []byte(tc.body)...), nil,
+				"/p/mcp.json", "alice", "cursor", tc.jsonc, MaxFileSize, tc.extract)
 			var found bool
 			for _, row := range rows {
-				if row.Warning != "" {
-					t.Errorf("a byte-order mark produced a diagnostic: %s", row.Warning)
+				if row.Warning.empty() == false {
+					t.Errorf("a byte-order mark produced a diagnostic: %s", row.Warning.render())
 				}
 				if row.ServerName == tc.want {
 					found = true
@@ -1447,11 +1462,11 @@ func TestJSONCAcceptsTrailingCommas(t *testing.T) {
 		{"with a comment too", "// note\n{\"servers\":{\"a\":{\"command\":\"npx\"},}}"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rows := finishProcessing([]byte(tc.body), nil, "/p/mcp.json", "alice", "vscode",
-				true, extractEnvelopeSimple)
+			rows := finishProcessing("", []byte(tc.body), nil, "/p/mcp.json", "alice", "vscode",
+				true, MaxFileSize, extractEnvelopeSimple)
 			for _, row := range rows {
-				if row.Warning != "" {
-					t.Errorf("a trailing comma produced a diagnostic: %s", row.Warning)
+				if row.Warning.empty() == false {
+					t.Errorf("a trailing comma produced a diagnostic: %s", row.Warning.render())
 				}
 			}
 			if len(rows) != 1 || rows[0].ServerName != "a" {
@@ -1465,9 +1480,9 @@ func TestJSONCAcceptsTrailingCommas(t *testing.T) {
 // value is data, and removing it would corrupt the configuration this is meant to rescue.
 func TestTrailingCommaStripIsStringAware(t *testing.T) {
 	body := `{"servers":{"a":{"command":"npx","args":["a,}","b, ]"],}}}`
-	rows := finishProcessing([]byte(body), nil, "/p/mcp.json", "alice", "vscode",
-		true, extractEnvelopeSimple)
-	if len(rows) != 1 || rows[0].Warning != "" {
+	rows := finishProcessing("", []byte(body), nil, "/p/mcp.json", "alice", "vscode",
+		true, MaxFileSize, extractEnvelopeSimple)
+	if len(rows) != 1 || rows[0].Warning.empty() == false {
 		t.Fatalf("want one clean row, got %+v", rows)
 	}
 	// The exact values, not the count. An implementation that stripped commas inside
@@ -1500,7 +1515,7 @@ func TestRunnerValueFlagsSkipValuesWithoutSwallowingPackages(t *testing.T) {
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
-			if got := firstPositional(testCase.args); got != testCase.want {
+			if got, _ := firstPositional(testCase.args); got != testCase.want {
 				t.Errorf("firstPositional(%q) = %q, want %q", testCase.args, got, testCase.want)
 			}
 		})
@@ -1516,32 +1531,32 @@ func TestRunnerValueFlagsSkipValuesWithoutSwallowingPackages(t *testing.T) {
 // cannot extend into them.
 func TestLauncherOptionScansStopAtTheFirstPositional(t *testing.T) {
 	t.Run("launched program options are not read", func(t *testing.T) {
-		if spec, _ := npxIdentity([]string{"real-package", "--package", "evilpkg"}); spec != "real-package" {
+		if spec, _, _ := npxIdentity([]string{"real-package", "--package", "evilpkg"}); spec != "real-package" {
 			t.Errorf("npx spaced form = %q, want real-package", spec)
 		}
-		if spec, _ := npxIdentity([]string{"real-package", "--package=evilpkg"}); spec != "real-package" {
+		if spec, _, _ := npxIdentity([]string{"real-package", "--package=evilpkg"}); spec != "real-package" {
 			t.Errorf("npx inline form = %q, want real-package", spec)
 		}
 		if got := pythonModule([]string{"-u", "script.py", "-m", "evilmod"}); got != "" {
 			t.Errorf("python = %q, want empty: -m after the script is the script's argument", got)
 		}
-		if got := uvRunIdentity([]string{"run", "server", "--from", "evilpkg"}); got != "" {
+		if got, _ := uvRunIdentity([]string{"run", "server", "--from", "evilpkg"}); got != "" {
 			t.Errorf("uv = %q, want empty", got)
 		}
-		if got := pipxIdentity([]string{"run", "server", "--spec", "evilpkg"}); got != "server" {
+		if got, _ := pipxIdentity([]string{"run", "server", "--spec", "evilpkg"}); got != "server" {
 			t.Errorf("pipx = %q, want server", got)
 		}
 	})
 	// The other direction, which the bound must not break: an option before the first
 	// positional is the launcher's own and still decides identity.
 	t.Run("launcher options are still honoured", func(t *testing.T) {
-		if spec, _ := npxIdentity([]string{"--package", "realpkg", "cmd"}); spec != "realpkg" {
+		if spec, _, _ := npxIdentity([]string{"--package", "realpkg", "cmd"}); spec != "realpkg" {
 			t.Errorf("npx spaced = %q, want realpkg", spec)
 		}
-		if spec, _ := npxIdentity([]string{"--package=realpkg@1.2.3"}); spec != "realpkg@1.2.3" {
+		if spec, _, _ := npxIdentity([]string{"--package=realpkg@1.2.3"}); spec != "realpkg@1.2.3" {
 			t.Errorf("npx inline = %q, want realpkg@1.2.3", spec)
 		}
-		if spec, _ := npxIdentity([]string{"real-package"}); spec != "real-package" {
+		if spec, _, _ := npxIdentity([]string{"real-package"}); spec != "real-package" {
 			t.Errorf("npx bare positional = %q, want real-package", spec)
 		}
 		if got := pythonModule([]string{"-m", "realmod"}); got != "realmod" {
@@ -1552,12 +1567,12 @@ func TestLauncherOptionScansStopAtTheFirstPositional(t *testing.T) {
 			{"tool", "run", "realpkg"},
 			{"tool", "run", "--python", "3.12", "realpkg"},
 		} {
-			if got := uvRunIdentity(args); got != "realpkg" {
+			if got, _ := uvRunIdentity(args); got != "realpkg" {
 				t.Errorf("uv %q = %q, want realpkg", args, got)
 			}
 		}
 		for _, args := range [][]string{{"run", "--spec", "realpkg", "cmd"}, {"run", "realpkg"}} {
-			if got := pipxIdentity(args); got != "realpkg" {
+			if got, _ := pipxIdentity(args); got != "realpkg" {
 				t.Errorf("pipx %q = %q, want realpkg", args, got)
 			}
 		}
@@ -1573,7 +1588,7 @@ func TestLauncherOptionScansStopAtTheFirstPositional(t *testing.T) {
 func TestLauncherOptionWalkRespectsTerminatorsAndValues(t *testing.T) {
 	t.Run("a subcommand word is only a subcommand in its own position", func(t *testing.T) {
 		// After `run`, `tool` is the command uv was asked to launch.
-		if got := uvRunIdentity([]string{"run", "tool", "--from", "evilpkg"}); got != "" {
+		if got, _ := uvRunIdentity([]string{"run", "tool", "--from", "evilpkg"}); got != "" {
 			t.Errorf("uv = %q, want empty", got)
 		}
 	})
@@ -1597,13 +1612,13 @@ func TestLauncherOptionWalkRespectsTerminatorsAndValues(t *testing.T) {
 		if got := pythonModule([]string{"-u", "-m", "realmod"}); got != "realmod" {
 			t.Errorf("python = %q, want realmod", got)
 		}
-		if got := uvRunIdentity([]string{"tool", "run", "realpkg"}); got != "realpkg" {
+		if got, _ := uvRunIdentity([]string{"tool", "run", "realpkg"}); got != "realpkg" {
 			t.Errorf("uv tool run = %q, want realpkg", got)
 		}
-		if got := uvRunIdentity([]string{"run", "--from=realpkg", "cmd"}); got != "realpkg" {
+		if got, _ := uvRunIdentity([]string{"run", "--from=realpkg", "cmd"}); got != "realpkg" {
 			t.Errorf("uv inline --from = %q, want realpkg", got)
 		}
-		if spec, _ := npxIdentity([]string{"-y", "--package", "realpkg", "cmd"}); spec != "realpkg" {
+		if spec, _, _ := npxIdentity([]string{"-y", "--package", "realpkg", "cmd"}); spec != "realpkg" {
 			t.Errorf("npx after a boolean = %q, want realpkg", spec)
 		}
 	})
@@ -1684,7 +1699,7 @@ func TestUvSubcommandIsPositional(t *testing.T) {
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
-			if got := uvRunIdentity(testCase.args); got != testCase.want {
+			if got, _ := uvRunIdentity(testCase.args); got != testCase.want {
 				t.Errorf("uvRunIdentity(%q) = %q, want %q", testCase.args, got, testCase.want)
 			}
 		})
@@ -1784,8 +1799,322 @@ func TestFirstOperandDecidesIdentity(t *testing.T) {
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
-			if got := firstPositional(testCase.args); got != testCase.want {
+			if got, _ := firstPositional(testCase.args); got != testCase.want {
 				t.Errorf("firstPositional(%q) = %q, want %q", testCase.args, got, testCase.want)
+			}
+		})
+	}
+}
+
+// --pip-args takes a value, and listing it among the value-less options is how that value
+// reached the identity columns. pipx documents it as the arguments to hand on to pip, which is
+// where an authenticated index URL or a token is passed, so the operand scan read the
+// credential as the first package-shaped token and copied it into package_name and
+// requested_spec -- the one value the final redactor, which recognises known token shapes,
+// cannot catch on the way out.
+func TestPipxPipArgsConsumesItsValue(t *testing.T) {
+	const opaqueSecret = "s3cr3tIndexT0ken"
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"a separated value is consumed, not reported",
+			[]string{"run", "--pip-args", "verbose", "real-package"}, "real-package"},
+		{"an opaque value never becomes the package",
+			[]string{"run", "--pip-args", opaqueSecret, "real-package"}, "real-package"},
+		{"the inline form carries its own value",
+			[]string{"run", "--pip-args=--no-deps", "real-package"}, "real-package"},
+		// A separated value that begins with a dash is indistinguishable from an option to
+		// the operand scan, which keeps no state for "the previous token was consumed as a
+		// value", so the scan fails closed: an empty identity and warnUnknownLauncherOption
+		// rather than a guess. That is the same answer it gave before this fix, and the half
+		// that matters is that the pip argument is not what lands in the column.
+		{"a value beginning with a dash empties the identity instead",
+			[]string{"run", "--pip-args", "--no-deps", "real-package"}, ""},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			got, _ := pipxIdentity(testCase.args)
+			if got != testCase.want {
+				t.Errorf("pipxIdentity(%q) = %q, want %q", testCase.args, got, testCase.want)
+			}
+		})
+	}
+	// End to end as well, because the defect was in the published columns rather than in the
+	// scan: redactArgs leaves this value alone, --pip-args not being a credential-named
+	// option, so nothing downstream would have recognised it.
+	t.Run("the published columns never carry the value", func(t *testing.T) {
+		server := Server{
+			Command: "pipx",
+			Args:    []string{"run", "--pip-args", opaqueSecret, "real-package"},
+		}
+		inferIdentity(&server)
+		if server.PackageName != "real-package" || server.RequestedSpec != "real-package" {
+			t.Errorf("package_name=%q requested_spec=%q, want real-package for both",
+				server.PackageName, server.RequestedSpec)
+		}
+		if strings.Contains(server.PackageName+server.RequestedSpec, opaqueSecret) {
+			t.Error("the pip arguments reached the identity columns")
+		}
+	})
+}
+
+// An option is either value-less or value-taking, and the two tables disagreeing about one is
+// not something the compiler can object to. --pip-args was in launcherBooleanFlags while pipx
+// documents a value, and every scanner shares both tables, so one wrong entry was wrong for
+// all four launchers at once.
+func TestBooleanAndValueFlagTablesAreDisjoint(t *testing.T) {
+	for name := range launcherBooleanFlags {
+		if _, alsoValue := runnerValueFlags[name]; alsoValue {
+			t.Errorf("%q is listed as both value-less and value-taking", name)
+		}
+	}
+	if _, boolean := launcherBooleanFlags["--pip-args"]; boolean {
+		t.Error("--pip-args takes a value: pipx hands it to pip")
+	}
+	if _, value := runnerValueFlags["--pip-args"]; !value {
+		t.Error("--pip-args must be known to take a value, or its value is read as the package")
+	}
+}
+
+// Identity inference assigned its warning unconditionally, erasing whatever parsing or
+// materialization had already found -- an environment variable name that is not an identifier,
+// or a TOML header holding the credential itself. Those name something in the file to go and
+// change; warnUnknownLauncherOption says only that a command line could not be read. A row
+// carries one warning, so the more specific and earlier finding is the one that survives.
+func TestIdentityInferenceKeepsAnEarlierWarning(t *testing.T) {
+	// One unrecognised option, spelled into each launcher's own grammar so that every
+	// scanner actually reaches the refusal: the npx closure assigns the warning itself and
+	// the rest route through assignIfClean, and a launcher whose arguments never reached an
+	// operand would pass this test without exercising anything. The paired control below is
+	// what proves each case does.
+	const unknown = "--option-this-table-does-not-know"
+	launchers := []struct {
+		command string
+		args    []string
+	}{
+		{"npx", []string{unknown, "value", "pkg"}},
+		{"uvx", []string{unknown, "value", "pkg"}},
+		{"bunx", []string{unknown, "value", "pkg"}},
+		{"pipx", []string{"run", unknown, "value", "pkg"}},
+		{"uv", []string{"tool", "run", unknown, "value", "pkg"}},
+	}
+	earlier := warning{Code: warnEnvHeaderLiteral, Count: 2}
+	for _, launcher := range launchers {
+		t.Run(launcher.command+" keeps the earlier finding", func(t *testing.T) {
+			server := Server{
+				Command: launcher.command,
+				Args:    launcher.args,
+				Warning: earlier,
+			}
+			inferIdentity(&server)
+			if server.Warning != earlier {
+				t.Errorf("warning = %+v, want the earlier finding %+v",
+					server.Warning, earlier)
+			}
+			// The identity stays empty: keeping the earlier warning is about what the row
+			// reports, not about trusting an argument list this table cannot read.
+			if server.PackageName != "" || server.RequestedSpec != "" {
+				t.Errorf("package_name=%q requested_spec=%q, want both empty",
+					server.PackageName, server.RequestedSpec)
+			}
+		})
+		// The control, and the proof that the case above refused for the reason claimed:
+		// with nothing to displace, the finding is still reported. A fix that simply
+		// stopped recording it would pass the half above and silence the fail-closed path
+		// this warning exists to explain.
+		t.Run(launcher.command+" still reports the unknown option", func(t *testing.T) {
+			server := Server{Command: launcher.command, Args: launcher.args}
+			inferIdentity(&server)
+			if server.Warning.Code != warnUnknownLauncherOption {
+				t.Errorf("warning = %+v, want %s", server.Warning,
+					warnUnknownLauncherOption)
+			}
+		})
+	}
+}
+
+// Only `==` pins a version; every other PEP 440 operator bounds a set.
+//
+// The column is `pinned_version` -- what the configuration pins -- and returning the number
+// beside a range operator asserted a version the config never chose, at high confidence,
+// since confidence is derived from having both a name and a version. `pkg!=1.5` was the
+// clearest case: an exclusion reported as the pin, so a vulnerability-feed correlation would
+// read the one version ruled out as the one in use.
+func TestSplitPyPISpecOnlyPinsExactVersions(t *testing.T) {
+	for _, tc := range []struct {
+		spec, name, ver string
+	}{
+		// Exact equality pins.
+		{"pkg==1.2.3", "pkg", "1.2.3"},
+		{"pkg==1.0", "pkg", "1.0"},
+		// Ranges and exclusions name the package and pin nothing.
+		{"pkg>=1.0", "pkg", ""},
+		{"pkg<=2.0", "pkg", ""},
+		{"pkg~=1.4", "pkg", ""},
+		{"pkg!=1.5", "pkg", ""},
+		{"pkg>1.0", "pkg", ""},
+		{"pkg<2.0", "pkg", ""},
+		// `@` pins when its operand is one version.
+		{"pkg@1.2.3", "pkg", "1.2.3"},
+		// And does not when the operand selects a set. This assertion previously expected
+		// "latest", because the finding that introduced this test scoped itself to the
+		// comparison operators and said to leave `@` alone; a later finding reversed that,
+		// on the same reasoning the comparison operators were changed for -- a dist-tag
+		// names whatever was published most recently, so it is not a pin.
+		{"pkg@latest", "pkg", ""},
+		{"pkg@next", "pkg", ""},
+		// Wildcard equality is PEP 440-legal and selects a range.
+		{"pkg==1.*", "pkg", ""},
+		// No operator at all.
+		{"pkg", "pkg", ""},
+	} {
+		t.Run(tc.spec, func(t *testing.T) {
+			name, ver := splitPyPISpec(tc.spec)
+			if name != tc.name || ver != tc.ver {
+				t.Errorf("splitPyPISpec(%q) = (%q, %q), want (%q, %q)",
+					tc.spec, name, ver, tc.name, tc.ver)
+			}
+		})
+	}
+}
+
+// And the consequence the change exists for: a range leaves confidence at medium rather than
+// claiming high on a version the configuration did not choose.
+func TestRangeSpecsReportMediumConfidence(t *testing.T) {
+	for _, tc := range []struct {
+		spec, wantVersion, wantConfidence string
+	}{
+		{"pkg==1.2.3", "1.2.3", "high"},
+		{"pkg>=1.0", "", "medium"},
+		{"pkg!=1.5", "", "medium"},
+		{"pkg~=1.4", "", "medium"},
+	} {
+		t.Run(tc.spec, func(t *testing.T) {
+			server := Server{Command: "uvx", Args: []string{tc.spec}, Transport: "stdio"}
+			inferIdentity(&server)
+			if server.PackageName != "pkg" {
+				t.Fatalf("package_name = %q, want pkg", server.PackageName)
+			}
+			if server.PinnedVersion != tc.wantVersion {
+				t.Errorf("pinned_version = %q, want %q",
+					server.PinnedVersion, tc.wantVersion)
+			}
+			if server.Confidence != tc.wantConfidence {
+				t.Errorf("confidence = %q, want %q", server.Confidence, tc.wantConfidence)
+			}
+			// The spec itself is still reported verbatim, so the range is not lost -- it
+			// moves from a column that claims a pin to one that describes the request.
+			if server.RequestedSpec != tc.spec {
+				t.Errorf("requested_spec = %q, want %q", server.RequestedSpec, tc.spec)
+			}
+		})
+	}
+}
+
+// A credential-named option consumes its value in launcherOptionValue too, so one appearing
+// before `--package` no longer hides it.
+//
+// The option was treated as value-less, so its value landed on the scan's default branch as a
+// bare positional -- which ends the walk, because a positional is where the launched program
+// begins. Any credential-named option before the wanted one therefore hid it completely, and
+// the operand fallback skipped the real package as a consumed value, so the row came back with
+// no identity at all. knownLauncherOption already documented the arity as known from the name;
+// this scanner was the one not honouring it.
+//
+// Not a leak in either direction: a value is not an option name, so it could never have been
+// returned as one. The cost was a missing identity.
+func TestSecretNamedOptionsConsumeTheirValueInOptionScan(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		wantSpec string
+		wantVer  string
+	}{
+		{"credential option before --package",
+			[]string{"--auth-token", "s3cret", "--package", "real-pkg"}, "real-pkg", ""},
+		{"and with a pinned version",
+			[]string{"--token", "s3cret", "--package", "real-pkg@1.2.3"},
+			"real-pkg@1.2.3", "1.2.3"},
+		{"after a boolean, and with the short package flag",
+			[]string{"-y", "--api-key", "s3cret", "-p", "real-pkg"}, "real-pkg", ""},
+		// Two of them, so the walk has to keep consuming rather than recover by luck.
+		{"two credential options",
+			[]string{"--token", "a", "--client-secret", "b", "--package", "real-pkg"},
+			"real-pkg", ""},
+		// The inline form carries its own value and consumes nothing, which must not
+		// regress into consuming the following token.
+		{"inline credential option",
+			[]string{"--token=s3cret", "--package", "real-pkg"}, "real-pkg", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			value, found := launcherOptionValue(tc.args, npxGrammar, npxPackageFlags)
+			if !found {
+				t.Fatalf("launcherOptionValue found nothing; --package was hidden")
+			}
+			if value != tc.wantSpec {
+				t.Errorf("value = %q, want %q", value, tc.wantSpec)
+			}
+			// And the whole way through to the row.
+			server := Server{Command: "npx", Args: tc.args, Transport: "stdio"}
+			inferIdentity(&server)
+			if server.RequestedSpec != tc.wantSpec {
+				t.Errorf("requested_spec = %q, want %q", server.RequestedSpec, tc.wantSpec)
+			}
+			if server.PinnedVersion != tc.wantVer {
+				t.Errorf("pinned_version = %q, want %q", server.PinnedVersion, tc.wantVer)
+			}
+			// The credential never reaches a column, which was true before and must stay so.
+			row := serverToRow(server)
+			for column, emitted := range row {
+				for _, secret := range []string{"s3cret"} {
+					if emitted != "" && emitted == secret {
+						t.Errorf("%s carries the credential: %q", column, emitted)
+					}
+				}
+			}
+		})
+	}
+}
+
+// npm partial versions are ranges, and Python's `==1.0` is not.
+//
+// pinsOneVersion was shared by both ecosystems, and npm's X-ranges make a missing component a
+// wildcard -- so `@1` and `@1.2` were reported as exact pins at high confidence, since neither
+// contains a wildcard character to notice. PEP 440 `==1.0` is exact against the release it
+// names, so holding Python to npm's three-component rule would discard a real pin. The two
+// recognisers are separate for that reason.
+func TestNPMPartialVersionsAreNotPinsButPythonExactIs(t *testing.T) {
+	for _, tc := range []struct {
+		name, command, spec, wantVer, wantConfidence string
+	}{
+		{"npx major only", "npx", "real-package@1", "", "medium"},
+		{"npx major.minor", "npx", "real-package@1.2", "", "medium"},
+		{"npx complete version", "npx", "real-package@1.2.3", "1.2.3", "high"},
+		{"npx prerelease", "npx", "real-package@1.2.3-rc.1", "1.2.3-rc.1", "high"},
+		{"npx dist-tag", "npx", "real-package@latest", "", "medium"},
+		// Python keeps its own semantics: `==1.0` names one release.
+		{"pypi exact two-component", "uvx", "real-package==1.0", "1.0", "high"},
+		{"pypi exact three-component", "uvx", "real-package==1.0.0", "1.0.0", "high"},
+		{"pypi wildcard equality", "uvx", "real-package==1.*", "", "medium"},
+		{"pypi range", "uvx", "real-package>=1.0", "", "medium"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := Server{Command: tc.command, Args: []string{tc.spec}, Transport: "stdio"}
+			inferIdentity(&server)
+			if server.PackageName != "real-package" {
+				t.Fatalf("package_name = %q, want real-package", server.PackageName)
+			}
+			if server.PinnedVersion != tc.wantVer {
+				t.Errorf("pinned_version = %q, want %q", server.PinnedVersion, tc.wantVer)
+			}
+			if server.Confidence != tc.wantConfidence {
+				t.Errorf("confidence = %q, want %q", server.Confidence, tc.wantConfidence)
+			}
+			// The selector always survives in requested_spec, so nothing is lost.
+			if server.RequestedSpec != tc.spec {
+				t.Errorf("requested_spec = %q, want %q", server.RequestedSpec, tc.spec)
 			}
 		})
 	}

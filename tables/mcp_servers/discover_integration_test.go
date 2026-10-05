@@ -2,15 +2,34 @@ package mcp_servers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/macadmins/osquery-extension/pkg/fsscan"
 )
+
+// serversOnly drops the diagnostic rows, so a test asserting on the servers found does not
+// also have to account for every note the fixture happens to raise.
+//
+// More useful than it was: discovery now reads project lists, so a fixture home carries a
+// ~/.claude.json whose own servers and whose project refusals both produce rows. A test about
+// which project-local configs were probed should not have to enumerate those.
+func serversOnly(rows []Server) []Server {
+	out := make([]Server, 0, len(rows))
+	for _, row := range rows {
+		if row.Warning.empty() && row.ServerName != "" {
+			out = append(out, row)
+		}
+	}
+	return out
+}
 
 // discoverForTest supplies the context and the walk budget that DiscoverAll threads through in
 // production, so the per-home tests below can keep naming just the user and the home.
@@ -26,6 +45,61 @@ func discoverForTest(user, home string) []Server {
 
 // buildFakeHome materializes a minimal user home with the given files.
 // files is a map of relative path -> contents. Returns the home dir.
+// buildFakeHomeWithProjects is buildFakeHome plus the project list that makes the
+// project-local files discoverable.
+//
+// Needed because discovery no longer walks: a project-local config is found by reading the
+// list of projects a client records and probing inside each entry, so a fixture that only
+// creates files on disk creates files nothing looks at. That is the behaviour change these
+// tests exist to pin, and making the fixture state it explicitly is the point -- a reader of
+// the test can see that the recorded list is what drives discovery.
+func buildFakeHomeWithProjects(t *testing.T, files map[string]string, projectRels ...string) string {
+	t.Helper()
+	home := buildFakeHome(t, files)
+	projects := make(map[string]any, len(projectRels))
+	for _, rel := range projectRels {
+		projects[filepath.Join(home, rel)] = map[string]any{}
+	}
+	recorded, err := json.Marshal(map[string]any{"projects": projects})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), recorded, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return home
+}
+
+// recordVSCodeWorkspace records a project the way a VS Code fork does, which is the only
+// evidence that licenses probing `.vscode/mcp.json` or `.cursor/mcp.json` inside it.
+//
+// Claude's project list no longer stands in for this. Using it did, and that was the
+// cross-product defect: one client's record that a directory is a project was being used to
+// justify reporting a different client's configuration there.
+func recordVSCodeWorkspace(t *testing.T, home, fork, projectRel string) {
+	t.Helper()
+	// The directory name under workspaceStorage is a generated hash; any stable string
+	// serves, since it is reached by listing rather than by a fixed path.
+	id := "ws-" + strings.ReplaceAll(projectRel, string(filepath.Separator), "-")
+	record := `{"folder":"file://` +
+		filepath.ToSlash(filepath.Join(home, projectRel)) + `"}`
+	writeTestFile(t, filepath.Join(home,
+		appSupport(fork, "User", "workspaceStorage", id, "workspace.json")), record)
+}
+
+// recordCodexProject records a project the way Codex does, including the trust state that
+// decides whether Codex would load its project-scoped config at all.
+func recordCodexProject(t *testing.T, home, projectRel, trustLevel string) {
+	t.Helper()
+	path := filepath.Join(home, ".codex", "config.toml")
+	existing, _ := os.ReadFile(path)
+	entry := "[projects.\"" + filepath.Join(home, projectRel) + "\"]\n"
+	if trustLevel != "" {
+		entry += "trust_level = \"" + trustLevel + "\"\n"
+	}
+	writeTestFile(t, path, string(existing)+entry)
+}
+
 func buildFakeHome(t *testing.T, files map[string]string) string {
 	t.Helper()
 	home := t.TempDir()
@@ -76,8 +150,19 @@ func TestDiscoverForHome_AllKnownClientsViaDirectPaths(t *testing.T) {
 	}
 	gotClient := map[string]string{}
 	for _, r := range rows {
-		if r.Warning != "" {
-			t.Errorf("unexpected warning on %s: %s", r.SourcePath, r.Warning)
+		if !r.Warning.empty() {
+			// The ~/.claude.json fixture records /repo/foo and /repo/bar as projects, which
+			// are absolute paths outside this temporary home. Reporting that is correct and
+			// is new: the inline servers those entries declare are still listed -- they are
+			// read out of the file, not probed -- but the directories themselves are not
+			// inspected, and the row set says so with a count and no path.
+			if r.Warning.Code == warnProjectOutsideHome {
+				if r.Warning.Count != 2 {
+					t.Errorf("outside-home count = %d, want 2", r.Warning.Count)
+				}
+				continue
+			}
+			t.Errorf("unexpected warning on %s: %s", r.SourcePath, r.Warning.render())
 			continue
 		}
 		gotClient[r.ServerName] = r.Client
@@ -92,12 +177,26 @@ func TestDiscoverForHome_AllKnownClientsViaDirectPaths(t *testing.T) {
 	}
 }
 
-func TestDiscoverForHome_WalkerFindsProjectLocalMCP(t *testing.T) {
-	// .mcp.json at an arbitrary repo root under ~/code/. Pass 1 misses it; pass 2 finds it.
-	home := buildFakeHome(t, map[string]string{
+// A project recorded in a client's own list is probed, and one that is not recorded is not.
+//
+// This is the whole of the discovery change in one test. The old version created
+// ~/code/myrepo/.mcp.json and relied on a depth-6 walk of ~/code to find it, which worked and
+// was nondeterministic: the budget was shared across every home, so whether this file was
+// reached depended on how large the previous account's source tree was.
+//
+// Now the project list is the input. The file is found because ~/.claude.json records
+// ~/code/myrepo as a project, and the second fixture -- an identical file in a directory
+// nobody recorded -- is the cost of the change, asserted rather than left implicit.
+func TestDiscoverForHome_ProbesRecordedProjects(t *testing.T) {
+	home := buildFakeHomeWithProjects(t, map[string]string{
 		"code/myrepo/.mcp.json": `{"mcpServers": {"repo-mcp": {"command": "npx", "args": ["repo-mcp@1.0.0"]}}}`,
-	})
-	rows := discoverForTest("alice", home)
+		// Same file, in a directory no client records. Not discovered, by design: a project
+		// the user has never opened in a participating client is invisible to this table,
+		// which the README states.
+		"code/unopened/.mcp.json": `{"mcpServers": {"never-opened": {"command": "npx", "args": ["x"]}}}`,
+	}, "code/myrepo")
+
+	rows := serversOnly(discoverForTest("alice", home))
 	if len(rows) != 1 {
 		t.Fatalf("expected 1 row, got %d: %+v", len(rows), rows)
 	}
@@ -105,93 +204,126 @@ func TestDiscoverForHome_WalkerFindsProjectLocalMCP(t *testing.T) {
 		t.Errorf("server name: %q", rows[0].ServerName)
 	}
 	if rows[0].Client != "claude_code" {
-		t.Errorf(".mcp.json should classify as claude_code; got %q", rows[0].Client)
+		t.Errorf(".mcp.json should be attributed to claude_code; got %q", rows[0].Client)
+	}
+	// Declared in a project .mcp.json and not in the approved list, so Claude Code will not
+	// run it. Reported as enabled before approval_state existed.
+	if rows[0].Approval != approvalNotApproved {
+		t.Errorf("approval = %q, want %q", rows[0].Approval, approvalNotApproved)
 	}
 }
 
-func TestDiscoverForHome_WalkerFindsCursorWorkspace(t *testing.T) {
+func TestDiscoverForHome_ProbesCursorInRecordedProject(t *testing.T) {
 	home := buildFakeHome(t, map[string]string{
 		"dev/foo/.cursor/mcp.json": `{"mcpServers": {"ws-cursor": {"command": "uvx", "args": ["x"]}}}`,
 	})
-	rows := discoverForTest("alice", home)
+	recordVSCodeWorkspace(t, home, "Cursor", filepath.Join("dev", "foo"))
+	rows := serversOnly(discoverForTest("alice", home))
 	if len(rows) != 1 {
-		t.Fatalf("rows: %d", len(rows))
+		t.Fatalf("rows: %d (%+v)", len(rows), rows)
 	}
 	if rows[0].Client != "cursor" {
-		t.Errorf("workspace .cursor/mcp.json should classify as cursor; got %q", rows[0].Client)
+		t.Errorf("a project .cursor/mcp.json should be attributed to cursor; got %q", rows[0].Client)
+	}
+	// Cursor has no approval step, so the question does not arise and `disabled` is the
+	// whole answer. Borrowing Claude's state here would say something the client does not.
+	if rows[0].Approval != approvalNotApplicable {
+		t.Errorf("approval = %q, want %q", rows[0].Approval, approvalNotApplicable)
 	}
 }
 
-func TestDiscoverForHome_WalkerFindsVSCodeWorkspace(t *testing.T) {
+func TestDiscoverForHome_ProbesVSCodeInRecordedProject(t *testing.T) {
 	home := buildFakeHome(t, map[string]string{
 		"projects/foo/.vscode/mcp.json": `{"mcpServers": {"ws-vscode": {"command": "npx", "args": ["x"]}}}`,
 	})
-	rows := discoverForTest("alice", home)
+	recordVSCodeWorkspace(t, home, "Code", filepath.Join("projects", "foo"))
+	rows := serversOnly(discoverForTest("alice", home))
 	if len(rows) != 1 {
-		t.Fatalf("rows: %d", len(rows))
+		t.Fatalf("rows: %d (%+v)", len(rows), rows)
 	}
 	if rows[0].Client != "vscode" {
-		t.Errorf(".vscode/mcp.json should classify as vscode; got %q", rows[0].Client)
+		t.Errorf("a project .vscode/mcp.json should be attributed to vscode; got %q", rows[0].Client)
 	}
 }
 
-func TestDiscoverForHome_SkipsClaudePluginMarketplace(t *testing.T) {
-	// Claude Code caches installable plugin definitions under
-	// .claude/plugins/marketplaces/. These are catalog entries, not active
-	// MCPs, and would otherwise inflate the table dozens of rows.
-	home := buildFakeHome(t, map[string]string{
-		".claude/plugins/marketplaces/official/external_plugins/github/.mcp.json": `{"github":{"type":"http","url":"https://api.example.com/mcp/"}}`,
-		".claude/plugins/cache/official/foo/abc/.mcp.json":                        `{"foo":{"command":"npx","args":["x"]}}`,
-		// Control: an *active* per-project config should still be found.
-		"code/myproj/.mcp.json": `{"mcpServers":{"active":{"command":"npx","args":["x"]}}}`,
-	})
-	rows := discoverForTest("alice", home)
-	for _, r := range rows {
-		if strings.Contains(r.SourcePath, filepath.Join("plugins", "marketplaces")) ||
-			strings.Contains(r.SourcePath, filepath.Join("plugins", "cache")) {
-			t.Errorf("catalog entry leaked into table: %s", r.SourcePath)
-		}
+// The plugin-catalog exclusions are gone, and so are the tests for them.
+//
+// Claude Code and Codex both cache installable plugin definitions as .mcp.json files --
+// catalog entries, not configured servers. Measured on one workstation, 39 of 51 Codex rows
+// came from three such directories. The fix was a list of path substrings, maintained by
+// noticing each new cache location after it polluted the table.
+//
+// Nothing reaches them now. A marketplace cache is not a project any client records, so it is
+// not probed, and the exclusion list became unreachable code with two tests asserting
+// behaviour that could no longer occur. Deleted rather than kept green against a path that
+// does not exist: a test that cannot fail is worse than no test, because it reads as coverage.
+//
+// A behaviour change, asserted rather than hidden: a project recorded under node_modules IS
+// probed now.
+//
+// The walk pruned node_modules, .git and vendor, because descending them found vendored and
+// hook-local configs that nothing was configured to run -- noise indistinguishable from real
+// rows. The prune list is still in fsscan and still correct for a walk.
+//
+// It no longer applies here, because nothing walks. A directory is probed because a client
+// recorded it as a project the user opened, and a client does not record node_modules unless
+// the user genuinely opened an editor there. If they did, that project's MCP configuration is
+// a real thing the editor will act on, and the old behaviour of silently pruning it was the
+// wrong answer for that case.
+//
+// So the noise this prevented is prevented by a different and better mechanism -- nobody
+// records a vendored directory as a project -- and the one case that changes is the one where
+// the user really did open it. Stated here because a test that quietly stopped covering the
+// prune would leave the next reader thinking it still applied.
+func TestDiscoverForHome_ProbesRecordedProjectEvenUnderNodeModules(t *testing.T) {
+	home := buildFakeHomeWithProjects(t, map[string]string{
+		"code/foo/.mcp.json":                  `{"mcpServers": {"good": {"command": "npx", "args": ["x"]}}}`,
+		"code/foo/node_modules/dep/.mcp.json": `{"mcpServers": {"vendored": {"command": "npx", "args": ["y"]}}}`,
+		// Not recorded as a project, so still not found -- which is what actually keeps the
+		// vendored noise out, rather than a prune list.
+		"code/foo/vendor/other/.cursor/mcp.json": `{"mcpServers": {"unrecorded": {"command": "evil"}}}`,
+	}, "code/foo", "code/foo/node_modules/dep")
+
+	var found []string
+	for _, row := range serversOnly(discoverForTest("alice", home)) {
+		found = append(found, row.ServerName)
 	}
-	// Active config must still be present.
-	var found bool
-	for _, r := range rows {
-		if r.ServerName == "active" {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("active config was filtered out by mistake; rows=%+v", rows)
+	sort.Strings(found)
+	if !reflect.DeepEqual(found, []string{"good", "vendored"}) {
+		t.Errorf("found %v; a recorded project is probed wherever it sits, and an "+
+			"unrecorded one is not probed at all", found)
 	}
 }
 
-func TestDiscoverForHome_WalkerSkipsNodeModulesAndGit(t *testing.T) {
-	// Planted configs inside directories that must be pruned. A scanner that descends
-	// node_modules or .git finds vendored and hook-local configs that nothing is configured
-	// to run, which is noise indistinguishable from real rows.
-	home := buildFakeHome(t, map[string]string{
-		"code/foo/.mcp.json":                    `{"mcpServers": {"good": {"command": "npx", "args": ["x"]}}}`,
-		"code/foo/node_modules/evil/.mcp.json":  `{"mcpServers": {"bad-nm": {"command": "evil"}}}`,
-		"code/foo/.git/hooks/.mcp.json":         `{"mcpServers": {"bad-git": {"command": "evil"}}}`,
-		"code/foo/vendor/evil/.cursor/mcp.json": `{"mcpServers": {"bad-vendor": {"command": "evil"}}}`,
-	})
-	rows := discoverForTest("alice", home)
-	if len(rows) != 1 {
-		t.Fatalf("expected exactly 1 row (pruned dirs filtered), got %d: %+v", len(rows), rows)
-	}
-	if rows[0].ServerName != "good" {
-		t.Errorf("wrong server discovered: %q", rows[0].ServerName)
-	}
-}
-
-func TestDiscoverForHome_DedupsBetweenDirectAndWalker(t *testing.T) {
-	// A file that both passes could find. We must emit it once, not twice.
-	// .cursor/mcp.json IS a direct-path entry: the walker shouldn't double it.
+// Dedup between the home-rooted and project-rooted probe lists.
+//
+// The real case, and it is not contrived: a user's home is frequently itself a recorded
+// project -- it is on the machine this was developed on -- and ~/.cursor/mcp.json is then
+// reachable both as a fixed path relative to the home and as `.cursor/mcp.json` inside the
+// project whose path is the home. Containment allows that deliberately, because `~/.mcp.json`
+// is a legitimate configuration file.
+//
+// So the two lists overlap for exactly one project, and the dedup that used to sit between
+// the direct pass and the walker has to sit between these two instead.
+func TestDiscoverForHome_DedupsBetweenHomeAndProjectProbes(t *testing.T) {
 	home := buildFakeHome(t, map[string]string{
 		".cursor/mcp.json": `{"mcpServers": {"single": {"command": "npx", "args": ["x"]}}}`,
 	})
-	rows := discoverForTest("alice", home)
+	// The home records itself as a project, which is what makes the overlap reachable.
+	recorded, err := json.Marshal(map[string]any{"projects": map[string]any{home: map[string]any{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), recorded, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := serversOnly(discoverForTest("alice", home))
 	if len(rows) != 1 {
-		t.Fatalf("expected 1 row (dedup), got %d: %+v", len(rows), rows)
+		t.Fatalf("expected 1 row after dedup, got %d: %+v", len(rows), rows)
+	}
+	if rows[0].ServerName != "single" {
+		t.Errorf("server name: %q", rows[0].ServerName)
 	}
 }
 
@@ -219,7 +351,7 @@ func TestDiscoverForHome_MalformedJSON_EmitsWarning(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("expected 1 warning row, got %d", len(rows))
 	}
-	if rows[0].Warning == "" {
+	if rows[0].Warning.empty() {
 		t.Errorf("expected warning, got none")
 	}
 	if rows[0].ServerName != "" {
@@ -249,7 +381,7 @@ func TestDiscoverForHome_JSONCWithComments(t *testing.T) {
 		}`,
 	})
 	rows := discoverForTest("alice", home)
-	if len(rows) != 1 || rows[0].Warning != "" {
+	if len(rows) != 1 || rows[0].Warning.empty() == false {
 		t.Fatalf("expected 1 clean row, got %#v", rows)
 	}
 	if rows[0].ServerName != "x" {
@@ -313,7 +445,7 @@ func TestDiscoverAllSharesOneWalkBudgetAcrossHomes(t *testing.T) {
 		rows := withoutStandingNotes(DiscoverAll(context.Background(), rosterOf(t, root), filter))
 		elapsed := time.Since(start)
 		for _, row := range rows {
-			if row.Warning != "" {
+			if row.Warning.empty() == false {
 				return elapsed, true
 			}
 		}
@@ -351,12 +483,12 @@ func TestDiscoverAllReportsUsersTheBudgetNeverReached(t *testing.T) {
 	}
 	t.Setenv(fsscan.WalkTimeoutEnv, "1ns")
 
-	reported := make(map[string]string, homes)
+	reported := make(map[string]warnCode, homes)
 	for _, row := range DiscoverAll(context.Background(), rosterOf(t, root), nil) {
-		if row.Warning == "" {
+		if row.Warning.empty() {
 			t.Errorf("user %q: an unscanned user must carry a warning", row.User)
 		}
-		reported[row.User] = row.Warning
+		reported[row.User] = row.Warning.Code
 	}
 	for homeIndex := 0; homeIndex < homes; homeIndex++ {
 		user := fmt.Sprintf("user%d", homeIndex)
@@ -381,53 +513,28 @@ func TestDiscoverAllHonoursCallerCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	// Pass 1 now checks ctx before each direct read and Pass 2 is skipped entirely, so the
-	// assertion is about how the stop is reported: a cancelled query must not be described as
-	// a timeout, which is a budget outcome and means something different to an operator.
+	// The assertion is about how the stop is reported: a cancelled query must not be
+	// described as a budget outcome, which means something different to an operator -- the
+	// first says the query went away, the second says this host is too slow for the
+	// schedule it is on.
+	//
+	// Equality on a code rather than a substring match on the sentence. The old version
+	// searched for "timeout", which passed for every wording that did not happen to contain
+	// that word, including a budget message that said "exhausted" instead.
+	budgetCodes := map[warnCode]struct{}{
+		warnBudgetExhaustedPreHome: {}, warnBudgetExhaustedOpening: {},
+		warnBudgetExhaustedInHome: {},
+	}
 	for _, row := range DiscoverAll(ctx, rosterOf(t, root), nil) {
-		if strings.Contains(row.Warning, "timeout") {
-			t.Errorf("cancellation was reported as a timeout: %q", row.Warning)
+		if row.Warning.empty() {
+			continue
+		}
+		if _, isBudget := budgetCodes[row.Warning.Code]; isBudget {
+			t.Errorf("cancellation was reported as a budget failure: %q", row.Warning.Code)
 		}
 	}
 }
 
-// Codex ships an installable-plugin catalog in the same file shape as real configuration, and
-// it had no exclusion while Claude's equivalent did. Measured on one workstation after a Codex
-// update, 39 of 51 rows came from these directories -- airtable, canva, figma, slack, stripe
-// and thirty more the user had never enabled.
-func TestCodexPluginCatalogIsExcluded(t *testing.T) {
-	catalog := `{"mcpServers":{"catalog-entry":{"type":"http","url":"https://example.test/mcp"}}}`
-	home := buildFakeHome(t, map[string]string{
-		".codex/.tmp/plugins/plugins/slack/.mcp.json":                         catalog,
-		".codex/.tmp/bundled-marketplaces/openai-bundled/plugins/x/.mcp.json": catalog,
-		".codex/plugins/cache/openai-bundled/computer-use/1.0.0/.mcp.json":    catalog,
-		// Control: a real config directly under .codex must still be found.
-		".codex/mcp.json": `{"servers":{"real-codex":{"command":"node","args":["s.js"]}}}`,
-	})
-	rows := discoverForTest("alice", home)
-	for _, row := range rows {
-		if row.ServerName == "catalog-entry" {
-			t.Errorf("catalog entry leaked into the table: %s", row.SourcePath)
-		}
-	}
-	var foundReal bool
-	for _, row := range rows {
-		if row.ServerName == "real-codex" {
-			foundReal = true
-		}
-	}
-	if !foundReal {
-		t.Errorf("the real config was filtered out by mistake; rows=%+v", rows)
-	}
-}
-
-// VS Code's user-scope and profile-scoped MCP configs live under Library, which the walker
-// prunes, and Copilot's portable config has a hyphenated basename that was in neither the
-// direct-path list nor walkableBasenames. All three were unreachable by any pathway.
-//
-// The VS Code files use `servers` rather than `mcpServers`, which is the shape Microsoft
-// documents and which extractEnvelope already accepts; asserting it here keeps that coupling
-// visible.
 func TestDiscoverForHome_VSCodeUserScopeProfilesAndCopilot(t *testing.T) {
 	home := buildFakeHome(t, map[string]string{
 		appSupport("Code", "User", "mcp.json"): `{
@@ -441,8 +548,8 @@ func TestDiscoverForHome_VSCodeUserScopeProfilesAndCopilot(t *testing.T) {
 	rows := discoverForTest("alice", home)
 	got := map[string]string{}
 	for _, row := range rows {
-		if row.Warning != "" {
-			t.Errorf("unexpected warning on %s: %s", row.SourcePath, row.Warning)
+		if row.Warning.empty() == false {
+			t.Errorf("unexpected warning on %s: %s", row.SourcePath, row.Warning.render())
 			continue
 		}
 		got[row.ServerName] = row.Client
@@ -463,24 +570,31 @@ func TestDiscoverForHome_VSCodeUserScopeProfilesAndCopilot(t *testing.T) {
 // in ~/.codex/<profile>.config.toml. Only the user-scope file had a direct path, so both of
 // these were false negatives for a client the table names as supported.
 //
-// The .codex parent is required rather than matching config.toml anywhere: that basename is
-// among the most common on a developer machine, and the walk roots are whole project trees.
+// The .codex parent is still required rather than matching config.toml anywhere, and the
+// reason is unchanged: that basename is among the most common on a developer machine. What
+// changed is which mechanism enforces it. The project-scoped file is now found because the
+// project is recorded and `.codex/config.toml` is a probe path inside it, so an unrelated
+// `config.toml` at a project root is never opened rather than being opened and rejected. The
+// named-profile file still needs isCodexTOMLPath, because that one is reached by listing
+// ~/.codex and the names in it are generated.
 func TestDiscoverForHome_CodexProjectAndProfileTOML(t *testing.T) {
 	home := buildFakeHome(t, map[string]string{
 		"code/myrepo/.codex/config.toml": "[mcp_servers.project_scoped]\ncommand = \"node\"\n",
 		".codex/work.config.toml":        "[mcp_servers.profile_scoped]\ncommand = \"uvx\"\n",
 		".codex/config.toml":             "[mcp_servers.user_scoped]\ncommand = \"npx\"\n",
-		// Must NOT be picked up: a config.toml that is not Codex's.
+		// Must NOT be picked up: a config.toml that is not Codex's. Both sit inside a
+		// recorded project, so they are reachable in principle and excluded by the probe
+		// path naming `.codex/config.toml` specifically.
 		"code/myrepo/config.toml":          "[build]\ntarget = \"wasm\"\n",
 		"code/rustproj/.cargo/config.toml": "[net]\ngit-fetch-with-cli = true\n",
 	})
-	rows := discoverForTest("alice", home)
+	// Recorded by Codex itself and trusted, which is what licenses reading a project's
+	// `.codex/config.toml`: Codex skips project-scoped layers for an untrusted project.
+	recordCodexProject(t, home, "code/myrepo", "trusted")
+	recordCodexProject(t, home, "code/rustproj", "trusted")
+	rows := serversOnly(discoverForTest("alice", home))
 	found := map[string]bool{}
 	for _, row := range rows {
-		if row.Warning != "" {
-			t.Errorf("unexpected warning on %s: %s", row.SourcePath, row.Warning)
-			continue
-		}
 		found[row.ServerName] = true
 		if row.Client != "codex" {
 			t.Errorf("%s: client = %q, want codex", row.ServerName, row.Client)
@@ -522,12 +636,17 @@ func TestDiscoverForHomeReportsAnExhaustedBudget(t *testing.T) {
 			fsscan.UserHome{Name: "alice", Path: home}, time.Now().Add(testCase.budget)))
 		var diagnostics int
 		for _, row := range rows {
-			if row.Warning == "" {
+			if row.Warning.empty() {
 				continue
 			}
 			diagnostics++
-			if !strings.Contains(row.Warning, "scan truncated") {
-				t.Errorf("%s: warning does not name the cause: %q", testCase.name, row.Warning)
+			// Equality on the code, not a substring of the sentence. The old assertion
+			// matched "scan truncated" anywhere in the text, so it passed for any message
+			// containing that phrase and would have kept passing if the cause changed.
+			if row.Warning.Code != warnBudgetExhaustedInHome &&
+				row.Warning.Code != warnBudgetExhaustedOpening {
+				t.Errorf("%s: warning does not name an exhausted budget: %q",
+					testCase.name, row.Warning.Code)
 			}
 			if row.Transport != "unknown" || row.Confidence != "low" {
 				t.Errorf("%s: diagnostic breaks the identity contract: %+v", testCase.name, row)
@@ -564,7 +683,7 @@ func TestHomeOpenIsChargedAgainstTheDeadline(t *testing.T) {
 			"with no configuration")
 	}
 	for _, row := range rows {
-		if row.Warning == "" {
+		if row.Warning.empty() {
 			t.Errorf("a server row was produced after the deadline had passed: %+v", row)
 		}
 	}
