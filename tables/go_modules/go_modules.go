@@ -60,8 +60,8 @@ func GoModulesColumns() []table.ColumnDefinition {
 		// compiler a build used, which GOTOOLCHAIN, an installed compiler or CI can change.
 		table.TextColumn("go_directive"),
 		table.TextColumn("toolchain_directive"),
-		table.TextColumn("project_path"),
-		table.TextColumn("user"),
+		table.TextColumn("project_path", table.IndexColumn(), table.OptimizedColumn()),
+		table.TextColumn("user", table.IndexColumn(), table.OptimizedColumn()),
 		// The uid column of osquery's users table, as core osquery's per-user tables publish it,
 		// so `JOIN users USING (uid)` works. On Windows osquery fills it with the last component
 		// of the SID, which two accounts can share; user_id holds the whole SID.

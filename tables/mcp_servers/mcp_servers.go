@@ -109,7 +109,7 @@ func MCPServersColumns() []table.ColumnDefinition {
 		table.TextColumn("approval_state"),
 		table.TextColumn("source_path"),
 		table.TextColumn("source_context"),
-		table.TextColumn("user"),
+		table.TextColumn("user", table.IndexColumn(), table.OptimizedColumn()),
 		// The uid column of osquery's users table, as core osquery's per-user tables publish it,
 		// so `JOIN users USING (uid)` works. On Windows osquery fills it with the last component
 		// of the SID, which two accounts can share; user_id holds the whole SID.
