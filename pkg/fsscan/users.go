@@ -1,6 +1,7 @@
 package fsscan
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -236,13 +237,14 @@ func accountID(row map[string]string) string {
 // Filtering afterwards meant `WHERE user = 'alice'` still stat'd every home on the box --
 // so one dead mount belonging to an account nobody asked about delayed, or killed, a query
 // scoped to a single local user.
-func ListUserHomes(client utils.OsqueryClient, filter map[string]struct{}) (UserHomes, error) {
-	// KNOWN GAP: this does not observe cancellation or
-	// the caller's budget. osquery-go does provide QueryRowsContext -- the pinned revision
-	// has it -- but utils.OsqueryClient does not name it, so no caller can reach it. An
-	// already-cancelled query still runs this, and the socket timeout rather than the table
-	// budget is what bounds it. Widening that shared interface belongs in its own change.
-	rows, err := client.QueryRows(UsersQuery)
+func ListUserHomes(ctx context.Context, client utils.OsqueryClient, filter map[string]struct{}) (UserHomes, error) {
+	// osquery-go's client races its free lock against ctx.Done() and sends the query whichever
+	// wins, so a query already cancelled is stopped here rather than left to the client. The
+	// context still bounds the wait for the client's lock.
+	if err := ctx.Err(); err != nil {
+		return UserHomes{}, fmt.Errorf("querying the osquery users table: %w", err)
+	}
+	rows, err := client.QueryRowsContext(ctx, UsersQuery)
 	if err != nil {
 		return UserHomes{}, fmt.Errorf("querying the osquery users table: %w", err)
 	}

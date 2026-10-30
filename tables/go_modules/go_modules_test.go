@@ -41,21 +41,69 @@ func roster(homes map[string]string) utils.OsqueryClienter {
 	return &utils.MockOsqueryClienter{Data: map[string][]map[string]string{fsscan.UsersQuery: rows}}
 }
 
+// TestACancelledQueryAfterTheRosterReportsEachAccount: a query cancelled after the roster is
+// read reports each account with a cancelled_before_home row carrying its uid.
+func TestACancelledQueryAfterTheRosterReportsEachAccount(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "alice")
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clienter := &utils.CancelAfterQueryClienter{Inner: roster(map[string]string{"alice": home}), Cancel: cancel}
+	rows, err := generate(ctx, table.QueryContext{}, clienter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || !strings.HasPrefix(rows[0]["warning"], warnSentences[warnCancelledPreHome]) ||
+		rows[0]["user"] != "alice" || rows[0]["uid"] != "501" {
+		t.Errorf("rows = %v, want one cancelled_before_home row for alice carrying uid 501", rows)
+	}
+}
+
+// TestACancelledQueryOpensNoClient: a query already cancelled reports the cancellation without
+// opening a client to osquery.
+func TestACancelledQueryOpensNoClient(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	clienter := &utils.CancelAfterQueryClienter{Inner: roster(map[string]string{}), Cancel: cancel}
+	rows, err := generate(ctx, table.QueryContext{}, clienter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clienter.Opened != 0 || len(rows) != 1 || rows[0]["user"] != "" ||
+		!strings.HasPrefix(rows[0]["warning"], warnSentences[warnCancelledPreHome]) {
+		t.Errorf("opened %d clients, rows = %v; want none and one cancelled_before_home row",
+			clienter.Opened, rows)
+	}
+}
+
+// TestARosterFailureWhileCancelledIsTheRosterFailure: a roster read that fails for its own
+// reason, here an empty roster, while the query is cancelled reports the roster failure.
+func TestARosterFailureWhileCancelledIsTheRosterFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clienter := &utils.CancelAfterQueryClienter{Inner: roster(map[string]string{}), Cancel: cancel}
+	rows, err := generate(ctx, table.QueryContext{}, clienter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || !strings.HasPrefix(rows[0]["warning"], warnSentences[warnRosterQueryFailed]) {
+		t.Errorf("rows = %v, want one roster_query_failed row", rows)
+	}
+}
+
 type unreachable struct{}
 
 func (unreachable) NewOsqueryClient() (utils.OsqueryClient, error) {
 	return nil, errors.New("no socket")
 }
 
-type failingClient struct{}
-
-func (failingClient) QueryRows(string) ([]map[string]string, error) { return nil, errors.New("x") }
-func (failingClient) QueryRow(string) (map[string]string, error)    { return nil, errors.New("x") }
-func (failingClient) Close()                                        {}
-
 type queryFails struct{}
 
-func (queryFails) NewOsqueryClient() (utils.OsqueryClient, error) { return failingClient{}, nil }
+func (queryFails) NewOsqueryClient() (utils.OsqueryClient, error) {
+	return utils.ErrorOsqueryClient{Err: errors.New("x")}, nil
+}
 
 func run(t *testing.T, clienter utils.OsqueryClienter, qc table.QueryContext) []map[string]string {
 	t.Helper()
@@ -375,7 +423,10 @@ func TestRequestedAccounts(t *testing.T) {
 	}
 }
 
-func TestACancelledQueryReportsEachAccount(t *testing.T) {
+// TestACancelledQueryReportsCancellationWithoutAnAccount: once the context is done the roster
+// read fails, and the answer is a cancelled_before_home row with no account rather than a
+// roster failure.
+func TestACancelledQueryReportsCancellationWithoutAnAccount(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "alice")
 	if err := os.MkdirAll(home, 0o755); err != nil {
 		t.Fatal(err)
@@ -387,8 +438,8 @@ func TestACancelledQueryReportsEachAccount(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(rows) != 1 || !strings.HasPrefix(rows[0]["warning"], warnSentences[warnCancelledPreHome]) ||
-		rows[0]["uid"] != "501" {
-		t.Errorf("rows = %v, want one cancelled_before_home row carrying uid 501", rows)
+		rows[0]["user"] != "" || rows[0]["uid"] != "" {
+		t.Errorf("rows = %v, want one cancelled_before_home row with no account", rows)
 	}
 }
 

@@ -1,6 +1,9 @@
 package fsscan
 
 import (
+	"context"
+	"errors"
+	"github.com/macadmins/osquery-extension/pkg/utils"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -333,5 +336,35 @@ func TestARelativeOrDotDotHomeIsOmitted(t *testing.T) {
 		if omission.Code != OmittedHomeNotAbsolute || !omission.HomeUnusable {
 			t.Errorf("omission = %+v, want home_not_absolute and unusable", omission)
 		}
+	}
+}
+
+// contextBlindClient answers every query and records that it was asked, as osquery-go's client
+// can when its lock wins the race against a cancelled context.
+type contextBlindClient struct {
+	utils.MockOsqueryClient
+	asked bool
+}
+
+func (client *contextBlindClient) QueryRowsContext(_ context.Context,
+	query string) ([]map[string]string, error) {
+	client.asked = true
+	return client.QueryRows(query)
+}
+
+// TestListUserHomesObservesCancellation: a query already cancelled does not ask osquery for the
+// roster, even through a client that would send it regardless of the context.
+func TestListUserHomesObservesCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	client := &contextBlindClient{MockOsqueryClient: utils.MockOsqueryClient{
+		Data: map[string][]map[string]string{
+			UsersQuery: {{"username": "alice", "uid": "501", "directory": "/Users/alice"}},
+		}}}
+	if _, err := ListUserHomes(ctx, client, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ListUserHomes with a cancelled context = %v, want context.Canceled", err)
+	}
+	if client.asked {
+		t.Error("ListUserHomes sent the roster query under a cancelled context")
 	}
 }

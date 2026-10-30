@@ -14,6 +14,7 @@ import (
 	"github.com/macadmins/osquery-extension/pkg/fsscan"
 	"github.com/macadmins/osquery-extension/pkg/redact"
 	"github.com/macadmins/osquery-extension/pkg/testutil"
+	"github.com/macadmins/osquery-extension/pkg/utils"
 )
 
 // Four configurations a user can write that would put a credential in a column, asserted end
@@ -998,12 +999,33 @@ func TestEveryRowCarriesItsHome(t *testing.T) {
 			t.Errorf("%s row has home %q, want %q", row.Warning.Code, row.Home, home)
 		}
 	}
-	cancelled, cancel := context.WithCancel(context.Background())
-	cancel()
-	for _, row := range DiscoverAll(cancelled, rosterOf(t, root), nil) {
-		if row.Warning.Code == warnCancelledPreHome && row.Home != home {
-			t.Errorf("cancelled_before_home row has home %q, want %q", row.Home, home)
+}
+
+// TestCancelledBeforeHomeRowsCarryTheirHome: a query cancelled after the roster is read reports
+// each account with a cancelled_before_home row that carries the account's home.
+func TestCancelledBeforeHomeRowsCarryTheirHome(t *testing.T) {
+	root := t.TempDir()
+	homes := map[string]string{}
+	for _, name := range []string{"alice", "bob"} {
+		homes[name] = filepath.Join(root, name)
+		testutil.WriteFile(t, filepath.Join(homes[name], ".cursor", "mcp.json"), `{}`)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clienter := &utils.CancelAfterQueryClienter{Inner: rosterOf(t, root), Cancel: cancel}
+	seen := map[string]bool{}
+	for _, row := range DiscoverAll(ctx, clienter, nil) {
+		if row.Warning.Code != warnCancelledPreHome {
+			continue
 		}
+		seen[row.User] = true
+		if row.Home != homes[row.User] {
+			t.Errorf("%s: cancelled_before_home row has home %q, want %q", row.User, row.Home,
+				homes[row.User])
+		}
+	}
+	if len(seen) != len(homes) {
+		t.Errorf("cancelled_before_home rows for %v, want one per account in %v", seen, homes)
 	}
 }
 

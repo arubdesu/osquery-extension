@@ -369,6 +369,12 @@ func DiscoverAll(ctx context.Context, clienter utils.OsqueryClienter, userFilter
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// osquery-go cancels the context only once osquery has closed the connection, so a query
+	// already cancelled has no reader, and opening a client can wait out the client's timeout.
+	if ctx.Err() != nil {
+		return rosterDiagnostic(userFilter, fsscan.UsersRoot,
+			warning{Code: warnCancelledPreHome})
+	}
 	// The account roster comes from osquery. There is no filesystem fallback: the socket is
 	// how this extension returns rows at all, so if it cannot be reached osquery is not
 	// receiving results either, and a guessed roster would only make that quieter.
@@ -386,8 +392,15 @@ func DiscoverAll(ctx context.Context, clienter utils.OsqueryClienter, userFilter
 	// the fact still Lstat'd every home on the host, so one dead automount belonging to an
 	// account nobody asked about could consume the budget of a query scoped to a single
 	// local user.
-	enumerated, err := fsscan.ListUserHomes(client, userFilter)
+	enumerated, err := fsscan.ListUserHomes(ctx, client, userFilter)
 	if err != nil {
+		// A roster read the cancellation stopped reports it, with no account since none was
+		// reached; any other failure is the roster's own, even when the query was cancelled
+		// meanwhile.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return rosterDiagnostic(userFilter, fsscan.UsersRoot,
+				warning{Code: warnCancelledPreHome})
+		}
 		// The roster itself is unreadable, so no account can be confirmed or ruled out.
 		//
 		// A single aggregate row with an empty user was dropped by `WHERE user = '<name>'`,

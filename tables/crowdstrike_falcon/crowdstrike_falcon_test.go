@@ -8,20 +8,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-type errorOsqueryClient struct {
-	err error
-}
-
-func (e errorOsqueryClient) QueryRows(query string) ([]map[string]string, error) {
-	return nil, e.err
-}
-
-func (e errorOsqueryClient) QueryRow(query string) (map[string]string, error) {
-	return nil, e.err
-}
-
-func (e errorOsqueryClient) Close() {}
-
 func TestRunCrowdstrikeFalconDarwin(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -234,7 +220,7 @@ func TestRunCrowdstrikeFalconLinuxQueryError(t *testing.T) {
 	runner := utils.Runner{Runner: utils.MockCmdRunner{}}
 	fs := utils.MockFileSystem{FileExists: true}
 
-	output, err := runCrowdstrikeFalconLinux(runner, fs, errorOsqueryClient{err: errors.New("query failed")})
+	output, err := runCrowdstrikeFalconLinux(runner, fs, utils.ErrorOsqueryClient{Err: errors.New("query failed")})
 	assert.Error(t, err)
 	assert.Empty(t, output)
 	assert.ErrorContains(t, err, "query failed")

@@ -19,21 +19,6 @@ func (e errorOsqueryClienter) NewOsqueryClient() (utils.OsqueryClient, error) {
 	return nil, e.err
 }
 
-type errorOsqueryClient struct {
-	rowsErr error
-	rowErr  error
-}
-
-func (e errorOsqueryClient) QueryRows(query string) ([]map[string]string, error) {
-	return nil, e.rowsErr
-}
-
-func (e errorOsqueryClient) QueryRow(query string) (map[string]string, error) {
-	return nil, e.rowErr
-}
-
-func (e errorOsqueryClient) Close() {}
-
 var mockIOReg = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -217,7 +202,7 @@ func TestIsMacOS15(t *testing.T) {
 }
 
 func TestIsMacOS15QueryError(t *testing.T) {
-	_, err := alt_system_info.IsMacOS150(errorOsqueryClient{rowsErr: errors.New("query failed")})
+	_, err := alt_system_info.IsMacOS150(utils.ErrorOsqueryClient{Err: errors.New("query failed")})
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "query failed")
 }
@@ -235,7 +220,7 @@ func TestFallback(t *testing.T) {
 }
 
 func TestFallbackQueryError(t *testing.T) {
-	_, err := alt_system_info.Fallback(errorOsqueryClient{rowErr: errors.New("system_info failed")})
+	_, err := alt_system_info.Fallback(utils.ErrorOsqueryClient{Err: errors.New("system_info failed")})
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "system_info failed")
 }

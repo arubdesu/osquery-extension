@@ -37,4 +37,7 @@ func TestQueryRow(t *testing.T) {
 	data, err := mock.QueryRow("SELECT * FROM table")
 	require.NoError(t, err)
 	assert.Equal(t, clienter.Data[query][0], data)
+
+	_, err = mock.QueryRow("SELECT * FROM unanswered")
+	assert.ErrorContains(t, err, "expected 1 row, got 0")
 }

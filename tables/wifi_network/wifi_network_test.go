@@ -47,20 +47,6 @@ func happyCommandExecutor() *fakeCommandExecutor {
 	}
 }
 
-type errorOsqueryClient struct {
-	err error
-}
-
-func (e errorOsqueryClient) QueryRows(query string) ([]map[string]string, error) {
-	return nil, e.err
-}
-
-func (e errorOsqueryClient) QueryRow(query string) (map[string]string, error) {
-	return nil, e.err
-}
-
-func (e errorOsqueryClient) Close() {}
-
 func wifiStatusFixture() map[string]string {
 	return map[string]string{
 		"interface":     "en0",
@@ -108,7 +94,7 @@ func TestGetWifiStatus(t *testing.T) {
 func TestGetWifiStatusReturnsQueryErrors(t *testing.T) {
 	expectedErr := errors.New("query failed")
 
-	result, err := getWifiStatus(errorOsqueryClient{err: expectedErr})
+	result, err := getWifiStatus(utils.ErrorOsqueryClient{Err: expectedErr})
 
 	require.ErrorIs(t, err, expectedErr)
 	assert.Nil(t, result)
@@ -434,7 +420,7 @@ func TestGenerateWithDeps(t *testing.T) {
 func TestGenerateWithDepsReturnsWifiStatusErrors(t *testing.T) {
 	expectedErr := errors.New("query failed")
 
-	result, err := generateWithDeps(errorOsqueryClient{err: expectedErr}, happyCommandExecutor())
+	result, err := generateWithDeps(utils.ErrorOsqueryClient{Err: expectedErr}, happyCommandExecutor())
 
 	require.ErrorIs(t, err, expectedErr)
 	assert.Nil(t, result)

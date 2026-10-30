@@ -320,7 +320,7 @@ A user that was not scanned. These come from the roster or from the first checks
 | `accounts_home_unusable` | accounts with no usable home directory were not inspected; query a specific user to see which | `count=` |
 | `home_unreadable` | this account's home directory could not be opened, so none of its configuration is listed | `reason=` |
 | `budget_exhausted_before_home` | the query budget was exhausted before this account was scanned, so none of its configuration is listed | none |
-| `cancelled_before_home` | the query was cancelled before this account was scanned, so none of its configuration is listed | none |
+| `cancelled_before_home` | the query was cancelled before this account was scanned, so none of its configuration is listed | none; when the query was cancelled before the roster was read, `user` is empty, or each user a `user` constraint names |
 | `budget_exhausted_opening_home` | the query budget was exhausted opening this account's home directory, so none of its configuration is listed | none |
 
 A user whose scan fell short. Some of the user's configuration is not listed, and the servers that are listed keep their own `scan_complete`.

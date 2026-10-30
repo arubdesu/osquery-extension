@@ -1,6 +1,8 @@
 package utils
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -11,17 +13,13 @@ type OsqueryClienter interface {
 	NewOsqueryClient() (OsqueryClient, error)
 }
 
-// OsqueryClient is deliberately narrow, and currently narrower than it should be.
-//
-// KNOWN GAP: osquery-go also provides QueryRowsContext,
-// QueryRowContext and QueryContext, and *ExtensionManagerClient satisfies them today. They
-// are absent here, so every caller queries with an implicit context.Background() and cannot
-// honour a cancelled table query or bound the call by its own deadline. Adding them is
-// additive -- the concrete client needs nothing and existing callers are unaffected -- but
-// it widens an interface four tables depend on, so it wants its own review.
+// OsqueryClient is the part of osquery-go's *ExtensionManagerClient the tables use. The context
+// form bounds the wait for the client's lock by the table's own query; it does not stop a query
+// once the lock is held, so a caller checks ctx.Err() first.
 type OsqueryClient interface {
 	QueryRows(query string) ([]map[string]string, error)
 	QueryRow(query string) (map[string]string, error)
+	QueryRowsContext(ctx context.Context, query string) ([]map[string]string, error)
 	Close()
 }
 
@@ -65,8 +63,77 @@ func (m *MockOsqueryClient) QueryRows(query string) ([]map[string]string, error)
 	return m.Data[query], nil
 }
 
+// QueryRow answers with the query's one row, and fails otherwise, as osquery-go's QueryRow does.
 func (m *MockOsqueryClient) QueryRow(query string) (map[string]string, error) {
-	return m.Data[query][0], nil
+	rows := m.Data[query]
+	if len(rows) != 1 {
+		return nil, fmt.Errorf("expected 1 row, got %d", len(rows))
+	}
+	return rows[0], nil
+}
+
+// QueryRowsContext answers as QueryRows does, or with the context's error once it is done.
+func (m *MockOsqueryClient) QueryRowsContext(ctx context.Context, query string) ([]map[string]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return m.QueryRows(query)
 }
 
 func (m *MockOsqueryClient) Close() {}
+
+// ErrorOsqueryClient fails every query with Err, for tests of the path where osquery cannot
+// answer. With no Err it still fails, so its zero value is never a client that answers nothing.
+type ErrorOsqueryClient struct {
+	Err error
+}
+
+func (e ErrorOsqueryClient) err() error {
+	if e.Err == nil {
+		return errors.New("osquery query failed")
+	}
+	return e.Err
+}
+
+func (e ErrorOsqueryClient) QueryRows(string) ([]map[string]string, error) { return nil, e.err() }
+
+func (e ErrorOsqueryClient) QueryRow(string) (map[string]string, error) { return nil, e.err() }
+
+func (e ErrorOsqueryClient) QueryRowsContext(context.Context, string) ([]map[string]string, error) {
+	return nil, e.err()
+}
+
+func (e ErrorOsqueryClient) Close() {}
+
+// CancelAfterQueryClienter opens Inner's clients wrapped so that each QueryRowsContext call, once
+// answered, calls Cancel when it is set: a test's way to land a cancellation after a query
+// returns, such as between the account roster and the first home. QueryRows and QueryRow pass
+// through without cancelling. Opened counts the clients it opened.
+type CancelAfterQueryClienter struct {
+	Inner  OsqueryClienter
+	Cancel context.CancelFunc
+	Opened int
+}
+
+func (clienter *CancelAfterQueryClienter) NewOsqueryClient() (OsqueryClient, error) {
+	client, err := clienter.Inner.NewOsqueryClient()
+	if err != nil {
+		return nil, err
+	}
+	clienter.Opened++
+	return cancelAfterQuery{OsqueryClient: client, cancel: clienter.Cancel}, nil
+}
+
+type cancelAfterQuery struct {
+	OsqueryClient
+	cancel context.CancelFunc
+}
+
+func (client cancelAfterQuery) QueryRowsContext(ctx context.Context,
+	query string) ([]map[string]string, error) {
+	rows, err := client.OsqueryClient.QueryRowsContext(ctx, query)
+	if client.cancel != nil {
+		client.cancel()
+	}
+	return rows, err
+}

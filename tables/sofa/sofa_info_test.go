@@ -10,20 +10,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-type errorOsqueryClient struct {
-	err error
-}
-
-func (e errorOsqueryClient) QueryRows(query string) ([]map[string]string, error) {
-	return nil, e.err
-}
-
-func (e errorOsqueryClient) QueryRow(query string) (map[string]string, error) {
-	return nil, e.err
-}
-
-func (e errorOsqueryClient) Close() {}
-
 func TestGetSecurityReleaseInfoForOSVersion(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -131,7 +117,7 @@ func TestGetCurrentOSVersion(t *testing.T) {
 }
 
 func TestGetCurrentOSVersionQueryError(t *testing.T) {
-	_, err := getCurrentOSVersion(errorOsqueryClient{err: errors.New("query failed")})
+	_, err := getCurrentOSVersion(utils.ErrorOsqueryClient{Err: errors.New("query failed")})
 	assert.Error(t, err)
 	assert.ErrorContains(t, err, "query failed")
 }

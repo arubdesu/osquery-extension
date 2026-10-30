@@ -15,6 +15,7 @@ import (
 
 	"github.com/macadmins/osquery-extension/pkg/fsscan"
 	"github.com/macadmins/osquery-extension/pkg/testutil"
+	"github.com/macadmins/osquery-extension/pkg/utils"
 )
 
 // serversOnly drops the diagnostic rows, so a test asserting on the servers found does not
@@ -514,6 +515,51 @@ func TestDiscoverAllHonoursCallerCancellation(t *testing.T) {
 		if _, isBudget := budgetCodes[row.Warning.Code]; isBudget {
 			t.Errorf("cancellation was reported as a budget failure: %q", row.Warning.Code)
 		}
+	}
+}
+
+// A roster read that fails under a done context is the cancellation, not a roster failure, and
+// no account was reached, so the row carries none. A constrained query gets it under each name.
+func TestCancelledRosterReadReportsCancellationWithoutAnAccount(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "alice"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rows := DiscoverAll(ctx, rosterOf(t, root), nil)
+	if len(rows) != 1 || rows[0].Warning.Code != warnCancelledPreHome || rows[0].User != "" ||
+		rows[0].Home != "" {
+		t.Errorf("rows = %+v, want one cancelled_before_home row with no account", rows)
+	}
+	rows = DiscoverAll(ctx, rosterOf(t, root), map[string]struct{}{"alice": {}})
+	if len(rows) != 1 || rows[0].Warning.Code != warnCancelledPreHome || rows[0].User != "alice" {
+		t.Errorf("constrained rows = %+v, want one cancelled_before_home row under alice", rows)
+	}
+}
+
+// TestACancelledQueryOpensNoClient: a query already cancelled reports the cancellation without
+// opening a client to osquery.
+func TestACancelledQueryOpensNoClient(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	clienter := &utils.CancelAfterQueryClienter{Inner: rosterOf(t, t.TempDir()), Cancel: cancel}
+	rows := DiscoverAll(ctx, clienter, nil)
+	if clienter.Opened != 0 || len(rows) != 1 || rows[0].Warning.Code != warnCancelledPreHome {
+		t.Errorf("opened %d clients, rows = %+v; want none and one cancelled_before_home row",
+			clienter.Opened, rows)
+	}
+}
+
+// TestARosterFailureWhileCancelledIsTheRosterFailure: a roster read that fails for its own
+// reason, here an empty roster, while the query is cancelled reports the roster failure.
+func TestARosterFailureWhileCancelledIsTheRosterFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clienter := &utils.CancelAfterQueryClienter{Inner: rosterOf(t, t.TempDir()), Cancel: cancel}
+	rows := DiscoverAll(ctx, clienter, nil)
+	if len(rows) != 1 || rows[0].Warning.Code != warnRosterQueryFailed {
+		t.Errorf("rows = %+v, want one roster_query_failed row", rows)
 	}
 }
 

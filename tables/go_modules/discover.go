@@ -2,6 +2,7 @@ package go_modules
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -128,6 +129,11 @@ func discoverAll(ctx context.Context, clienter utils.OsqueryClienter,
 // without writing tens of thousands of rows.
 func discoverWithin(ctx context.Context, clienter utils.OsqueryClienter,
 	userFilter, pathFilter map[string]struct{}, limits outputLimits) []row {
+	// osquery-go cancels the context only once osquery has closed the connection, so a query
+	// already cancelled has no reader, and opening a client can wait out the client's timeout.
+	if ctx.Err() != nil {
+		return rosterRows(userFilter, warning{Code: warnCancelledPreHome})
+	}
 	client, err := clienter.NewOsqueryClient()
 	if err != nil {
 		return rosterRows(userFilter, warning{Code: warnRosterUnreachable})
@@ -135,8 +141,14 @@ func discoverWithin(ctx context.Context, clienter utils.OsqueryClienter,
 	defer client.Close()
 	// Set before the roster is read, so the roster query is inside the budget.
 	deadline := time.Now().Add(fsscan.WalkTimeout())
-	enumerated, err := fsscan.ListUserHomes(client, userFilter)
+	enumerated, err := fsscan.ListUserHomes(ctx, client, userFilter)
 	if err != nil {
+		// A roster read the cancellation stopped reports it, with no account since none was
+		// reached; any other failure is the roster's own, even when the query was cancelled
+		// meanwhile.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return rosterRows(userFilter, warning{Code: warnCancelledPreHome})
+		}
 		return rosterRows(userFilter, warning{Code: warnRosterQueryFailed})
 	}
 

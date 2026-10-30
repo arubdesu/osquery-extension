@@ -243,7 +243,7 @@ The terms the sentences use:
 | `account_not_in_roster` | no account of this name is in the roster osquery returned, so nothing was scanned for it: the name may be misspelled, the account may have been removed, or it may be one the roster does not enumerate | none |
 | `home_unreadable` | this account's home directory could not be opened, so none of its projects are listed | `reason=`, the failure class |
 | `budget_exhausted_before_home` | the query budget was exhausted before this account was scanned, so none of its projects are listed | none |
-| `cancelled_before_home` | the query was cancelled before this account was scanned, so none of its projects are listed | none |
+| `cancelled_before_home` | the query was cancelled before this account was scanned, so none of its projects are listed | none; when the query was cancelled before the roster was read, `user` is empty, or each user a `user` constraint names |
 | `row_limit_reached_before_home` | the query reached the number of module rows this table returns before this account was scanned, so none of its modules are listed | `limit=` |
 | `output_size_reached_before_home` | the query reached the number of bytes this table returns before this account was scanned, so none of its modules are listed | `limit=`, in bytes |
 
