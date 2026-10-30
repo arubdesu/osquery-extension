@@ -4,7 +4,9 @@ import "os"
 
 func FileExists(fs FileSystem, filename string) bool {
 	info, err := os.Stat(filename)
-	if os.IsNotExist(err) {
+	// Any error leaves info nil, not only "not exist": a path that runs through a regular file
+	// fails with ENOTDIR, and an unreadable parent with EACCES.
+	if err != nil {
 		return false
 	}
 	return !info.IsDir()

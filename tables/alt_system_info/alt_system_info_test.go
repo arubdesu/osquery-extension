@@ -177,6 +177,23 @@ func TestGetHostDataCommandError(t *testing.T) {
 	assert.ErrorContains(t, err, "could not run scutil --get ComputerName command")
 }
 
+// panickingCmdRunner panics on every command, standing in for a fault in code a worker runs.
+type panickingCmdRunner struct{}
+
+func (panickingCmdRunner) RunCmd(string, ...string) ([]byte, error) { panic("command fault") }
+
+func (panickingCmdRunner) RunCmdWithStdin(string, string, ...string) ([]byte, error) {
+	panic("command fault")
+}
+
+// TestGetHostDataRecoversAWorkerPanic: a panic in one of the errgroup workers becomes the
+// table's internal error instead of ending the process.
+func TestGetHostDataRecoversAWorkerPanic(t *testing.T) {
+	_, err := alt_system_info.GetHostData(panickingCmdRunner{})
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "alt_system_info: internal error")
+}
+
 var (
 	isMacOS15Query  = "select * from os_version where name = 'macOS' and major = '15' and minor = 0;"
 	systemInfoQuery = "select * from system_info;"

@@ -4,6 +4,7 @@ go 1.27.3
 
 require (
 	github.com/BurntSushi/toml v1.6.0
+	github.com/apache/thrift v0.24.0
 	github.com/hashicorp/go-version v1.7.0
 	github.com/micromdm/plist v0.3.0
 	github.com/osquery/osquery-go v0.0.0-20260630173615-eb39ad3443df
@@ -17,7 +18,6 @@ require (
 
 require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
-	github.com/apache/thrift v0.24.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect

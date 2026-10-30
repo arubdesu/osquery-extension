@@ -15,6 +15,10 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// TableName is the name main.go registers this table under, and the name a worker's recovered
+// panic is reported under.
+const TableName = "alt_system_info"
+
 func GetCPUType(cmder utils.CmdRunner) (string, error) {
 	buf, err := cmder.RunCmd("machine")
 	if err != nil {
@@ -117,32 +121,32 @@ func GetHostData(cmder utils.CmdRunner) (*HostData, error) {
 	data := new(HostData)
 
 	var wg errgroup.Group
-	wg.Go(func() error {
+	wg.Go(utils.RecoverWorker(TableName, func() error {
 		buf, err := cmder.RunCmd("hostname")
 		if err != nil {
 			return fmt.Errorf("could not run hostname command: %w", err)
 		}
 		data.Hostname = strings.TrimSpace(string(buf))
 		return nil
-	})
+	}))
 
-	wg.Go(func() error {
+	wg.Go(utils.RecoverWorker(TableName, func() error {
 		buf, err := cmder.RunCmd("scutil", "--get", "ComputerName")
 		if err != nil {
 			return fmt.Errorf("could not run scutil --get ComputerName command: %w", err)
 		}
 		data.ComputerName = strings.TrimSpace(string(buf))
 		return nil
-	})
+	}))
 
-	wg.Go(func() error {
+	wg.Go(utils.RecoverWorker(TableName, func() error {
 		buf, err := cmder.RunCmd("scutil", "--get", "LocalHostName")
 		if err != nil {
 			return fmt.Errorf("could not run scutil --get LocalHostname command: %w", err)
 		}
 		data.LocalHostname = strings.TrimSpace(string(buf))
 		return nil
-	})
+	}))
 
 	return data, wg.Wait()
 }
@@ -260,47 +264,47 @@ func GenerateInfo(
 
 	var wg errgroup.Group
 	if cache.CPUType == "" {
-		wg.Go(func() error {
+		wg.Go(utils.RecoverWorker(TableName, func() error {
 			var err error
 			cache.CPUType, err = GetCPUType(runner)
 			if err != nil {
 				return fmt.Errorf("could not get cpu type: %w", err)
 			}
 			return nil
-		})
+		}))
 	}
 
 	if cache.IORegData == nil {
-		wg.Go(func() error {
+		wg.Go(utils.RecoverWorker(TableName, func() error {
 			var err error
 			cache.IORegData, err = GetIORegData(runner)
 			if err != nil {
 				return fmt.Errorf("could not get ioreg data: %w", err)
 			}
 			return nil
-		})
+		}))
 	}
 
 	if cache.SysctlData == nil {
-		wg.Go(func() error {
+		wg.Go(utils.RecoverWorker(TableName, func() error {
 			var err error
 			cache.SysctlData, err = GetSysctlData(runner)
 			if err != nil {
 				return fmt.Errorf("could not get sysctl data: %w", err)
 			}
 			return nil
-		})
+		}))
 	}
 
 	if time.Since(cache.lastHost) > 5*time.Minute {
-		wg.Go(func() error {
+		wg.Go(utils.RecoverWorker(TableName, func() error {
 			var err error
 			cache.HostData, err = GetHostData(runner)
 			if err != nil {
 				return fmt.Errorf("could not get host data: %w", err)
 			}
 			return nil
-		})
+		}))
 
 	}
 
