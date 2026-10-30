@@ -377,12 +377,7 @@ func DiscoverAll(ctx context.Context, clienter utils.OsqueryClienter, userFilter
 		return rosterDiagnostic(userFilter, fsscan.UsersRoot,
 			warning{Code: warnRosterUnreachable})
 	}
-	// KNOWN GAP: this Close is correct and currently
-	// does nothing. The pinned osquery-go revision opens a transport in NewClient and never
-	// assigns it to the struct, so Close finds a nil transport and returns. The socket is
-	// left to the garbage collector, and this table opens one per query. Written anyway
-	// because the call site is right and only the dependency is wrong; fixing it is an
-	// osquery-go bump, which is a repository-wide change.
+	// Each query opens its own client, so its socket is closed when the query returns.
 	defer client.Close()
 	// Established before the roster is read, not after. The roster is a query back to
 	// osquery, so it is fast, but it is still work the budget should cover.
