@@ -6,10 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"time"
 
 	"github.com/macadmins/osquery-extension/pkg/utils"
-	"github.com/osquery/osquery-go"
 	"github.com/osquery/osquery-go/plugin/table"
 	"github.com/pkg/errors"
 )
@@ -59,14 +57,17 @@ func WifiNetworkGenerate(
 	queryContext table.QueryContext,
 	socketPath string,
 ) ([]map[string]string, error) {
-	// get the wifi interface from osquery
-	osqueryClient, err := osquery.NewClient(socketPath, 10*time.Second)
+	return generate(utils.SocketClienter(socketPath), CmdExecutor{})
+}
+
+// generate opens one client through clienter for the query, to read the wifi interface from
+// osquery, and closes it when the query returns.
+func generate(clienter utils.OsqueryClienter, cmdExecutor CommandExecutor) ([]map[string]string, error) {
+	osqueryClient, err := clienter.NewOsqueryClient()
 	if err != nil {
 		return nil, err
 	}
 	defer osqueryClient.Close()
-
-	cmdExecutor := CmdExecutor{}
 	return generateWithDeps(osqueryClient, cmdExecutor)
 }
 

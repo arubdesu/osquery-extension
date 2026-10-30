@@ -439,3 +439,18 @@ func TestGenerateWithDepsReturnsWifiStatusErrors(t *testing.T) {
 	require.ErrorIs(t, err, expectedErr)
 	assert.Nil(t, result)
 }
+
+// TestGenerateOpensItsClientThroughTheClienter: the path a query takes reads the wifi interface
+// through the clienter it is given, and reports a client that cannot be opened.
+func TestGenerateOpensItsClientThroughTheClienter(t *testing.T) {
+	data := map[string][]map[string]string{"SELECT * FROM wifi_status;": {wifiStatusFixture()}}
+	got, err := generate(&utils.MockOsqueryClienter{Data: data}, happyCommandExecutor())
+	assert.NoError(t, err)
+	want, err := generateWithDeps(&utils.MockOsqueryClient{Data: data}, happyCommandExecutor())
+	assert.NoError(t, err)
+	assert.NotEmpty(t, got)
+	assert.Equal(t, want, got)
+
+	_, err = generate(&utils.MockOsqueryClienter{Err: errors.New("no socket")}, happyCommandExecutor())
+	assert.Error(t, err)
+}

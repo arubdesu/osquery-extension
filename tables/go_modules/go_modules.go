@@ -32,7 +32,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"time"
 
 	"github.com/osquery/osquery-go/plugin/table"
 
@@ -86,7 +85,7 @@ func GoModulesColumns() []table.ColumnDefinition {
 func GoModulesGenerate(ctx context.Context, queryContext table.QueryContext,
 	socketPath string) ([]map[string]string, error) {
 	return generate(ctx, queryContext,
-		&utils.SocketOsqueryClienter{SocketPath: socketPath, Timeout: 10 * time.Second})
+		utils.SocketClienter(socketPath))
 }
 
 // generate is GoModulesGenerate with the osquery client injected, so tests drive it through a

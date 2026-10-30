@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"sort"
 	"strconv"
-	"time"
 
 	"github.com/osquery/osquery-go/plugin/table"
 
@@ -136,7 +135,7 @@ func MCPServersColumns() []table.ColumnDefinition {
 // stop being true.
 func MCPServersGenerate(ctx context.Context, queryContext table.QueryContext, socketPath string) ([]map[string]string, error) {
 	return generate(ctx, queryContext,
-		&utils.SocketOsqueryClienter{SocketPath: socketPath, Timeout: 10 * time.Second})
+		utils.SocketClienter(socketPath))
 }
 
 // generate is MCPServersGenerate with the osquery client injected, so tests drive it through

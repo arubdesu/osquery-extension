@@ -217,7 +217,7 @@ var globalCache = new(Cache)
 func AltSystemInfoGenerate(ctx context.Context, queryContext table.QueryContext, socketPath string) ([]map[string]string, error) {
 	return GenerateInfo(
 		utils.NewRunner().Runner,
-		&utils.SocketOsqueryClienter{SocketPath: socketPath, Timeout: 10 * time.Second},
+		utils.SocketClienter(socketPath),
 		globalCache,
 	)
 }

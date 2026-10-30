@@ -25,6 +25,12 @@ type OsqueryClient interface {
 	Close()
 }
 
+// SocketClienter opens clients on osquery's extension socket at socketPath, with the timeout
+// every table uses.
+func SocketClienter(socketPath string) OsqueryClienter {
+	return &SocketOsqueryClienter{SocketPath: socketPath, Timeout: 10 * time.Second}
+}
+
 type SocketOsqueryClienter struct {
 	SocketPath string
 	Timeout    time.Duration
@@ -40,9 +46,14 @@ func (s *SocketOsqueryClienter) NewOsqueryClient() (OsqueryClient, error) {
 
 type MockOsqueryClienter struct {
 	Data map[string][]map[string]string
+	// Err, when set, is returned in place of a client, as when the socket cannot be reached.
+	Err error
 }
 
 func (m *MockOsqueryClienter) NewOsqueryClient() (OsqueryClient, error) {
+	if m.Err != nil {
+		return nil, m.Err
+	}
 	return &MockOsqueryClient{Data: m.Data}, nil
 }
 

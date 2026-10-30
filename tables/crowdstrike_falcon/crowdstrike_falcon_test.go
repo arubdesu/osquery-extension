@@ -286,3 +286,43 @@ func TestLinuxParsing(t *testing.T) {
 		})
 	}
 }
+
+// TestGenerateOnLinuxAsksThroughTheClienter: on Linux the path a query takes asks osquery
+// whether the sensor is loaded through the clienter it is given, and reports a client that
+// cannot be opened.
+func TestGenerateOnLinuxAsksThroughTheClienter(t *testing.T) {
+	// Keyed by the Linux falconctl path, so the test fails on any other host if generate looks
+	// the path up by the host's platform instead of the one it was given.
+	runner := utils.Runner{Runner: utils.MultiMockCmdRunner{Commands: map[string]utils.MockCmdRunner{
+		falconCtlPath["linux"] + " -g --aid --cid --rfm-state --version": {Output: `cid="79391c24113773b01d8181c38c3e111a", aid="f3edc954d286243b5bd94130c2f2647d", version = 7.29.18202.0
+rfm-state=true,`}}}}
+	fs := utils.MockFileSystem{FileExists: true}
+	clienter := &utils.MockOsqueryClienter{Data: map[string][]map[string]string{
+		"SELECT 1 FROM processes WHERE name like 'falcon-sensor%';": {{"1": "1"}},
+	}}
+	rows, err := generate("linux", runner, fs, clienter)
+	assert.NoError(t, err)
+	assert.Len(t, rows, 1)
+	assert.Equal(t, "true", rows[0]["sensor_loaded"])
+	assert.Equal(t, "F3EDC954D286243B5BD94130C2F2647D", rows[0]["agent_id"])
+
+	_, err = generate("linux", runner, fs, &utils.MockOsqueryClienter{Err: errors.New("no socket")})
+	assert.Error(t, err)
+}
+
+// TestGenerateOnLinuxWithoutFalconctlOpensNoClient: a host without falconctl gets the empty row
+// without a client being opened, so an unreachable osquery socket does not fail the query.
+func TestGenerateOnLinuxWithoutFalconctlOpensNoClient(t *testing.T) {
+	runner := utils.Runner{Runner: utils.MockCmdRunner{}}
+	fs := utils.MockFileSystem{FileExists: false}
+	rows, err := generate("linux", runner, fs, &utils.MockOsqueryClienter{Err: errors.New("no socket")})
+	assert.NoError(t, err)
+	assert.Len(t, rows, 1)
+	assert.Equal(t, "false", rows[0]["sensor_loaded"])
+
+	// A falconctl that cannot be checked is an error, reported as itself rather than as the
+	// unreachable socket.
+	fs = utils.MockFileSystem{Err: errors.New("input/output error")}
+	_, err = generate("linux", runner, fs, &utils.MockOsqueryClienter{Err: errors.New("no socket")})
+	assert.EqualError(t, err, "input/output error")
+}

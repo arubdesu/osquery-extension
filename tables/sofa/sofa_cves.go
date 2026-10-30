@@ -3,10 +3,9 @@ package sofa
 import (
 	"context"
 	"strconv"
-	"time"
 
 	"github.com/hashicorp/go-version"
-	osquery "github.com/osquery/osquery-go"
+	"github.com/macadmins/osquery-extension/pkg/utils"
 	"github.com/osquery/osquery-go/plugin/table"
 )
 
@@ -27,6 +26,12 @@ func SofaUnpatchedCVEsColumns() []table.ColumnDefinition {
 }
 
 func SofaUnpatchedCVEsGenerate(ctx context.Context, queryContext table.QueryContext, socketPath string, opts ...Option) ([]map[string]string, error) {
+	return unpatchedCVEs(queryContext, utils.SocketClienter(socketPath), opts...)
+}
+
+// unpatchedCVEs answers the query, asking osquery through clienter for this host's OS version
+// when the query names none.
+func unpatchedCVEs(queryContext table.QueryContext, clienter utils.OsqueryClienter, opts ...Option) ([]map[string]string, error) {
 	url := SofaV1URL
 	if constraintList, present := queryContext.Constraints["url"]; present {
 		// 'url' is in the where clause
@@ -49,14 +54,8 @@ func SofaUnpatchedCVEsGenerate(ctx context.Context, queryContext table.QueryCont
 	}
 
 	if osVersion == "" {
-		// get the current device os version from osquery
-		osqueryClient, err := osquery.NewClient(socketPath, 10*time.Second)
-		if err != nil {
-			return nil, err
-		}
-		defer osqueryClient.Close()
-
-		osVersion, err = getCurrentOSVersion(osqueryClient)
+		var err error
+		osVersion, err = currentOSVersion(clienter)
 		if err != nil {
 			return nil, err
 		}

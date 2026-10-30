@@ -8,11 +8,9 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/macadmins/osquery-extension/pkg/utils"
 	"github.com/micromdm/plist"
-	"github.com/osquery/osquery-go"
 	"github.com/osquery/osquery-go/plugin/table"
 	"github.com/pkg/errors"
 )
@@ -41,14 +39,18 @@ func CrowdstrikeFalconColumns() []table.ColumnDefinition {
 }
 
 func CrowdstrikeFalconGenerate(ctx context.Context, queryContext table.QueryContext, socketPath string) ([]map[string]string, error) {
-	var results []map[string]string
-	r := utils.NewRunner()
-	fs := utils.OSFileSystem{}
+	return generate(runtime.GOOS, utils.NewRunner(), utils.OSFileSystem{}, utils.SocketClienter(socketPath))
+}
 
+// generate reads the sensor's state for goos; on Linux, when falconctl is installed, it opens one
+// client through clienter to ask osquery whether the sensor is loaded, and closes it when the
+// query returns.
+func generate(goos string, r utils.Runner, fs utils.FileSystem, clienter utils.OsqueryClienter) ([]map[string]string, error) {
+	var results []map[string]string
 	var output = CrowdStrikeOutput{}
 	var err error
 
-	switch runtime.GOOS {
+	switch goos {
 	case "darwin":
 		output, err = runCrowdstrikeFalconDarwin(r, fs)
 		if err != nil {
@@ -57,7 +59,15 @@ func CrowdstrikeFalconGenerate(ctx context.Context, queryContext table.QueryCont
 		}
 
 	case "linux":
-		osqueryClient, err := osquery.NewClient(socketPath, 10*time.Second)
+		// Without falconctl there is nothing to report, so no client to osquery is opened; a
+		// falconctl that cannot be checked fails the query with that error, before any client.
+		if _, err := fs.Stat(falconCtlPath["linux"]); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				break
+			}
+			return nil, err
+		}
+		osqueryClient, err := clienter.NewOsqueryClient()
 		if err != nil {
 			return nil, err
 		}
@@ -83,7 +93,7 @@ func CrowdstrikeFalconGenerate(ctx context.Context, queryContext table.QueryCont
 func runCrowdstrikeFalconLinux(r utils.Runner, fs utils.FileSystem, client utils.OsqueryClient) (CrowdStrikeOutput, error) {
 	var output CrowdStrikeOutput
 
-	_, err := fs.Stat(falconCtlPath[runtime.GOOS])
+	_, err := fs.Stat(falconCtlPath["linux"])
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return output, nil
@@ -103,9 +113,9 @@ func runCrowdstrikeFalconLinux(r utils.Runner, fs utils.FileSystem, client utils
 		output.SensorLoaded = true
 	}
 
-	out, err := r.Runner.RunCmd(falconCtlPath[runtime.GOOS], "-g", "--aid", "--cid", "--rfm-state", "--version")
+	out, err := r.Runner.RunCmd(falconCtlPath["linux"], "-g", "--aid", "--cid", "--rfm-state", "--version")
 	if err != nil {
-		return output, errors.Wrap(err, falconCtlPath[runtime.GOOS]+" -g --aid --cid --rfm-state --version")
+		return output, errors.Wrap(err, falconCtlPath["linux"]+" -g --aid --cid --rfm-state --version")
 	}
 
 	return HydrateCommandOutput(string(out), output), nil
@@ -145,7 +155,7 @@ func HydrateCommandOutput(cmdOut string, output CrowdStrikeOutput) CrowdStrikeOu
 func runCrowdstrikeFalconDarwin(r utils.Runner, fs utils.FileSystem) (CrowdStrikeOutput, error) {
 	var output CrowdStrikeOutput
 
-	_, err := fs.Stat(falconCtlPath[runtime.GOOS])
+	_, err := fs.Stat(falconCtlPath["darwin"])
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return output, nil
@@ -153,9 +163,9 @@ func runCrowdstrikeFalconDarwin(r utils.Runner, fs utils.FileSystem) (CrowdStrik
 		return output, err
 	}
 
-	out, err := r.Runner.RunCmd(falconCtlPath[runtime.GOOS], "info")
+	out, err := r.Runner.RunCmd(falconCtlPath["darwin"], "info")
 	if err != nil {
-		return output, errors.Wrap(err, falconCtlPath[runtime.GOOS]+" info")
+		return output, errors.Wrap(err, falconCtlPath["darwin"]+" info")
 	}
 	if err := plist.Unmarshal(out, &output); err != nil {
 		return output, errors.Wrap(err, "unmarshalling falconctl output")

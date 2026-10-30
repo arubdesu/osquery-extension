@@ -240,3 +240,31 @@ func TestBuildSecurityReleaseInfoOutput(t *testing.T) {
 
 	assert.Equal(t, expectedOutput, output)
 }
+
+// TestQueriesAskOsqueryThroughTheClienter: with no os_version in the query, both tables ask
+// osquery for this host's version through the clienter they are given, and report a client that
+// cannot be opened.
+func TestQueriesAskOsqueryThroughTheClienter(t *testing.T) {
+	server := setup()
+	defer teardown(server)
+	queryContext := table.QueryContext{Constraints: map[string]table.ConstraintList{
+		"url": {Constraints: []table.Constraint{{Operator: table.OperatorEquals, Expression: server.URL}}},
+	}}
+	clienter := &utils.MockOsqueryClienter{Data: map[string][]map[string]string{
+		"SELECT * FROM os_version;": {{"version": "14.4.1"}},
+	}}
+	options := []Option{WithCacheDir(t.TempDir()), WithUserAgent("test")}
+
+	rows, err := securityReleaseInfo(queryContext, clienter, options...)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, rows)
+	assert.Equal(t, "14.4.1", rows[0]["os_version"])
+	_, err = unpatchedCVEs(queryContext, clienter, options...)
+	assert.NoError(t, err)
+
+	failing := &utils.MockOsqueryClienter{Err: errors.New("no socket")}
+	_, err = securityReleaseInfo(queryContext, failing, options...)
+	assert.Error(t, err)
+	_, err = unpatchedCVEs(queryContext, failing, options...)
+	assert.Error(t, err)
+}
