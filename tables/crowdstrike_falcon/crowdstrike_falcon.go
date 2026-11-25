@@ -28,6 +28,34 @@ type CrowdStrikeOutput struct {
 	SensorLoaded             bool   `plist:"sensor_loaded"`
 }
 
+// falconctlInfo is the plist `falconctl info` prints on macOS. With the sensor not loaded,
+// falconctl prints rfm as the string sensor_not_loaded rather than a boolean, which must not fail
+// the parse and drop the row. sensor_loaded stays a strict boolean: a value that is not one fails
+// the query rather than reporting the sensor as not loaded.
+type falconctlInfo struct {
+	AgentID       string        `plist:"aid"`
+	CID           string        `plist:"cid"`
+	FalconVersion string        `plist:"falcon_version"`
+	RFM           falconctlBool `plist:"rfm"`
+	SensorLoaded  bool          `plist:"sensor_loaded"`
+}
+
+// falconctlBool is rfm as falconctl reports it: a boolean while the sensor runs, and otherwise a
+// value such as sensor_not_loaded, which reads as false, as the Linux parse treats an rfm-state
+// it cannot match.
+type falconctlBool bool
+
+// UnmarshalPlist decodes a boolean, and leaves any other plist value false.
+func (b *falconctlBool) UnmarshalPlist(unmarshal func(interface{}) error) error {
+	var value bool
+	if err := unmarshal(&value); err != nil {
+		*b = false
+		return nil
+	}
+	*b = falconctlBool(value)
+	return nil
+}
+
 func CrowdstrikeFalconColumns() []table.ColumnDefinition {
 	return []table.ColumnDefinition{
 		table.TextColumn("agent_id"),
@@ -179,9 +207,16 @@ func runCrowdstrikeFalconDarwin(r utils.Runner, fs utils.FileSystem) (CrowdStrik
 	if err != nil {
 		return output, errors.Wrap(err, falconCtlPath["darwin"]+" info")
 	}
-	if err := plist.Unmarshal(out, &output); err != nil {
+	var info falconctlInfo
+	if err := plist.Unmarshal(out, &info); err != nil {
 		return output, errors.Wrap(err, "unmarshalling falconctl output")
 	}
 
-	return output, nil
+	return CrowdStrikeOutput{
+		AgentID:                  info.AgentID,
+		CID:                      info.CID,
+		FalconVersion:            info.FalconVersion,
+		ReducedFunctionalityMode: bool(info.RFM),
+		SensorLoaded:             info.SensorLoaded,
+	}, nil
 }

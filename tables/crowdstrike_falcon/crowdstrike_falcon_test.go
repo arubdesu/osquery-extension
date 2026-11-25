@@ -14,16 +14,19 @@ func TestRunCrowdstrikeFalconDarwin(t *testing.T) {
 		name      string
 		mockCmd   utils.MockCmdRunner
 		fileExist bool
+		statErr   error
 		wantErr   bool
+		// want is the parse result for a case that does not error.
+		want CrowdStrikeOutput
 	}{
 		{
 			name: "Binary not present",
 			mockCmd: utils.MockCmdRunner{
 				Output: "",
-				Err:    nil,
 			},
 			fileExist: false,
 			wantErr:   false,
+			want:      CrowdStrikeOutput{},
 		},
 		{
 			name: "Command execution error",
@@ -41,28 +44,142 @@ func TestRunCrowdstrikeFalconDarwin(t *testing.T) {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-        <key>aid</key>
-        <string>F3EDC954D286243B5BD94130C2F2647D</string>
-		<key>cid</key>
-		<string>79391C24113773B01D8181C38C3E111A</string>
-        <key>falcon_version</key>
-        <string>7.26.19707.0</string>
-        <key>rfm</key>
-        <true/>
-        <key>sensor_loaded</key>
-        <true/>
+	<key>aid</key>
+	<string>F3EDC954D286243B5BD94130C2F2647D</string>
+	<key>cid</key>
+	<string>79391C24113773B01D8181C38C3E111A</string>
+	<key>falcon_version</key>
+	<string>7.26.19707.0</string>
+	<key>rfm</key>
+	<true/>
+	<key>sensor_loaded</key>
+	<true/>
 </dict>
 </plist>`,
-				Err: nil,
 			},
 			fileExist: true,
 			wantErr:   false,
+			want: CrowdStrikeOutput{
+				AgentID:                  "F3EDC954D286243B5BD94130C2F2647D",
+				CID:                      "79391C24113773B01D8181C38C3E111A",
+				FalconVersion:            "7.26.19707.0",
+				ReducedFunctionalityMode: true,
+				SensorLoaded:             true,
+			},
+		},
+		{
+			name: "Reduced functionality off with the sensor loaded",
+			mockCmd: utils.MockCmdRunner{
+				Output: `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>aid</key>
+	<string>F3EDC954D286243B5BD94130C2F2647D</string>
+	<key>cid</key>
+	<string>79391C24113773B01D8181C38C3E111A</string>
+	<key>falcon_version</key>
+	<string>8.10.21307.0</string>
+	<key>rfm</key>
+	<false/>
+	<key>sensor_loaded</key>
+	<true/>
+</dict>
+</plist>`,
+			},
+			fileExist: true,
+			wantErr:   false,
+			want: CrowdStrikeOutput{
+				AgentID:       "F3EDC954D286243B5BD94130C2F2647D",
+				CID:           "79391C24113773B01D8181C38C3E111A",
+				FalconVersion: "8.10.21307.0",
+				SensorLoaded:  true,
+			},
+		},
+		{
+			name: "Sensor not loaded",
+			mockCmd: utils.MockCmdRunner{
+				Output: `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>aid</key>
+	<string>F3EDC954D286243B5BD94130C2F2647D</string>
+	<key>cid</key>
+	<string>79391C24113773B01D8181C38C3E111A</string>
+	<key>falcon_version</key>
+	<string>8.10.21307.0</string>
+	<key>rfm</key>
+	<string>sensor_not_loaded</string>
+	<key>sensor_loaded</key>
+	<false/>
+</dict>
+</plist>`,
+			},
+			fileExist: true,
+			wantErr:   false,
+			want: CrowdStrikeOutput{
+				AgentID:       "F3EDC954D286243B5BD94130C2F2647D",
+				CID:           "79391C24113773B01D8181C38C3E111A",
+				FalconVersion: "8.10.21307.0",
+			},
+		},
+		{
+			name: "Not-loaded rfm with the sensor reported loaded",
+			mockCmd: utils.MockCmdRunner{
+				Output: `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>aid</key>
+	<string>F3EDC954D286243B5BD94130C2F2647D</string>
+	<key>cid</key>
+	<string>79391C24113773B01D8181C38C3E111A</string>
+	<key>falcon_version</key>
+	<string>8.10.21307.0</string>
+	<key>rfm</key>
+	<string>sensor_not_loaded</string>
+	<key>sensor_loaded</key>
+	<true/>
+</dict>
+</plist>`,
+			},
+			fileExist: true,
+			wantErr:   false,
+			want: CrowdStrikeOutput{
+				AgentID:       "F3EDC954D286243B5BD94130C2F2647D",
+				CID:           "79391C24113773B01D8181C38C3E111A",
+				FalconVersion: "8.10.21307.0",
+				SensorLoaded:  true,
+			},
+		},
+		{
+			name: "sensor_loaded not a boolean",
+			mockCmd: utils.MockCmdRunner{
+				Output: `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>aid</key>
+	<string>F3EDC954D286243B5BD94130C2F2647D</string>
+	<key>cid</key>
+	<string>79391C24113773B01D8181C38C3E111A</string>
+	<key>falcon_version</key>
+	<string>8.10.21307.0</string>
+	<key>rfm</key>
+	<false/>
+	<key>sensor_loaded</key>
+	<string>true</string>
+</dict>
+</plist>`,
+			},
+			fileExist: true,
+			wantErr:   true,
 		},
 		{
 			name: "PLIST unmarshal error",
 			mockCmd: utils.MockCmdRunner{
 				Output: `invalid plist`,
-				Err:    nil,
 			},
 			fileExist: true,
 			wantErr:   true,
@@ -71,9 +188,9 @@ func TestRunCrowdstrikeFalconDarwin(t *testing.T) {
 			name: "File stat error",
 			mockCmd: utils.MockCmdRunner{
 				Output: "",
-				Err:    nil,
 			},
 			fileExist: true,
+			statErr:   errors.New("stat failed"),
 			wantErr:   true,
 		},
 	}
@@ -81,31 +198,15 @@ func TestRunCrowdstrikeFalconDarwin(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			runner := utils.Runner{Runner: tt.mockCmd}
-			fs := utils.MockFileSystem{FileExists: tt.fileExist}
-			if tt.name == "File stat error" {
-				fs.Err = errors.New("stat failed")
-			}
+			fs := utils.MockFileSystem{FileExists: tt.fileExist, Err: tt.statErr}
 
 			output, err := runCrowdstrikeFalconDarwin(runner, fs)
 			if tt.wantErr {
 				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-				if tt.fileExist {
-					assert.NotEmpty(t, output)
-					if tt.name == "Successful execution" {
-						expectedOutput := CrowdStrikeOutput{
-							AgentID:                  "F3EDC954D286243B5BD94130C2F2647D",
-							CID:                      "79391C24113773B01D8181C38C3E111A",
-							FalconVersion:            "7.26.19707.0",
-							ReducedFunctionalityMode: true,
-							SensorLoaded:             true}
-						assert.Equal(t, expectedOutput, output)
-					}
-				} else {
-					assert.Empty(t, output)
-				}
+				return
 			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.want, output)
 		})
 	}
 }
@@ -335,4 +436,32 @@ func TestGenerateOnLinuxWithCancelledContextOpensNoClient(t *testing.T) {
 	_, err := generate(ctx, "linux", runner, fs, clienter)
 	assert.ErrorIs(t, err, context.Canceled)
 	assert.Zero(t, clienter.Opened)
+}
+
+// TestGenerateOnDarwinWithTheSensorNotLoadedReturnsARow: the query returns one row reporting the
+// sensor not loaded, rather than failing, when falconctl prints rfm as sensor_not_loaded.
+func TestGenerateOnDarwinWithTheSensorNotLoadedReturnsARow(t *testing.T) {
+	runner := utils.Runner{Runner: utils.MockCmdRunner{Output: `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>aid</key>
+	<string>F3EDC954D286243B5BD94130C2F2647D</string>
+	<key>cid</key>
+	<string>79391C24113773B01D8181C38C3E111A</string>
+	<key>falcon_version</key>
+	<string>8.10.21307.0</string>
+	<key>rfm</key>
+	<string>sensor_not_loaded</string>
+	<key>sensor_loaded</key>
+	<false/>
+</dict>
+</plist>`}}
+	fs := utils.MockFileSystem{FileExists: true}
+	rows, err := generate(context.Background(), "darwin", runner, fs, &utils.MockOsqueryClienter{})
+	assert.NoError(t, err)
+	assert.Len(t, rows, 1)
+	assert.Equal(t, "false", rows[0]["sensor_loaded"])
+	assert.Equal(t, "false", rows[0]["reduced_functionality_mode"])
+	assert.Equal(t, "8.10.21307.0", rows[0]["falcon_version"])
 }
